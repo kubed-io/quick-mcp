@@ -32,9 +32,11 @@ owner's review. A draft runs no checks.
 
 ## The wiki
 
-What the library does is the spec in `docs/`, one file per area with numbered requirements, each
+What the library does is [the spec](https://github.com/kubed-io/quick-mcp/wiki/Specification),
+`docs/superpowers/specs/` in the submodule: one file per area with numbered requirements, each
 true of the code or marked *(proposed)*. When behaviour changes, the spec changes in the same pull
-request. Designs and plans are dated files beside it, each with a History header.
+request. Designs and plans are dated files in `docs/superpowers/plans/`, each with a History
+header.
 
 A change in `docs/` is a commit in the wiki repository: commit there on the wiki branch named after
 your branch, push it, then commit the `docs` pointer here. Never push the wiki's `master`.

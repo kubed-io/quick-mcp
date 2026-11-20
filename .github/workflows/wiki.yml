@@ -1,0 +1,175 @@
+name: 📖 Wiki
+
+# Publishes the wiki. Every page is hand-written, so publishing is only ever moving the wiki's
+# master to the commit main pins: nothing is generated here.
+#
+#   pull_request        the pinned wiki commit can be fetched — never pushes
+#   push: main          bring master into the pin, push it to master, record the pointer
+#   workflow_dispatch   the same, by hand, e.g. after master was edited in the browser
+#
+# The wiki is its own git repository at <repo>.wiki.git, and a submodule here at docs/ — hence
+# the submodule checkout and the push from inside that directory rather than a commit to this
+# repo. A branch's wiki commits go on the wiki branch named after it, never on master: master is
+# the public wiki and this job's alone.
+
+on:
+  pull_request:
+    # a draft runs nothing; marking it ready starts the checks
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+    - docs
+    - .gitmodules
+    - .github/workflows/wiki.yml
+  # every merge, not only one that moves the pin: after it, the open PRs are brought up to date
+  # (the last step), and a merge of any kind leaves them behind
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push to the wiki
+        type: boolean
+        required: false
+        default: true
+
+# One publisher at a time. Two runs racing to push master is a guaranteed non-fast-forward, and
+# the loser fails for no useful reason. cancel-in-progress stays false so a queued run is not
+# killed.
+concurrency:
+  group: wiki-${{ github.ref }}
+
+permissions: {}
+
+jobs:
+
+  wiki:
+    name: Publish Wiki
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write   # the wiki repo lives under this repository's permissions
+    env:
+      # true only for a real publish: a push to main, or a dispatch with push=true. A
+      # pull_request run never pushes.
+      PUSH: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)) && 'true' || 'false' }}
+    steps:
+
+    # Only a run that pushes needs a writable identity. The App is the identity main's ruleset
+    # lets through, so it records the pointer; the wiki push goes out under it too when it is
+    # there, and under the built-in token otherwise.
+    #
+    # Gated on the variable rather than the key, because the `secrets` context cannot be used
+    # in an `if` at all.
+    - name: Create GitHub App Token
+      id: app-token
+      if: env.PUSH == 'true' && vars.GH_CLIENT_ID != ''
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ vars.GH_CLIENT_ID }}
+        private-key: ${{ secrets.GH_APP_KEY }}
+        # A wiki push and a commit to main are both contents writes. Without this the token
+        # would carry every permission the App is installed with.
+        permission-contents: write
+
+    # With submodules, checkout fetches the exact commit main pins, so a pin that was never
+    # pushed to the wiki fails here: that is the pull_request gate.
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+        token: ${{ steps.app-token.outputs.token || github.token }}
+        # The push below runs from inside docs/ and authenticates with what checkout left in
+        # the submodule's remote. Nothing here uploads an artifact, so the credential has
+        # nowhere to leak to — see .github/zizmor.yml.
+        persist-credentials: true
+
+    - name: Pin
+      working-directory: docs
+      run: |
+        pin=$(git rev-parse HEAD)
+        branches=$(git ls-remote --heads origin | awk -v pin="$pin" '$1 == pin { sub("refs/heads/", "", $2); print $2 }')
+        echo "The pinned wiki commit ${pin:0:8} is fetchable${branches:+, the head of: $branches}." >> "$GITHUB_STEP_SUMMARY"
+
+    # A branch's pin is on that branch's own wiki branch, so it is usually beside master, not
+    # ahead of it. Master is merged in, the pin's side taking a file both changed: the pin
+    # carries the branch's specs and plans, and a browser edit to master survives the same way.
+    - name: Bring the Wiki's Master In
+      if: env.PUSH == 'true'
+      working-directory: docs
+      run: |
+        git fetch --quiet --unshallow origin 2>/dev/null || git fetch --quiet origin
+        git fetch --quiet origin master
+        if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+          exit 0
+        fi
+        git -c user.name="github-actions[bot]" \
+          -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+          merge --no-edit -X ours -m "Merge the wiki's master into ${GITHUB_SHA:0:8}'s pin" FETCH_HEAD
+
+    # Master is an ancestor of HEAD now, so this is a fast-forward unless master moved since
+    # the fetch above, and then it is rejected, loudly, which is the right answer.
+    - name: Push
+      id: push
+      if: env.PUSH == 'true'
+      working-directory: docs
+      run: |
+        remote=$(git ls-remote origin refs/heads/master | cut -f1)
+        if [ "$(git rev-parse HEAD)" = "$remote" ]; then
+          echo "The wiki is already current." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        {
+          echo "## Wiki changes"
+          echo ""
+          echo '```'
+          git diff --stat "${remote}" HEAD
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        # The wiki's default branch is master, not main — GitHub creates it that way and does
+        # not follow the repository's own default.
+        git push origin HEAD:master
+        echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+    # After a merge of master the submodule points at a commit that exists only on the wiki
+    # remote. Left unrecorded, main pins an older wiki and a fresh clone checks out pages that
+    # are not the published ones.
+    #
+    # Pushed with the App's token through an explicit remote: the App is the identity main's
+    # ruleset lets through. It lands on what the branch is NOW, so a merge that came in
+    # meanwhile does not make it a non-fast-forward.
+    - name: Record the Submodule Pointer
+      if: env.PUSH == 'true' && steps.push.outputs.pushed == 'true'
+      env:
+        TOKEN: ${{ steps.app-token.outputs.token }}
+      run: |
+        pin=$(git -C docs rev-parse HEAD)
+        if [ "$(git rev-parse "HEAD:docs")" = "$pin" ]; then
+          exit 0
+        fi
+        if [ -z "$TOKEN" ]; then
+          echo "::warning::Wiki published, but the docs pointer was not recorded: no App token (GH_CLIENT_ID unset)."
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        remote="https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+        git fetch --quiet origin "$GITHUB_REF_NAME"
+        git checkout --quiet -B "$GITHUB_REF_NAME" FETCH_HEAD
+        git update-index --cacheinfo "160000,${pin},docs"
+        git commit --quiet -m "chore: bump docs submodule [skip ci]"
+        git push "$remote" "HEAD:${GITHUB_REF_NAME}"
+
+    # Every open PR into main falls behind each merge, and an agent PR's docs pointer (and often
+    # CHANGELOG's [Unreleased]) conflicts with every other's. This brings each one up to date:
+    # GitHub's update-branch when it merges clean, otherwise a merge whose docs pointer goes to
+    # the wiki's head and whose CHANGELOG keeps both sides. Anything else is left for the PR's
+    # agent. It pushes as the App, so each PR's checks run again.
+    # !cancelled(): it does not depend on the publish above, so a wiki push refused (a browser
+    # edit) still leaves the PRs current
+    - name: Bring the Open PRs Up to Date
+      if: ${{ !cancelled() && github.event_name == 'push' }}
+      uses: kubed-io/actions/pr-update@main
+      with:
+        client-id: ${{ vars.GH_CLIENT_ID }}
+        private-key: ${{ secrets.GH_APP_KEY }}

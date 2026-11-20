@@ -12,6 +12,9 @@ loaded through Python entry points. Today it is a skeleton and holds no logic.
 - **[The wiki](https://github.com/kubed-io/quick-mcp/wiki)** is the manual, checked out as a
   submodule at `docs/`. `docs/` is the wiki's own repository: [CONTRIBUTING.md](CONTRIBUTING.md)
   says which branch to commit on, and you never push the wiki's `master`.
+- **[The spec](https://github.com/kubed-io/quick-mcp/wiki/Specification)** is what the package
+  promises, as numbered requirements, at `docs/superpowers/specs/`. A behaviour change edits it in the
+  same change.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** is the loop: setup, what CI runs, how the changelog is
   written.
 - **[README.md](README.md)** advertises. It links out and explains nothing.
