@@ -9,7 +9,7 @@ loaded through Python entry points. Today it is a skeleton and holds no logic.
 
 ## Read first
 
-- **[The wiki](https://github.com/kubed-io/kubed-mcp/wiki)** is the manual, checked out as a
+- **[The wiki](https://github.com/kubed-io/quick-mcp/wiki)** is the manual, checked out as a
   submodule at `docs/`. `docs/` is the wiki's own repository: [CONTRIBUTING.md](CONTRIBUTING.md)
   says which branch to commit on, and you never push the wiki's `master`.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** is the loop: setup, what CI runs, how the changelog is

@@ -3,7 +3,7 @@
 ## Getting set up
 
 ```bash
-git clone --recurse-submodules git@github.com:kubed-io/kubed-mcp.git
+git clone --recurse-submodules git@github.com:kubed-io/quick-mcp.git
 ```
 
 `docs/` is the GitHub wiki, checked out as a submodule; an existing clone gets it with
