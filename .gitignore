@@ -1,0 +1,43 @@
+# Build & distribution artifacts
+build/
+dist/
+*.egg-info
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment & direnv
+.env
+.envrc
+.direnv/
+
+# OS / Editor noise
+.DS_Store
+.idea/
+
+# Logs
+*.log
+
+# Org-wide scratch
+stuff/
+foo.*
+out.yaml
+.worktrees/
+
+# Subagent-driven-development scratch: ledgers, briefs, review packages.
+.superpowers/
+
+# The issue agents' per-run context and scratch (kubed-io/actions issue-agent, pr-checks)
+.issue/
