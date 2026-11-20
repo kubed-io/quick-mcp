@@ -69,7 +69,7 @@ jobs:
         cache-dependency-path: pyproject.toml
 
     - name: Install
-      run: pip install .[test]
+      run: pip install .[test,tasks]
 
     # --junit-xml feeds `Test results`, which turns a failing assertion into a named
     # test rather than a wall of pytest output.
