@@ -1,0 +1,23 @@
+name: 🧭 Agent · Issue
+
+# The spec agent on an issue: kubed-io/actions' agent-issue.yml says what it does.
+
+on:
+  # n8n sends it (Agent flow · intake)
+  repository_dispatch:
+    # sub-issue-accepted: Dr K ticked a suggested sub-issue (spec 2026-11-03 R-M10)
+    types: [agent-issue, sub-issue-accepted]
+
+permissions: {}
+
+jobs:
+  agent:
+    name: Agent
+    uses: kubed-io/actions/.github/workflows/agent-issue.yml@main
+    with:
+      # docs/ is the wiki: a spec or plan lands there first, then its pointer
+      wiki: docs
+    secrets: inherit
+    permissions:
+      contents: read
+      issues: write

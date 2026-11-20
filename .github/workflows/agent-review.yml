@@ -1,0 +1,28 @@
+name: 🔍 Agent · Review
+
+# The review agent and the `Agent review` status: kubed-io/actions' agent-review.yml says
+# what they do.
+
+on:
+  # pr.yml's Checks job sends it, for an `agent` PR only
+  repository_dispatch:
+    types: [agent-review]
+
+permissions: {}
+
+jobs:
+  agent:
+    name: Agent
+    uses: kubed-io/actions/.github/workflows/agent-review.yml@main
+    secrets: inherit
+    permissions:
+      # contents write is the `agent-code` dispatch's; the review, its comments, the notes
+      # and the status are github-actions[bot]'s
+      contents: write
+      actions: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      # pr-checks: the alerts and the annotations
+      checks: read
+      security-events: read

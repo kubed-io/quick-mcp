@@ -1,0 +1,29 @@
+name: 🛠️ Agent · Pull Request
+
+# The plan and code agents on a PR from an issue: kubed-io/actions' agent-pr.yml says what
+# they do.
+
+on:
+  # n8n sends these (Agent flow · intake)
+  repository_dispatch:
+    types: [agent-code, agent-route]
+
+permissions: {}
+
+jobs:
+  agent:
+    name: Agent
+    uses: kubed-io/actions/.github/workflows/agent-pr.yml@main
+    with:
+      # docs/ is the wiki: a spec or plan lands there first, then its pointer
+      wiki: docs
+    secrets: inherit
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      # the checks report, an artifact of pr.yml's run
+      actions: read
+      # pr-checks: the alerts and the annotations
+      checks: read
+      security-events: read
