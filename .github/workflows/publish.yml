@@ -1,0 +1,282 @@
+name: 🧬 Publish Version
+
+# Manual, intentional release. Each job owns one thing, ordered so nothing
+# outward-facing happens until every artifact it refers to exists:
+#
+#   test    → the full 3.11 → 3.14 matrix; gates everything below
+#   version → roll CHANGELOG [Unreleased], commit + tag on main. The ONLY job
+#             that writes a file or a tag; it emits the tag used downstream.
+#   package → check out that tag and build the sdist + wheel → GHA artifact
+#   pypi    → upload that artifact to PyPI
+#   release → attach the same artifact to the GitHub Release
+#
+# PyPI uses trusted publishing, which PyPI binds to THIS file name and the
+# `pypi` environment — so the upload is a job here, never inside a called
+# workflow, and renaming this file breaks publishing until PyPI is updated.
+#
+# Run once with push=false (a dry run: tests, the next version, and both builds,
+# nothing pushed), then push=true. A failed build after a successful tag strands
+# a tag that never reached PyPI, which is what the dry run buys.
+#
+# Auth for the version job: tokenless WIF → GCP Secret Manager → the kubed.io
+# GitHub App creds, which let the version job commit and tag on main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Version to bump to
+        default: patch
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
+        - premajor
+        - preminor
+        - prepatch
+      push:
+        description: Push changes and create release
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+    # A called job gets no more than its caller grants, and test.yml's results
+    # job asks for these to post its check run.
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+  version:
+    name: Version
+    needs: test
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write   # commit the rolled CHANGELOG and push the tag to main
+      id-token: write   # GCP workload-identity federation, for the App token
+    # No release-notes output: GitHub drops a job output that contains a
+    # registered secret's substring (`kubed-io` is in every PR link), silently.
+    # The notes travel as an artifact instead.
+    outputs:
+      tag: ${{ steps.bump.outputs.tag || steps.first.outputs.tag }}
+      version: ${{ steps.bump.outputs.version || steps.first.outputs.version }}
+    steps:
+
+    - name: Validate Branch
+      if: inputs.push
+      env:
+        REF: ${{ github.ref_name }}
+      run: |
+        if [[ "$REF" != "main" ]]; then
+          echo "::error::Releases can only be pushed from main. Current ref: $REF"
+          exit 1
+        fi
+
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+        service_account: github@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+
+    # github-app = kubed.io app creds (JSON: github_app_client_id /
+    # github_app_private_key) pushed by apps/github/providers/gcp.
+    - name: Get secrets
+      id: secrets
+      uses: google-github-actions/get-secretmanager-secrets@v3
+      with:
+        secrets: |-
+          github_app:${{ vars.GCP_PROJECT }}/github-app
+
+    - name: Mint kubed.io app token
+      id: app-token
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ fromJson(steps.secrets.outputs.github_app).github_app_client_id }}
+        private-key: ${{ fromJson(steps.secrets.outputs.github_app).github_app_private_key }}
+        permission-contents: write
+
+    # Nothing here pushes through git: version-bump and the step below write
+    # through the API with the App token, so the checkout keeps no credential.
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    # version-bump cannot cut the first release. With no `v*` tag it counts on
+    # from a v0.0.1 that does not exist, so `patch` gives 0.0.2 and its notes
+    # call fails (400, invalid previous_tag); no base tag or input gets it to
+    # 0.0.1. So with no tag yet this step does what version-bump would have,
+    # releasing 0.0.1, and once v0.0.1 exists it does nothing.
+    - name: First Release
+      id: first
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        ACTION: ${{ inputs.action }}
+        PUSH: ${{ inputs.push }}
+        REPO: ${{ github.repository }}
+        REF: ${{ github.ref_name }}
+      run: |
+        if [[ -n "$(git tag --list 'v*')" ]]; then
+          echo "A v* tag exists, so version-bump takes it from here."
+          exit 0
+        fi
+        if [[ "$ACTION" != patch ]]; then
+          echo "::error::There is no tag yet, so the first release is 0.0.1: run with action=patch."
+          exit 1
+        fi
+        version=0.0.1
+        tag="v$version"
+
+        # Notes as version-bump writes them: [Unreleased], then GitHub's own.
+        changelog=$(awk '/^## \[Unreleased\]/ {f=1; next} /^## \[/ {exit} f' CHANGELOG.md)
+        generated=$(gh api "repos/$REPO/releases/generate-notes" \
+          -f tag_name="$tag" -f target_commitish="$REF" --jq .body)
+        sed -i "0,/^## \[Unreleased\]/s//&\n\n## [$version] - $(date -u +%F)/" CHANGELOG.md
+        git --no-pager diff
+
+        # Through the API, as version-bump does, so GitHub signs the commit as
+        # the App. A PATCH without force fails if main moved since checkout.
+        if [[ "$PUSH" == true ]]; then
+          tree=$(jq -n --arg base "$(git rev-parse 'HEAD^{tree}')" --rawfile content CHANGELOG.md \
+            '{base_tree: $base, tree: [{path: "CHANGELOG.md", mode: "100644", type: "blob", content: $content}]}' |
+            gh api "repos/$REPO/git/trees" --input - --jq .sha)
+          commit=$(gh api "repos/$REPO/git/commits" -f message="Bump version to $tag" \
+            -f tree="$tree" -f "parents[]=$(git rev-parse HEAD)" --jq .sha)
+          gh api -X PATCH "repos/$REPO/git/refs/heads/$REF" -f sha="$commit" --silent
+          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$commit" --silent
+        fi
+
+        delimiter="notes-$(openssl rand -hex 8)"
+        {
+          echo "version=$version"
+          echo "tag=$tag"
+          echo "release-notes<<$delimiter"
+          printf '%s\n%s\n' "$changelog" "$generated"
+          echo "$delimiter"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Bump Version
+      id: bump
+      if: steps.first.outputs.tag == ''
+      uses: duplocloud/version-bump@main
+      with:
+        version: ${{ inputs.action }}
+        push: ${{ inputs.push }}
+        token: ${{ steps.app-token.outputs.token }}
+
+    # Empty notes are a hard failure: they ARE the release, and an empty body
+    # sails through a green run unnoticed.
+    - name: Save the Release Notes
+      env:
+        NOTES: ${{ steps.bump.outputs.release-notes || steps.first.outputs.release-notes }}
+      run: |
+        mkdir -p notes
+        printf '%s\n' "$NOTES" > notes/release-notes.md
+        if [[ ! -s notes/release-notes.md || -z "$(tr -d '[:space:]' < notes/release-notes.md)" ]]; then
+          echo "::error::The release notes came back empty, so this fails rather than publishing a release without them."
+          exit 1
+        fi
+        echo "Release notes: $(wc -l < notes/release-notes.md) lines." >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload the Release Notes
+      uses: actions/upload-artifact@v7
+      with:
+        name: release-notes
+        path: notes/release-notes.md
+        retention-days: 1
+
+  # On a dry run there is no tag, so it builds the current ref.
+  package:
+    name: Package
+    needs: version
+    uses: ./.github/workflows/package.yml
+    with:
+      tag: ${{ inputs.push && needs.version.outputs.tag || '' }}
+
+  pypi:
+    name: PyPI
+    needs: package
+    if: inputs.push
+    runs-on: ubuntu-26.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kubed-mcp
+    permissions:
+      contents: read
+      id-token: write   # PyPI trusted publishing
+    steps:
+
+    - name: Download Package
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ needs.package.outputs.package }}
+        path: dist
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    name: Release
+    needs:
+    - version
+    - package
+    - pypi
+    if: inputs.push
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write   # create the GitHub Release on the existing tag
+    steps:
+
+    - name: Download Package
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ needs.package.outputs.package }}
+        path: dist
+
+    - name: Download the Release Notes
+      uses: actions/download-artifact@v8
+      with:
+        name: release-notes
+        path: notes
+
+    - name: Compose the Release Body
+      env:
+        SERVER: ${{ github.server_url }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+        VERSION: ${{ needs.package.outputs.version }}
+      run: |
+        {
+          echo "[![Publish](${SERVER}/${REPO}/actions/workflows/publish.yml/badge.svg)](${SERVER}/${REPO}/actions/runs/${RUN_ID})"
+          echo "[![Test](${SERVER}/${REPO}/actions/workflows/test.yml/badge.svg)](${SERVER}/${REPO}/actions/workflows/test.yml)"
+          echo "[![Quality](${SERVER}/${REPO}/actions/workflows/quality.yml/badge.svg)](${SERVER}/${REPO}/actions/workflows/quality.yml)"
+          echo
+          cat notes/release-notes.md
+          echo
+          echo "## Install"
+          echo
+          echo '```sh'
+          echo "pip install kubed-mcp==${VERSION}"
+          echo '```'
+        } > body.md
+        cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v3.0.4
+      with:
+        name: ${{ needs.version.outputs.tag }}
+        tag_name: ${{ needs.version.outputs.tag }}
+        prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
+        body_path: body.md
+        files: |
+          dist/${{ needs.package.outputs.sdist }}
+          dist/${{ needs.package.outputs.wheel }}
