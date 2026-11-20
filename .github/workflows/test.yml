@@ -1,0 +1,132 @@
+name: 🧪 Test
+
+# Unit tests only: no network, so this stays fast and needs nothing running beside it.
+#
+# The matrix is event-shaped, and that is the whole design of this file:
+#
+#   pull_request     3.11 and 3.14, called by pr.yml — the floor and the newest, in parallel
+#   push: main       3.11 → 3.14 — the compatibility sweep, run once the change
+#                    has already landed, for the versions in between
+#   workflow_call    full matrix too (the caller's event is not pull_request) —
+#                    publish.yml runs this before it cuts a version, so a release
+#                    never ships an interpreter it has not been tested on
+#
+# The floor is where pathlib, globbing and friends differ most, so it gates a pull
+# request as much as the newest does. `Test results` is the required check, and it
+# fails when any leg fails.
+
+on:
+  # pull requests: pr.yml calls this, with every other check, so one collector sees them all
+  # (with no path filter: a required check that never reports blocks a PR forever). The
+  # push filter below is fine: nothing gates on it.
+  push:
+    branches: [main]
+    paths:
+    - kubed/**
+    - tests/**
+    - pyproject.toml
+    - .github/workflows/test.yml
+  workflow_dispatch:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    name: Test
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-26.04
+    # a hang fails here, red, instead of holding the PR for 6 hours
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      # One interpreter failing should not hide the others — on a main-branch
+      # sweep the useful answer is "which versions broke", not "the first one to".
+      fail-fast: false
+      matrix:
+        # A pull request pays for the floor and the newest; everything else sweeps the
+        # supported range. The required status check is `Test results` below, which every
+        # leg feeds: a skipped matrix reports only as `Test`, never under a leg's name, so
+        # no leg can be the required one.
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        # setuptools_scm needs history to resolve a version at install time.
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+        cache-dependency-path: pyproject.toml
+
+    - name: Install
+      run: pip install .[test]
+
+    # --junit-xml feeds `Test results`, which turns a failing assertion into a named
+    # test rather than a wall of pytest output.
+    - name: Test
+      run: pytest --junit-xml=dist/test-results.xml
+
+    # One artifact per leg, so a sweep does not have four uploads racing for one name.
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: dist/test-results.xml
+        if-no-files-found: error
+
+  # Every leg's results as one: the sticky comment, the check run that annotates a
+  # failing test where it fails, and the required status check. It runs whatever the
+  # legs did, so a failing leg still publishes, then fails here; on a draft it is
+  # skipped, which a required check counts as passed.
+  results:
+    name: Test results
+    needs: test
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+
+    # No merge-multiple: every leg's file is named test-results.xml, so merged they
+    # would overwrite each other; each artifact lands in its own directory instead.
+    - name: Download Every Leg's Results
+      uses: actions/download-artifact@v8
+      with:
+        path: results
+        pattern: test-results-*
+
+    - name: One Report per Leg
+      env:
+        LEGS: ${{ github.event_name == 'pull_request' && 2 || 4 }}
+      run: |
+        found=$(find results -name '*.xml' | wc -l)
+        echo "$found reports for $LEGS legs"
+        [ "$found" -eq "$LEGS" ] || { echo "::error::$LEGS legs, $found reports"; exit 1; }
+
+    - name: Publish Test Results
+      uses: EnricoMi/publish-unit-test-result-action@v2
+      with:
+        check_name: Unit test results
+        files: results/**/*.xml
+        comment_mode: always
+
+    - name: Every Leg Passed
+      if: needs.test.result != 'success'
+      env:
+        RESULT: ${{ needs.test.result }}
+      run: |
+        echo "::error::the test matrix ended $RESULT"
+        exit 1

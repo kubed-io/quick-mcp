@@ -1,0 +1,97 @@
+name: 🧹 Lint
+
+# The static gates, kept out of test.yml so a red here names the thing that is wrong
+# instead of burying it in a test run. Two independent jobs, both fast, in parallel:
+#
+#   Ruff              ruff over the whole checkout, tests included
+#   Dependency Audit  pip-audit over the resolved RUNTIME dependency set
+#
+# The scanners, whose findings go to code scanning, are quality.yml.
+
+on:
+  # pull requests: pr.yml calls this, with every other gate, so one collector sees them all
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+
+    # ruff reads its config from pyproject.toml and needs nothing else installed.
+    - name: Install Ruff
+      run: pip install ruff
+
+    # No paths: the ruff config covers the whole checkout, so naming directories here
+    # would be a second list to keep in sync with it.
+    - name: Lint
+      run: ruff check --output-format=github .
+
+  # ---------------------------------------------------------------------------
+  # Known-vulnerability audit of what a user's install actually pulls in.
+  # ---------------------------------------------------------------------------
+  deps:
+    name: Dependency Audit
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        # setuptools_scm resolves the version from history at install time.
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+        cache: pip
+        cache-dependency-path: pyproject.toml
+
+    # Runtime only. The test extra is deliberately NOT installed here: ruff and
+    # pytest never reach a user, and an advisory against a test-only tool that
+    # stops a release is noise, not security.
+    - name: Install Runtime Dependencies
+      run: pip install --editable .
+
+    # --exclude-editable drops kubed-mcp itself: pip-audit would look up this
+    # checkout's dev version on PyPI and fail to resolve it, which reads like a
+    # broken audit rather than an unreleased version.
+    - name: Freeze Runtime Dependencies
+      run: pip freeze --exclude-editable > requirements.txt
+
+    - name: Audit Dependencies
+      uses: pypa/gh-action-pip-audit@v1.1.0
+      with:
+        inputs: requirements.txt
+        summary: true
+
+    - name: Upload Resolved Dependencies
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: requirements-lock
+        path: requirements.txt
+        if-no-files-found: error
