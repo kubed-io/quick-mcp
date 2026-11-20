@@ -149,7 +149,9 @@ class QuickMCP:
         """Serves until the process stops, as ``serving`` says, or the config when None.
 
         ``http_options`` go to FastMCP's HTTP transport (``path``, ``middleware``,
-        ``uvicorn_config``) and are not used on stdio.
+        ``uvicorn_config``) and are not used on stdio. The log level is never
+        passed on: given one, FastMCP's run puts its own handlers back on its logger
+        and stops it propagating, for the life of the process.
         """
         settings: Any = serving if serving is not None else self._config
         if settings is None:
@@ -162,7 +164,6 @@ class QuickMCP:
             transport=settings.transport,
             host=settings.host,
             port=settings.port,
-            log_level=settings.log_level,
             show_banner=False,
             **http_options,
         )

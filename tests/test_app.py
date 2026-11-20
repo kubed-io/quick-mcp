@@ -481,7 +481,6 @@ def test_run_reads_serving(ran) -> None:
             "transport": "http",
             "host": "127.0.0.1",
             "port": 9001,
-            "log_level": "DEBUG",
             "show_banner": False,
         }
     ]
@@ -512,5 +511,27 @@ def test_run_hands_fastmcps_logging_to_the_server(ran) -> None:
     fastmcp_logger.addHandler(logging.NullHandler())
     fastmcp_logger.propagate = False
     QuickMCP("logged").run(Settings())
+    assert fastmcp_logger.handlers == []
+    assert fastmcp_logger.propagate is True
+
+
+def test_serving_over_http_leaves_fastmcps_logging_with_the_server(
+    monkeypatch,
+) -> None:
+    """FastMCP's own run, not a stand-in: given a log level it would put its handlers
+    back on its logger for the rest of the process."""
+    seen: list[tuple[list[logging.Handler], bool]] = []
+
+    async def serve(self, sockets=None) -> None:
+        logger = logging.getLogger("fastmcp")
+        seen.append((list(logger.handlers), logger.propagate))
+
+    monkeypatch.setattr("uvicorn.Server.serve", serve)
+    fastmcp_logger = logging.getLogger("fastmcp")
+    QuickMCP("served").run(
+        Settings(host="127.0.0.1", port=0, log_level="DEBUG"),
+        uvicorn_config={"log_config": None},
+    )
+    assert seen == [([], True)]
     assert fastmcp_logger.handlers == []
     assert fastmcp_logger.propagate is True
