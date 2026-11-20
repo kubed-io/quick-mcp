@@ -292,11 +292,14 @@ def _md_files(base: Path, kind: str, entries: Iterable[str], notes: list[str]):
         if _inside(path, base) is None or not path.is_dir():
             notes.append(f"{kind} entry '{entry}' is not a folder in the plugin")
             continue
-        found += sorted(
-            child
-            for child in path.iterdir()
-            if child.suffix == ".md" and _readable(base, child.relative_to(base))
-        )
+        try:
+            found += sorted(
+                child
+                for child in path.iterdir()
+                if child.suffix == ".md" and _readable(base, child.relative_to(base))
+            )
+        except OSError as exc:
+            notes.append(f"{kind} entry '{entry}' cannot be listed: {exc}")
     return found
 
 
@@ -394,22 +397,37 @@ class Plugins:
             read,
         )
 
-    def _claim(self, key: str, plugin: Plugin, what: str, seen: set[str]) -> bool:
+    def _claim(
+        self,
+        key: str,
+        plugin: Plugin,
+        what: str,
+        seen: dict[str, Path | None],
+        path: Path | None = None,
+    ) -> bool:
         """Whether ``key`` is free: refused when served, skipped when this plugin
-        has it already."""
+        has it already, the warning naming both files when ``path`` is given."""
         owner = self._owners.get(key)
         if owner is not None:
             raise PluginError(f"{what} is already served by plugin {owner}")
         if key in seen:
-            log.warning("plugin %s: %s is skipped, served already", plugin.name, what)
+            first = seen[key]
+            if path is None or first is None:
+                log.warning(
+                    "plugin %s: %s is skipped, served already", plugin.name, what
+                )
+            else:
+                log.warning(
+                    "%s is already served by %s; %s is skipped", what, first, path
+                )
             return False
-        seen.add(key)
+        seen[key] = path
         return True
 
     def _read(self, plugin: Plugin, prefix: str, notes: list[str]) -> _Read:
         base = plugin.root.resolve()
         parts = plugin.components
-        seen: set[str] = set()
+        seen: dict[str, Path | None] = {}
 
         catalogue: dict[str, skills.Skill] = {}
         by_name: dict[str, str] = {}
@@ -440,7 +458,7 @@ class Plugins:
                 log.warning("prompt %s is skipped: %s", path, exc)
                 continue
             if self._claim(
-                f"prompt:{prompt.name}", plugin, f"prompt {prompt.name}", seen
+                f"prompt:{prompt.name}", plugin, f"prompt {prompt.name}", seen, path
             ):
                 prompts.append(prompt)
 
@@ -455,7 +473,7 @@ class Plugins:
             if isinstance(agent, str):
                 log.warning("agent file %s is skipped: %s", path, agent)
             elif self._claim(
-                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen
+                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen, path
             ):
                 agents.append(agent)
         return _Read(catalogue, prompts, agents)
