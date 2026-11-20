@@ -55,17 +55,12 @@ rules:
     - agent-pr.yml
     - agent-review.yml
 
-  # The checkout in publish.yml MUST keep its credentials: duplocloud/version-bump
-  # commits the rolled changelog and pushes the tag through the remote checkout
-  # configured — the only thing the job exists for. The one artifact that job
-  # uploads is `notes/release-notes.md`, written outside the checkout, so the
-  # credential in `.git/config` is not in anything that leaves the runner.
+  # wiki.yml pushes from inside the `docs/` submodule, which authenticates with
+  # what checkout left in that submodule's remote — so the credential has to
+  # survive the checkout. The job uploads no artifact, so it has nowhere to leak to.
+  # publish.yml is not here: version-bump writes through the API, not the remote.
   artipacked:
     ignore:
-    - publish.yml
-    # wiki.yml pushes from inside the `docs/` submodule, which authenticates with
-    # what checkout left in that submodule's remote — so the credential has to
-    # survive the checkout. The job uploads no artifact, so it has nowhere to leak to.
     - wiki.yml
 
   # `gh release create` in a script step would work, but softprops/action-gh-release
