@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import FastMCP's names from `kubed.mcp`, `kubed.mcp.protocol` and `kubed.mcp.auth`, the same objects under one pin.
 - `request_values()` reads a request's query parameters and headers, every value a list.
 - `kubed-mcp[tasks]` installs FastMCP's background tasks.
+- `kubed.mcp.skills` serves a catalogue of Agent Skills strictly, each listed by its `SKILL.md` alone, nested paths included.
+- A served skill's folders read as directory resources, with `_index.json` and `_index.md` beside each.
+- The Skills extension answers handshake-era clients too, and `AdvertiseLegacyExtensions` declares an extension in a legacy `initialize`.
 
 ### Changed
 

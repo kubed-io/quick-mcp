@@ -7,7 +7,13 @@ import warnings
 
 import pytest
 
-FACADES = ("kubed.mcp", "kubed.mcp.protocol", "kubed.mcp.auth", "kubed.mcp.request")
+FACADES = (
+    "kubed.mcp",
+    "kubed.mcp.protocol",
+    "kubed.mcp.auth",
+    "kubed.mcp.request",
+    "kubed.mcp.skills",
+)
 
 # Where each re-export comes from, so a re-export is checked to be the same object.
 SOURCES = {
@@ -71,14 +77,27 @@ SOURCES = {
         "get_context": "fastmcp.server.dependencies",
         "get_http_request": "fastmcp.server.dependencies",
     },
+    "kubed.mcp.skills": {
+        "Skill": "fastmcp.skills",
+    },
 }
 
 # Names this package defines rather than re-exports.
 OWN = {
     "kubed.mcp": {"Inject", "QuickMCP", "Serving", "lookup"},
-    "kubed.mcp.protocol": {"types"},
+    "kubed.mcp.protocol": {"AdvertiseLegacyExtensions", "types"},
     "kubed.mcp.auth": set(),
     "kubed.mcp.request": {"Values", "request_values"},
+    "kubed.mcp.skills": {
+        "EntryOnlySkillProvider",
+        "FolderNotFound",
+        "Folders",
+        "NameTheIndex",
+        "SkillsExtension",
+        "load_skill",
+        "serve",
+        "without_reserved",
+    },
 }
 
 
