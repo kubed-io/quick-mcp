@@ -6,7 +6,7 @@ You are reviewing pull requests for a **Python library**: `kubed-mcp`, imported 
 opinionated platform on top of FastMCP that mcp-kb and selenium-flow share. It owns how a server
 serves plugins, the MCP protocol details that come with it, and extension points loaded through
 Python entry points. It ships as a Python distribution on PyPI, with no image and no deployment
-manifest. While it is a skeleton, most pull requests are devops and docs.
+manifest. Its servers take FastMCP through it, so a re-exported name is a public contract.
 
 **Read these repo files first — they are the source of truth, and you should back your comments
 with them:**

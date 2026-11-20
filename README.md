@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![FastMCP](https://img.shields.io/badge/FastMCP-4-8a2be2)](https://gofastmcp.com/)
 
-> **Pre-release.** This is a skeleton: the repository, its devops and a name on PyPI. There is no code to use yet.
+> **Pre-release.** `QuickMCP`, its container and the facade over FastMCP are in. Serving plugins is next.
 
 ---
 
@@ -35,7 +35,19 @@ It is built for [mcp-kb](https://github.com/kubed-io/mcp-kb) and [selenium-flow]
 pip install kubed-mcp
 ```
 
-Import it as `kubed.mcp`. Today that gets you a package with nothing in it.
+Import it as `kubed.mcp`:
+
+```python
+from kubed.mcp import Inject, QuickMCP
+
+mcp = QuickMCP("grid", config=settings)
+mcp.singleton(Grid)
+
+@mcp.tool
+async def navigate(url: str, grid: Inject[Grid]) -> dict: ...
+
+mcp.run()
+```
 
 ---
 

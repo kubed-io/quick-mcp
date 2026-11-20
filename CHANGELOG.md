@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`QuickMCP`:** build a FastMCP server in a factory, and serve it from its config with `run()`.
+- **`Inject[T]`:** a tool, resource or prompt takes an object the container builds, kept out of its schema.
+- Singleton, session and transient lifetimes, with async factories, ordered teardown and `override` for tests.
+
+### Changed
+
+- Needs FastMCP 4.2 or later.
+
 ## [0.0.2] - 2026-11-20
 
 ## [0.0.1] - 2026-11-20

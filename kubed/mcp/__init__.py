@@ -1,12 +1,26 @@
-"""The platform mcp-kb and selenium-flow share on top of FastMCP.
+"""kubed-mcp: an opinionated platform on top of FastMCP.
 
-It will own how a server serves plugins, the MCP protocol details that come with
-them, and the extension points loaded through Python entry points. Today it holds
-only its own version.
+``QuickMCP`` builds the server, its container builds what the tools use, and
+``Inject[T]`` hands it to them.
 """
 
 from __future__ import annotations
 
 from importlib.metadata import version
 
+from fastmcp.dependencies import Depends
+from fastmcp.server.context import Context
+
+from .app import QuickMCP, Serving
+from .inject import Inject, lookup
+
 __version__ = version("kubed-mcp")
+
+__all__ = [
+    "Context",
+    "Depends",
+    "Inject",
+    "QuickMCP",
+    "Serving",
+    "lookup",
+]

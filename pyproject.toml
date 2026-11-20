@@ -23,12 +23,16 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-  # Both servers install this beside their own fastmcp pin, so the range is one
-  # both already accept: a conflict shows up here, not at the first real feature.
-  "fastmcp>=4.1.4,<5",
+  # quick-mcp owns the FastMCP pin, and its servers take FastMCP through it.
+  # The floor is the first release with Annotated injection and fastmcp.skills.
+  "fastmcp>=4.2,<5",
 ]
 
 [project.optional-dependencies]
+# Background tasks (TaskConfig, TasksExtension), re-exported by kubed.mcp.protocol.
+tasks = [
+  "fastmcp[tasks]>=4.2,<5",
+]
 build = [
   "setuptools_scm",
   "build",
@@ -63,6 +67,10 @@ Changelog = "https://github.com/kubed-io/quick-mcp/blob/main/CHANGELOG.md"
 packages = [
   "kubed.mcp",
 ]
+
+[tool.setuptools.package-data]
+# PEP 561: consumers' type checkers read the inline types, so Inject[T] is T.
+"kubed.mcp" = ["py.typed"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
