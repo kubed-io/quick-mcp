@@ -128,10 +128,10 @@ class QuickMCP:
         A bare path or a ``file://`` URL is read in place; any other scheme needs a
         loader registered with ``add_loader``. ``namespace`` None is the server's name,
         so a skill at ``skills/<name>/`` is ``skill://<server>/<name>/SKILL.md``; given
-        ``"x"``, it is ``skill://x/<name>/SKILL.md``, and given ``""``, the root,
-        ``skill://<name>/SKILL.md``. Plugins under one namespace merge. A plugin that
-        does not load, or that would serve something already served, is refused with a
-        ``PluginError`` naming the reason, and nothing of it is served.
+        ``"x"``, it is ``skill://x/<name>/SKILL.md``. An empty namespace is refused with
+        a ``ValueError``: there is no root. Plugins under one namespace merge. A plugin
+        that does not load, or that would serve something already served, is refused
+        with a ``PluginError`` naming the reason, and nothing of it is served.
         """
         return self._plugins.add(address, namespace)
 

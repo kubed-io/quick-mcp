@@ -12,8 +12,9 @@ component path that leaves the plugin root is dropped with a warning naming it.
 Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
 prompts (``kubed.mcp.prompts``) and agents through the agents extension
 (``kubed.mcp.agents``). A plugin added with no namespace is the server's own, its
-skills under ``skill://<server name>/``, and ``""`` is the root; plugins added under
-one namespace merge, and a second thing at one address is refused.
+skills under ``skill://<server name>/``; there is no root, and an empty namespace is
+refused. Plugins added under one namespace merge, and a second thing at one address is
+refused.
 """
 
 from __future__ import annotations
@@ -113,8 +114,8 @@ class Components:
 class Plugin:
     """A plugin: its metadata, where it was read from, and what it serves.
 
-    ``namespace`` is ``""`` for the root. ``skills`` are the ``skill://`` URIs of the
-    ``SKILL.md`` of each skill served, ``prompts`` and ``agents`` the names served.
+    ``namespace`` is the one it is served under. ``skills`` are the ``skill://`` URIs of
+    the ``SKILL.md`` of each skill served, ``prompts`` and ``agents`` the names served.
     """
 
     name: str
@@ -300,13 +301,18 @@ def _md_files(base: Path, kind: str, entries: Iterable[str], notes: list[str]):
 
 
 def _namespace(namespace: str | None, server: str) -> str:
-    """``namespace`` as served: the server's name for None, ``""`` for the root, else
-    its ``/`` segments."""
+    """``namespace`` as served: the server's name for None, else its ``/`` segments.
+
+    There is no root: a blank namespace is refused.
+    """
     if namespace is None:
         namespace = server
     trimmed = namespace.strip("/")
-    if not trimmed:
-        return ""
+    if not trimmed.strip():
+        raise ValueError(
+            f"namespace {namespace!r} is empty: skills are always under a namespace, "
+            "None is the server's name"
+        )
     parts = trimmed.split("/")
     if any(part in (".", "..") or not _usable(part) for part in parts):
         raise ValueError(f"namespace {namespace!r} is not a path of usable names")
@@ -409,7 +415,7 @@ class Plugins:
         by_name: dict[str, str] = {}
         for folder in parts.skills:
             for path, location in _skill_folders(base, folder, notes):
-                key = f"{prefix}/{path}" if prefix else path
+                key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
                 if not self._claim(uri, plugin, uri, seen):
                     continue
@@ -419,9 +425,9 @@ class Plugins:
                 catalogue[key] = skill
                 by_name.setdefault(skill.name, uri)
 
-        # The server is already a scope for prompts and agents: only another
-        # namespace than its own is a prefix.
-        own = prefix in ("", self._server.name)
+        # The server is already a scope for prompts and agents: only an explicit
+        # namespace other than its own is a prefix.
+        own = prefix == self._server.name
         named = "" if own else prefix.replace("/", "_") + "_"
         prompts: list[FilePrompt] = []
         for path in _md_files(base, "commands", parts.commands, notes):

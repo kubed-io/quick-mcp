@@ -27,7 +27,6 @@ DEMO = Path(__file__).parent / "plugins" / "demo"
 # A plugin added with no namespace serves under the server's name, "t" here.
 ENTRY = "skill://t/demo-guide/SKILL.md"
 GUIDE = "skill://t/demo-guide/references/GUIDE.md"
-ROOT_ENTRY = "skill://demo-guide/SKILL.md"
 
 
 def write(root: Path, files: dict[str, str]) -> Path:
@@ -216,24 +215,15 @@ async def test_no_namespace_is_the_servers_name():
     assert detail["_meta"][META_KEY]["skills"] == {"demo-guide": entry}
 
 
-async def test_an_empty_namespace_is_the_root():
-    mcp = served((DEMO, ""))
-    assert mcp.plugins[0].namespace == ""
-    assert mcp.plugins[0].skills == (ROOT_ENTRY,)
-    assert await skill_uris(mcp) == [ROOT_ENTRY]
-    async with Client(mcp.server) as client:
-        guide = await client.read_resource("skill://demo-guide/references/GUIDE.md")
-        prompts = [p.name for p in await client.list_prompts()]
-        detail = await request(client, "agents/get", name="helper")
-    assert guide[0].text.startswith("# The guide")
-    assert prompts == ["greet"]
-    assert detail["_meta"][META_KEY]["skills"] == {"demo-guide": ROOT_ENTRY}
+@pytest.mark.parametrize("namespace", ["", " ", "/"])
+def test_an_empty_namespace_is_refused(namespace):
+    with pytest.raises(ValueError, match="empty"):
+        QuickMCP("t").add_plugin(DEMO, namespace=namespace)
 
 
 async def test_a_skill_keeps_its_path_under_skills(tmp_path):
     root = write(tmp_path / "deep", {"skills/tools/lint/SKILL.md": skill("lint")})
     assert await skill_uris(served((root, None))) == ["skill://t/tools/lint/SKILL.md"]
-    assert await skill_uris(served((root, ""))) == ["skill://tools/lint/SKILL.md"]
     assert await skill_uris(served((root, "lib"))) == [
         "skill://lib/tools/lint/SKILL.md"
     ]
@@ -312,13 +302,6 @@ def test_a_prompt_clash_is_refused(tmp_path):
 async def test_another_namespace_does_not_clash():
     mcp = served((DEMO, None), (DEMO, "kit"))
     assert await skill_uris(mcp) == ["skill://kit/demo-guide/SKILL.md", ENTRY]
-
-
-def test_the_root_and_the_servers_name_share_prompt_names():
-    """Neither prefixes a prompt, so the same command in both clashes."""
-    mcp = served((DEMO, None))
-    with pytest.raises(PluginError, match="prompt greet is already served"):
-        mcp.add_plugin(DEMO, namespace="")
 
 
 @pytest.mark.parametrize("namespace", ["..", "a/../b", "a b"])
