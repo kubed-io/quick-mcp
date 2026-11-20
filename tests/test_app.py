@@ -10,6 +10,10 @@ from dataclasses import dataclass
 
 import pytest
 from fastmcp import Client
+from fastmcp.server.transforms import Namespace
+from fastmcp.utilities.tests import asgi_server
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import kubed.mcp.container
 from kubed.mcp import Context, Inject, QuickMCP, lookup
@@ -71,7 +75,6 @@ class Settings:
     transport: str = "http"
     host: str = "0.0.0.0"
     port: int = 8000
-    log_level: str = "INFO"
 
 
 def server(**options) -> QuickMCP:
@@ -417,6 +420,60 @@ async def test_singletons_are_built_again_after_a_restart() -> None:
     assert BUILT["Grid"] == 2
 
 
+class Booted:
+    """Built before the server starts, by the caller, who owns its lifetime."""
+
+    def __init__(self) -> None:
+        self.id = _count("Booted")
+
+    async def __aenter__(self) -> Booted:
+        EVENTS.append("booted entered")
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        EVENTS.append("booted exited")
+
+
+class Reader:
+    def __init__(self, booted: Booted) -> None:
+        self.booted = booted
+
+
+async def test_a_singleton_instance_is_injected_and_never_built_or_torn_down() -> None:
+    booted = Booted()
+    mcp = QuickMCP("instance")
+    mcp.singleton(Booted, instance=booted)
+    mcp.transient(Reader)
+
+    @mcp.tool
+    def ids(booted: Inject[Booted], reader: Inject[Reader]) -> list[int]:
+        return [booted.id, reader.booted.id]
+
+    for _ in range(2):  # a restart keeps it: it was never the container's
+        async with Client(mcp.server) as client:
+            assert (await client.call_tool("ids", {})).data == [booted.id] * 2
+    assert BUILT["Booted"] == 1
+    assert EVENTS == []
+
+
+def test_a_singleton_takes_a_factory_or_an_instance_not_both() -> None:
+    with pytest.raises(TypeError, match="a factory or an instance, not both"):
+        QuickMCP("both").singleton(Grid, Grid, instance=Grid())
+
+
+async def test_registering_a_key_again_replaces_its_instance_or_recipe() -> None:
+    mcp = server()
+    fake = Grid.__new__(Grid)
+    fake.id = -1
+    mcp.singleton(Grid, instance=fake)
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("navigate", {"url": "a"})).data["grid"] == -1
+    mcp.singleton(Grid)
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("navigate", {"url": "a"})).data["grid"] > 0
+    assert BUILT["Grid"] == 1
+
+
 # -- override and config -------------------------------------------------------
 
 
@@ -462,6 +519,34 @@ async def test_a_factory_parameter_with_no_registered_type_needs_a_default() -> 
     )
 
 
+# -- FastMCP's own ---------------------------------------------------------------
+
+
+async def test_a_transform_added_applies_to_every_tool() -> None:
+    mcp = server()
+    mcp.add_transform(Namespace("api"))
+    async with Client(mcp.server) as client:
+        names = {tool.name for tool in await client.list_tools()}
+        result = (await client.call_tool("api_navigate", {"url": "a"})).data
+    assert {"api_navigate", "api_origins"} <= names
+    assert "navigate" not in names
+    assert result["grid"] > 0
+
+
+async def test_a_custom_route_answers_over_http() -> None:
+    mcp = server()
+
+    @mcp.custom_route("/health", methods=["GET"], name="health")
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    assert health.__name__ == "health"  # the decorator hands back the handler
+    async with asgi_server(mcp.server) as running, running.http_client() as http:
+        answer = await http.get(str(running.app.url_path_for("health")))
+    assert answer.status_code == 200
+    assert answer.json() == {"status": "ok"}
+
+
 # -- run() ---------------------------------------------------------------------
 
 
@@ -475,7 +560,7 @@ def ran(monkeypatch) -> list[dict]:
 
 
 def test_run_reads_serving(ran) -> None:
-    QuickMCP("http").run(Settings(host="127.0.0.1", port=9001, log_level="DEBUG"))
+    QuickMCP("http").run(Settings(host="127.0.0.1", port=9001))
     assert ran == [
         {
             "transport": "http",
@@ -487,9 +572,7 @@ def test_run_reads_serving(ran) -> None:
 
 
 def test_run_reads_an_argparse_namespace(ran) -> None:
-    args = argparse.Namespace(
-        transport="stdio", host="0.0.0.0", port=8000, log_level="INFO"
-    )
+    args = argparse.Namespace(transport="stdio", host="0.0.0.0", port=8000, extra=1)
     QuickMCP("stdio").run(args, path="/mcp")
     assert ran == [{"transport": "stdio", "show_banner": False}]
 
@@ -519,7 +602,8 @@ def test_serving_over_http_leaves_fastmcps_logging_with_the_server(
     monkeypatch,
 ) -> None:
     """FastMCP's own run, not a stand-in: given a log level it would put its handlers
-    back on its logger for the rest of the process."""
+    back on its logger for the rest of the process. The config has one; run() never
+    passes it."""
     seen: list[tuple[list[logging.Handler], bool]] = []
 
     async def serve(self, sockets=None) -> None:
@@ -529,7 +613,9 @@ def test_serving_over_http_leaves_fastmcps_logging_with_the_server(
     monkeypatch.setattr("uvicorn.Server.serve", serve)
     fastmcp_logger = logging.getLogger("fastmcp")
     QuickMCP("served").run(
-        Settings(host="127.0.0.1", port=0, log_level="DEBUG"),
+        argparse.Namespace(
+            transport="http", host="127.0.0.1", port=0, log_level="DEBUG"
+        ),
         uvicorn_config={"log_config": None},
     )
     assert seen == [([], True)]

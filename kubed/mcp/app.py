@@ -27,9 +27,12 @@ from .container import (
 
 T = TypeVar("T")
 
+# ``singleton``'s ``instance`` when none is given: ``None`` may be one.
+_UNSET: Any = object()
+
 
 class Serving(Protocol):
-    """The four settings ``QuickMCP.run()`` reads: none of the rest of a config."""
+    """The three settings ``QuickMCP.run()`` reads: none of the rest of a config."""
 
     @property
     def transport(self) -> str: ...
@@ -37,8 +40,6 @@ class Serving(Protocol):
     def host(self) -> str: ...
     @property
     def port(self) -> int: ...
-    @property
-    def log_level(self) -> str: ...
 
 
 class _CallScope(Middleware):
@@ -113,12 +114,27 @@ class QuickMCP:
         self.add_middleware = self.server.add_middleware
         self.add_provider = self.server.add_provider
         self.add_extension = self.server.add_extension
+        self.add_transform = self.server.add_transform
+        self.custom_route = self.server.custom_route
 
     def singleton(
-        self, key: type[T], factory: Callable[..., Any] | None = None
+        self,
+        key: type[T],
+        factory: Callable[..., Any] | None = None,
+        *,
+        instance: T = _UNSET,
     ) -> None:
-        """Built once, on first use, and kept until the server shuts down."""
-        self._container.register(key, Recipe(factory or key, SINGLETON))
+        """Built once, on first use, and kept until the server shuts down.
+
+        Given an ``instance``, built already, that is what ``key`` resolves to: the
+        container never builds it, enters it or tears it down, as its caller owns it.
+        """
+        if instance is _UNSET:
+            self._container.register(key, Recipe(factory or key, SINGLETON))
+        elif factory is not None:
+            raise TypeError("singleton() takes a factory or an instance, not both")
+        else:
+            self._container.provide(key, instance)
 
     def session(
         self,

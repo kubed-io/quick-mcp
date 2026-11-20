@@ -97,7 +97,13 @@ class Container:
         self.locks: dict[Any, anyio.Lock] = {}
 
     def register(self, key: Any, recipe: Recipe) -> None:
+        self.values.pop(key, None)
         self.recipes[key] = recipe
+
+    def provide(self, key: Any, value: Any) -> None:
+        """``key`` resolves to ``value``, built by its caller and never torn down."""
+        self.recipes.pop(key, None)
+        self.values[key] = value
 
     def knows(self, key: Any) -> bool:
         try:

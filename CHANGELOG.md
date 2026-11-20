@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`QuickMCP`:** build a FastMCP server in a factory, and serve it from its config with `run()`.
 - **`Inject[T]`:** a tool, resource or prompt takes an object the container builds, kept out of its schema.
 - Singleton, session and transient lifetimes, with async factories, ordered teardown and `override` for tests.
+- `mcp.singleton(T, instance=obj)` hands the container an object built before the server starts.
+- `mcp.custom_route` and `mcp.add_transform`, FastMCP's own, straight on `QuickMCP`.
 - Import FastMCP's names from `kubed.mcp`, `kubed.mcp.protocol` and `kubed.mcp.auth`, the same objects under one pin.
 - `request_values()` reads a request's query parameters and headers, every value a list.
 - `kubed-mcp[tasks]` installs FastMCP's background tasks.
