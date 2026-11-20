@@ -7,6 +7,7 @@ for what this class does not cover.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol, TypeVar
@@ -24,6 +25,7 @@ from .container import (
     Recipe,
     _Call,
 )
+from .plugins import Plugin, PluginLoader, Plugins
 
 T = TypeVar("T")
 
@@ -116,6 +118,35 @@ class QuickMCP:
         self.add_extension = self.server.add_extension
         self.add_transform = self.server.add_transform
         self.custom_route = self.server.custom_route
+        self._plugins = Plugins(self.server)
+
+    def add_plugin(
+        self, address: str | os.PathLike[str], *, namespace: str | None = None
+    ) -> Plugin:
+        """Serves the plugin at ``address``: its skills, its commands and its agents.
+
+        A bare path or a ``file://`` URL is read in place; any other scheme needs a
+        loader registered with ``add_loader``. ``namespace`` None is the server's name,
+        so a skill at ``skills/<name>/`` is ``skill://<server>/<name>/SKILL.md``; given
+        ``"x"``, it is ``skill://x/<name>/SKILL.md``, and given ``""``, the root,
+        ``skill://<name>/SKILL.md``. Plugins under one namespace merge. A plugin that
+        does not load, or that would serve something already served, is refused with a
+        ``PluginError`` naming the reason, and nothing of it is served.
+        """
+        return self._plugins.add(address, namespace)
+
+    def add_loader(self, loader: PluginLoader) -> None:
+        """Registers ``loader`` for the address schemes it names.
+
+        ``LocalLoader`` is always registered, for ``file``. A scheme that already has a
+        loader is refused with a ``ValueError``.
+        """
+        self._plugins.add_loader(loader)
+
+    @property
+    def plugins(self) -> tuple[Plugin, ...]:
+        """The plugins this server serves, in the order they were added."""
+        return tuple(self._plugins.served)
 
     def singleton(
         self,

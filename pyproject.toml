@@ -26,6 +26,8 @@ dependencies = [
   # quick-mcp owns the FastMCP pin, and its servers take FastMCP through it.
   # The floor is the first release with Annotated injection and fastmcp.skills.
   "fastmcp>=4.2,<5",
+  # The plugin layer reads command and agent frontmatter itself.
+  "pyyaml>=6,<7",
 ]
 
 [project.optional-dependencies]

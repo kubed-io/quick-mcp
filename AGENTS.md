@@ -5,8 +5,8 @@ Agent context for `kubed-mcp`. Read this before working in this repo.
 A Python library, published on PyPI as `kubed-mcp` and imported as `kubed.mcp`: an opinionated
 platform on top of FastMCP that mcp-kb and selenium-flow share. It owns how a server serves plugins
 (skills, agents, commands), the MCP protocol details that come with it, and the extension points
-loaded through Python entry points. Today it holds `QuickMCP`, its container and the facade over
-FastMCP; serving plugins is next.
+loaded through Python entry points. Today it holds `QuickMCP`, its container, the facade over
+FastMCP and the plugin layer (`mcp.add_plugin`).
 
 ## Read first
 

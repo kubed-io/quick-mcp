@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `kubed.mcp.skills` serves a catalogue of Agent Skills strictly, each listed by its `SKILL.md` alone, nested paths included.
 - A served skill's folders read as directory resources, with `_index.json` and `_index.md` beside each.
 - The Skills extension answers handshake-era clients too, and `AdvertiseLegacyExtensions` declares an extension in a legacy `initialize`.
+- **`mcp.add_plugin(address, namespace=None)`:** serve a Claude-format plugin's skills, commands and agents in one call.
+- Commands are served as MCP prompts, with declared arguments and strict `{{ name }}` placeholders.
+- Agents are served through the agents extension, `agents/list` and `agents/get`.
+- `mcp.add_loader()` registers a `PluginLoader` for another address scheme; local folders and `file://` work out of the box.
+- Plugins added under one namespace merge, and a clash is refused.
 
 ### Changed
 

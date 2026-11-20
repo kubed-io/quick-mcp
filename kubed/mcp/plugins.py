@@ -1,0 +1,485 @@
+"""Plugins: what a server registers, read the Claude way and served by one rule set.
+
+A server says which plugin to serve, ``mcp.add_plugin(address)``, and this layer does
+the rest. A ``PluginLoader`` turns the address into a local folder, and that is all a
+loader does: ``LocalLoader`` serves a folder in place, and a loader for any other
+scheme is registered with ``mcp.add_loader``. The folder is read here, never by a
+loader, as a Claude plugin: ``.claude-plugin/plugin.json`` for its metadata and the
+component paths it declares, else the conventional ``skills/``, ``commands/`` and
+``agents/``. What the manifest says is fetched content, never trusted as a path: a
+component path that leaves the plugin root is dropped with a warning naming it.
+
+Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
+prompts (``kubed.mcp.prompts``) and agents through the agents extension
+(``kubed.mcp.agents``). A plugin added with no namespace is the server's own, its
+skills under ``skill://<server name>/``, and ``""`` is the root; plugins added under
+one namespace merge, and a second thing at one address is refused.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
+from typing import Protocol, runtime_checkable
+from urllib.parse import quote, unquote, urlparse
+
+import yaml
+from fastmcp import FastMCP
+
+from . import skills
+from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
+from .agents import usable_name as _usable
+from .prompts import FilePrompt, load_prompt
+from .protocol import AdvertiseLegacyExtensions
+
+__all__ = [
+    "Components",
+    "LocalLoader",
+    "Plugin",
+    "PluginError",
+    "PluginLoader",
+    "read_plugin",
+]
+
+log = logging.getLogger(__name__)
+
+MANIFEST_FILES = (".claude-plugin/plugin.json", "plugin.json")
+KINDS = ("skills", "commands", "agents")
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
+
+
+class PluginError(ValueError):
+    """A plugin that is not served, and why."""
+
+
+# ---- loaders -----------------------------------------------------------------------
+
+
+@runtime_checkable
+class PluginLoader(Protocol):
+    """Turns an address into a local folder holding the plugin, and nothing else.
+
+    ``schemes`` are the address schemes it answers, such as ``("git+https",)``. A
+    loader that cannot fetch raises ``PluginError``, ``OSError`` or ``ValueError``
+    with the reason.
+    """
+
+    schemes: tuple[str, ...]
+
+    def materialise(self, address: str) -> Path: ...
+
+
+class LocalLoader:
+    """A folder on this machine, a path or a ``file://`` URL, served where it is."""
+
+    schemes: tuple[str, ...] = ("file",)
+
+    def materialise(self, address: str) -> Path:
+        path = Path(address)
+        if _SCHEME.match(address):
+            url = urlparse(address)
+            if url.netloc not in ("", "localhost"):
+                raise PluginError(f"{address} names another host")
+            path = Path(unquote(url.path))
+        if not path.is_dir():
+            raise PluginError(f"{path} is not a folder")
+        return path
+
+
+# ---- the manifest ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Components:
+    """Where each kind is read from, as root-relative paths (``.`` is the root).
+
+    ``skills`` are folders. ``commands`` and ``agents`` are folders, whose ``*.md``
+    files are read, or ``.md`` files. ``notes`` name what the manifest got wrong without
+    failing the plugin.
+    """
+
+    skills: tuple[str, ...] = ()
+    commands: tuple[str, ...] = ()
+    agents: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Plugin:
+    """A plugin: its metadata, where it was read from, and what it serves.
+
+    ``namespace`` is ``""`` for the root. ``skills`` are the ``skill://`` URIs of the
+    ``SKILL.md`` of each skill served, ``prompts`` and ``agents`` the names served.
+    """
+
+    name: str
+    description: str | None
+    version: str | None
+    root: Path
+    components: Components
+    address: str = ""
+    namespace: str = ""
+    skills: tuple[str, ...] = ()
+    prompts: tuple[str, ...] = ()
+    agents: tuple[str, ...] = ()
+
+
+def _inside(path: Path, base: Path) -> Path | None:
+    """``path`` resolved, or None when it escapes ``base`` or cannot resolve.
+
+    Before Python 3.13 a symlink loop makes ``resolve()`` raise ``RuntimeError``.
+    """
+    try:
+        target = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    return target if target.is_relative_to(base) else None
+
+
+def _readable(base: Path, rel: str | Path) -> Path | None:
+    """``base / rel`` resolved, when it is a regular file inside ``base``.
+
+    Resolving before comparing refuses a ``..`` that climbs out and a symlink pointing
+    out of the tree.
+    """
+    target = _inside(base / rel, base)
+    return target if target is not None and target.is_file() else None
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _strings(value: object, field: str) -> tuple[str, ...] | None:
+    """A field that may be written as one string or as a list of them."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return tuple(value)
+    raise PluginError(f"{field} must be a string or a list of strings")
+
+
+def _relative(text: str, field: str, notes: list[str]) -> str:
+    """``text`` as a root-relative path, or ``""`` when it leaves the root.
+
+    ``.`` and ``./`` name the root. A path that does not start ``./`` is kept, and
+    noted: Claude requires the prefix.
+    """
+    path = text.strip()
+    if path in (".", "./"):
+        return "."
+    relative = path.removeprefix("./").rstrip("/")
+    if not relative or path.startswith("/") or ".." in PurePosixPath(relative).parts:
+        notes.append(f"{field} path '{path}' leaves the plugin root")
+        return ""
+    if relative == path.rstrip("/"):
+        notes.append(f"{field} path '{path}' does not start with ./")
+    return relative
+
+
+def _declared(data: dict, field: str, notes: list[str]) -> tuple[str, ...] | None:
+    """The paths a manifest declares for one kind, or None when it declares none."""
+    value = data.get(field)
+    if field == "commands" and isinstance(value, dict):
+        notes.append("commands object map is not served")
+        return ()
+    found = _strings(value, field)
+    if found is None:
+        return None
+    kept = (_relative(item, field, notes) for item in found)
+    paths = tuple(dict.fromkeys(path for path in kept if path))
+    if field == "agents":
+        for path in paths:
+            if not path.endswith(".md"):
+                notes.append(f"agents entry '{path}' is not a .md file")
+        paths = tuple(path for path in paths if path.endswith(".md"))
+    return paths
+
+
+def read_plugin(root: str | os.PathLike[str]) -> Plugin:
+    """The plugin in folder ``root``, from its manifest and the conventions.
+
+    The manifest is the first of ``MANIFEST_FILES`` that is a regular file inside the
+    root; a symlink out of it is not read. ``name``, ``description`` and ``version``
+    come from it, the name falling back to the folder's. Each kind's paths are the ones
+    it declares, else the conventional folder when there is one. A manifest that is not
+    a JSON object, or a component field that is not a string or a list of strings, is
+    refused with ``PluginError``.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise PluginError(f"{root} is not a folder")
+    base = root.resolve()
+    data: dict = {}
+    for name in MANIFEST_FILES:
+        path = _readable(base, name)
+        if path is None:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PluginError(f"{name} is not readable JSON: {exc}") from exc
+        except RecursionError:
+            raise PluginError(f"{name} is nested too deeply to read") from None
+        if not isinstance(data, dict):
+            raise PluginError(f"{name} must be a JSON object")
+        break
+
+    notes: list[str] = []
+    found: dict[str, tuple[str, ...]] = {}
+    for kind in KINDS:
+        declared = _declared(data, kind, notes)
+        if declared is not None:
+            found[kind] = declared
+        elif (base / kind).is_dir() and _inside(base / kind, base) is not None:
+            found[kind] = (kind,)
+        else:
+            found[kind] = ()
+    name = _text(data.get("name"))
+    return Plugin(
+        name=name if _usable(name) else root.name,
+        description=_text(data.get("description")),
+        version=_text(data.get("version")),
+        root=root,
+        components=Components(**found, notes=tuple(notes)),
+    )
+
+
+# ---- reading each kind -------------------------------------------------------------
+
+
+def _skill_folders(base: Path, folder: str, notes: list[str]) -> list[tuple[str, Path]]:
+    """Each skill under ``folder``, as its path below the folder and its own folder.
+
+    A skill is a folder holding a ``SKILL.md``, and owns everything under it, so no
+    folder below one is searched. A dot folder is never searched. A declared folder
+    that is a skill itself is its own name.
+    """
+    start = base / folder
+    if _inside(start, base) is None or not start.is_dir():
+        notes.append(f"skills entry '{folder}' is not a folder in the plugin")
+        return []
+    found = []
+    for dirpath, dirnames, filenames in os.walk(start):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        if skills.ENTRY in filenames:
+            here = Path(dirpath)
+            rel = here.relative_to(start).as_posix()
+            found.append((here.name if rel == "." else rel, here))
+            dirnames[:] = []
+    return sorted(found)
+
+
+def _md_files(base: Path, kind: str, entries: Iterable[str], notes: list[str]):
+    """The ``.md`` files each entry names: itself, or a folder's direct files."""
+    found: list[Path] = []
+    for entry in entries:
+        path = base / entry
+        if entry.endswith(".md"):
+            if _readable(base, entry) is None:
+                notes.append(f"{kind} entry '{entry}' is not in the plugin")
+            else:
+                found.append(path)
+            continue
+        if _inside(path, base) is None or not path.is_dir():
+            notes.append(f"{kind} entry '{entry}' is not a folder in the plugin")
+            continue
+        found += sorted(
+            child
+            for child in path.iterdir()
+            if child.suffix == ".md" and _readable(base, child.relative_to(base))
+        )
+    return found
+
+
+def _namespace(namespace: str | None, server: str) -> str:
+    """``namespace`` as served: the server's name for None, ``""`` for the root, else
+    its ``/`` segments."""
+    if namespace is None:
+        namespace = server
+    trimmed = namespace.strip("/")
+    if not trimmed:
+        return ""
+    parts = trimmed.split("/")
+    if any(part in (".", "..") or not _usable(part) for part in parts):
+        raise ValueError(f"namespace {namespace!r} is not a path of usable names")
+    return trimmed
+
+
+@dataclass
+class _Read:
+    """A plugin's kinds, read and checked, before anything is served."""
+
+    catalogue: dict[str, skills.Skill]
+    prompts: list[FilePrompt]
+    agents: list[Agent]
+
+
+class Plugins:
+    """A server's plugins and loaders: what ``QuickMCP`` delegates to.
+
+    Everything a plugin serves is read and checked against what the server already
+    serves before any of it is served, so a refused plugin leaves no trace.
+    """
+
+    def __init__(self, server: FastMCP) -> None:
+        self._server = server
+        self._loaders: dict[str, PluginLoader] = {}
+        self._owners: dict[str, str] = {}  # what is served -> the plugin serving it
+        self._extension: AgentsExtension | None = None
+        self.served: list[Plugin] = []
+        self.add_loader(LocalLoader())
+
+    def add_loader(self, loader: PluginLoader) -> None:
+        schemes = tuple(scheme.lower() for scheme in loader.schemes)
+        if not schemes:
+            raise ValueError(f"{type(loader).__name__} names no scheme")
+        for scheme in schemes:
+            if scheme in self._loaders:
+                raise ValueError(f"a loader for {scheme}:// is already registered")
+        for scheme in schemes:
+            self._loaders[scheme] = loader
+
+    def _loader_for(self, address: str) -> PluginLoader:
+        match = _SCHEME.match(address)
+        scheme = match.group(1).lower() if match else "file"
+        loader = self._loaders.get(scheme)
+        if loader is None:
+            raise PluginError(
+                f"no loader for {scheme}:// addresses: register one with "
+                "mcp.add_loader()"
+            )
+        return loader
+
+    def add(
+        self, address: str | os.PathLike[str], namespace: str | None = None
+    ) -> Plugin:
+        address = os.fspath(address)
+        prefix = _namespace(namespace, self._server.name)
+        try:
+            loader = self._loader_for(address)
+            try:
+                root = loader.materialise(address)
+            except PluginError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise PluginError(str(exc) or type(exc).__name__) from exc
+            plugin = read_plugin(root)
+            notes = list(plugin.components.notes)
+            read = self._read(plugin, prefix, notes)
+        except PluginError as exc:
+            raise PluginError(f"plugin {address} is not served: {exc}") from None
+        for note in dict.fromkeys(notes):
+            log.warning("plugin %s: %s", plugin.name, note)
+        return self._serve(
+            replace(
+                plugin,
+                address=address,
+                namespace=prefix,
+                components=replace(plugin.components, notes=tuple(notes)),
+            ),
+            read,
+        )
+
+    def _claim(self, key: str, plugin: Plugin, what: str, seen: set[str]) -> bool:
+        """Whether ``key`` is free: refused when served, skipped when this plugin
+        has it already."""
+        owner = self._owners.get(key)
+        if owner is not None:
+            raise PluginError(f"{what} is already served by plugin {owner}")
+        if key in seen:
+            log.warning("plugin %s: %s is skipped, served already", plugin.name, what)
+            return False
+        seen.add(key)
+        return True
+
+    def _read(self, plugin: Plugin, prefix: str, notes: list[str]) -> _Read:
+        base = plugin.root.resolve()
+        parts = plugin.components
+        seen: set[str] = set()
+
+        catalogue: dict[str, skills.Skill] = {}
+        by_name: dict[str, str] = {}
+        for folder in parts.skills:
+            for path, location in _skill_folders(base, folder, notes):
+                key = f"{prefix}/{path}" if prefix else path
+                uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
+                if not self._claim(uri, plugin, uri, seen):
+                    continue
+                skill = skills.load_skill(location)
+                if skill is None:
+                    continue
+                catalogue[key] = skill
+                by_name.setdefault(skill.name, uri)
+
+        # The server is already a scope for prompts and agents: only another
+        # namespace than its own is a prefix.
+        own = prefix in ("", self._server.name)
+        named = "" if own else prefix.replace("/", "_") + "_"
+        prompts: list[FilePrompt] = []
+        for path in _md_files(base, "commands", parts.commands, notes):
+            if not _usable(path.stem):
+                log.warning("prompt %s is skipped: not a usable name", path)
+                continue
+            try:
+                prompt = load_prompt(path, name=f"{named}{path.stem}")
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                log.warning("prompt %s is skipped: %s", path, exc)
+                continue
+            if self._claim(
+                f"prompt:{prompt.name}", plugin, f"prompt {prompt.name}", seen
+            ):
+                prompts.append(prompt)
+
+        agents: list[Agent] = []
+        for path in _md_files(base, "agents", parts.agents, notes):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                log.warning("agent file %s is skipped: %s", path, exc)
+                continue
+            agent = parse_agent(text, by_name, named)
+            if isinstance(agent, str):
+                log.warning("agent file %s is skipped: %s", path, agent)
+            elif self._claim(
+                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen
+            ):
+                agents.append(agent)
+        return _Read(catalogue, prompts, agents)
+
+    def _serve(self, plugin: Plugin, read: _Read) -> Plugin:
+        if read.catalogue:
+            skills.serve(self._server, read.catalogue)
+        for prompt in read.prompts:
+            self._server.add_prompt(prompt)
+        if self._extension is None:
+            self._extension = AgentsExtension()
+            self._server.add_extension(self._extension)
+            self._server.add_middleware(
+                AdvertiseLegacyExtensions({EXTENSION_ID: SETTINGS})
+            )
+        self._extension.agents.extend(read.agents)
+        plugin = replace(
+            plugin,
+            skills=tuple(
+                f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
+                for key in read.catalogue
+            ),
+            prompts=tuple(prompt.name for prompt in read.prompts),
+            agents=tuple(agent.name for agent in read.agents),
+        )
+        for key in plugin.skills:
+            self._owners[key] = plugin.name
+        for name in plugin.prompts:
+            self._owners[f"prompt:{name}"] = plugin.name
+        for name in plugin.agents:
+            self._owners[f"agent:{name}"] = plugin.name
+        self.served.append(plugin)
+        return plugin

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![FastMCP](https://img.shields.io/badge/FastMCP-4-8a2be2)](https://gofastmcp.com/)
 
-> **Pre-release.** `QuickMCP`, its container and the facade over FastMCP are in. Serving plugins is next.
+> **Pre-release.** `QuickMCP`, its container, the facade over FastMCP and serving a Claude-format plugin are in.
 
 ---
 
@@ -42,6 +42,7 @@ from kubed.mcp import Inject, QuickMCP
 
 mcp = QuickMCP("grid", config=settings)
 mcp.singleton(Grid)
+mcp.add_plugin("plugin/")  # its skills, commands and agents
 
 @mcp.tool
 async def navigate(url: str, grid: Inject[Grid]) -> dict: ...
