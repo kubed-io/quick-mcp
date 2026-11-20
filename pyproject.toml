@@ -1,0 +1,99 @@
+[project]
+name = "kubed-mcp"
+description = "An opinionated platform on top of FastMCP: how an MCP server serves plugins (skills, agents, commands), the protocol details that come with it, and extension points loaded through Python entry points."
+readme = "README.md"
+dynamic = ["version"]
+requires-python = ">=3.11"
+keywords = ["mcp", "fastmcp", "plugins", "skills", "agent-skills", "ai"]
+license = "MIT"
+license-files = ["LICENSE"]
+# One entry per interpreter CI actually sweeps, so the metadata and
+# .github/workflows/test.yml make the same claim. A bare "Python :: 3" tells an
+# installer nothing it can act on.
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  # Both servers install this beside their own fastmcp pin, so the range is one
+  # both already accept: a conflict shows up here, not at the first real feature.
+  "fastmcp>=4.1.4,<5",
+]
+
+[project.optional-dependencies]
+build = [
+  "setuptools_scm",
+  "build",
+  "wheel",
+  # Validates the built distribution's metadata before it can become a rejected
+  # upload to a package index. Used by .github/workflows/package.yml.
+  "twine",
+]
+test = [
+  "pytest",
+  "pytest-asyncio",
+  "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=77.0.3", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+Homepage = "https://github.com/kubed-io"
+Repository = "https://github.com/kubed-io/quick-mcp"
+Issues = "https://github.com/kubed-io/quick-mcp/issues"
+Changelog = "https://github.com/kubed-io/quick-mcp/blob/main/CHANGELOG.md"
+
+[tool.setuptools_scm]
+
+[tool.setuptools]
+# Every package, spelled out. `kubed` is a PEP 420 namespace with no
+# __init__.py, so it is never listed: naming only `kubed.mcp` and below keeps
+# the namespace open for kubed.mcp_kb and kubed.selenium_flow. setuptools takes
+# this list literally and implies no subpackage from it.
+packages = [
+  "kubed.mcp",
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+asyncio_mode = "auto"
+addopts = "--verbose"
+testpaths = ["tests"]
+markers = [
+  "unit: mark a test as a unit test",
+  "integration: mark a test as an integration test",
+]
+
+[tool.ruff]
+# The oldest interpreter supported, so ruff flags what would break there.
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # import sorting
+  "UP",       # constructs a newer supported Python does better
+  "B",        # bugbear
+  "SIM",      # simplifications
+  "C4",       # comprehensions
+  "PIE",      # small dead weight
+  "PTH",      # pathlib over os.path
+  "RET",      # return-flow noise
+  "RUF",      # ruff's own, incl. RUF100 for noqas that stopped applying
+  "BLE",      # blind except: each one must carry a noqa saying why
+]
+
+[tool.ruff.lint.per-file-ignores]
+# A long, specific assertion message is the point of a test.
+"tests/*" = ["E501"]
