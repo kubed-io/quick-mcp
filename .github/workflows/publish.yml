@@ -66,8 +66,8 @@ jobs:
     # registered secret's substring (`kubed-io` is in every PR link), silently.
     # The notes travel as an artifact instead.
     outputs:
-      tag: ${{ steps.bump.outputs.tag || steps.first.outputs.tag }}
-      version: ${{ steps.bump.outputs.version || steps.first.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
     steps:
 
     - name: Validate Branch
@@ -103,70 +103,16 @@ jobs:
         private-key: ${{ fromJson(steps.secrets.outputs.github_app).github_app_private_key }}
         permission-contents: write
 
-    # Nothing here pushes through git: version-bump and the step below write
-    # through the API with the App token, so the checkout keeps no credential.
+    # Nothing here pushes through git: version-bump writes through the API with
+    # the App token, so the checkout keeps no credential.
     - name: Checkout
       uses: actions/checkout@v7
       with:
         fetch-depth: 0
         persist-credentials: false
 
-    # version-bump cannot cut the first release. With no `v*` tag it counts on
-    # from a v0.0.1 that does not exist, so `patch` gives 0.0.2 and its notes
-    # call fails (400, invalid previous_tag); no base tag or input gets it to
-    # 0.0.1. So with no tag yet this step does what version-bump would have,
-    # releasing 0.0.1, and once v0.0.1 exists it does nothing.
-    - name: First Release
-      id: first
-      env:
-        GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        ACTION: ${{ inputs.action }}
-        PUSH: ${{ inputs.push }}
-        REPO: ${{ github.repository }}
-        REF: ${{ github.ref_name }}
-      run: |
-        if [[ -n "$(git tag --list 'v*')" ]]; then
-          echo "A v* tag exists, so version-bump takes it from here."
-          exit 0
-        fi
-        if [[ "$ACTION" != patch ]]; then
-          echo "::error::There is no tag yet, so the first release is 0.0.1: run with action=patch."
-          exit 1
-        fi
-        version=0.0.1
-        tag="v$version"
-
-        # Notes as version-bump writes them: [Unreleased], then GitHub's own.
-        changelog=$(awk '/^## \[Unreleased\]/ {f=1; next} /^## \[/ {exit} f' CHANGELOG.md)
-        generated=$(gh api "repos/$REPO/releases/generate-notes" \
-          -f tag_name="$tag" -f target_commitish="$REF" --jq .body)
-        sed -i "0,/^## \[Unreleased\]/s//&\n\n## [$version] - $(date -u +%F)/" CHANGELOG.md
-        git --no-pager diff
-
-        # Through the API, as version-bump does, so GitHub signs the commit as
-        # the App. A PATCH without force fails if main moved since checkout.
-        if [[ "$PUSH" == true ]]; then
-          tree=$(jq -n --arg base "$(git rev-parse 'HEAD^{tree}')" --rawfile content CHANGELOG.md \
-            '{base_tree: $base, tree: [{path: "CHANGELOG.md", mode: "100644", type: "blob", content: $content}]}' |
-            gh api "repos/$REPO/git/trees" --input - --jq .sha)
-          commit=$(gh api "repos/$REPO/git/commits" -f message="Bump version to $tag" \
-            -f tree="$tree" -f "parents[]=$(git rev-parse HEAD)" --jq .sha)
-          gh api -X PATCH "repos/$REPO/git/refs/heads/$REF" -f sha="$commit" --silent
-          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$commit" --silent
-        fi
-
-        delimiter="notes-$(openssl rand -hex 8)"
-        {
-          echo "version=$version"
-          echo "tag=$tag"
-          echo "release-notes<<$delimiter"
-          printf '%s\n%s\n' "$changelog" "$generated"
-          echo "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-
     - name: Bump Version
       id: bump
-      if: steps.first.outputs.tag == ''
       uses: duplocloud/version-bump@main
       with:
         version: ${{ inputs.action }}
@@ -177,7 +123,7 @@ jobs:
     # sails through a green run unnoticed.
     - name: Save the Release Notes
       env:
-        NOTES: ${{ steps.bump.outputs.release-notes || steps.first.outputs.release-notes }}
+        NOTES: ${{ steps.bump.outputs.release-notes }}
       run: |
         mkdir -p notes
         printf '%s\n' "$NOTES" > notes/release-notes.md
