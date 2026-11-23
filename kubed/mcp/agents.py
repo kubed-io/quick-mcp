@@ -50,14 +50,14 @@ class Agent:
 def usable_name(text: object) -> bool:
     """Whether ``text`` can be a served name: one non-empty token.
 
-    No whitespace, no control or other invisible character, no ``/`` (a path) and no
-    ``@``.
+    No whitespace, no control or other invisible character, no ``/`` (a path), no
+    ``@`` and no ``:`` (Claude Code's segment separator).
     """
     return (
         isinstance(text, str)
         and bool(text)
         and not any(
-            c.isspace() or c in "/@" or unicodedata.category(c).startswith("C")
+            c.isspace() or c in "/@:" or unicodedata.category(c).startswith("C")
             for c in text
         )
     )
@@ -92,13 +92,20 @@ def _strings(value: object) -> list[str]:
 
 
 def parse_agent(
-    text: str, skills: Mapping[str, str] | None = None, prefix: str = ""
+    text: str,
+    skills: Mapping[str, str] | None = None,
+    prefix: str = "",
+    *,
+    stem: str | None = None,
+    folders: Sequence[str] = (),
 ) -> Agent | str:
     """The agent an agent file defines, or the sentence saying why it is skipped.
 
     ``skills`` maps a skill's name to the ``skill://`` URI of its ``SKILL.md``: a name
     in the frontmatter's ``skills`` is resolved through it, and left out when it is not
-    there. ``prefix`` goes before the frontmatter's ``name``.
+    there. The agent's own segment is the frontmatter's ``name``, else ``stem``, the
+    file's. Its name is ``prefix``, then ``folders`` and that segment joined with
+    ``_``; each segment and the whole must be a usable name.
     """
     try:
         parsed = split_frontmatter(text)
@@ -111,18 +118,22 @@ def parse_agent(
         return "its frontmatter is not a non-empty mapping"
     if not _survives_json(header):
         return "its frontmatter is not representable as JSON"
-    name = header.get("name")
-    if not usable_name(name):
-        return (
-            "its name must be a non-empty string with no whitespace, control or "
-            'invisible characters, "/" or "@"'
-        )
+    own = header.get("name")
+    if own is None:
+        own = stem
+    if own is None:
+        return "it has no name"
+    if not isinstance(own, str) or not own:
+        return "its name must be a non-empty string"
     description = header.get("description")
     if not isinstance(description, str) or not description.strip():
         return "its description must be a non-empty string"
+    segments = (*folders, own)
+    name = prefix + "_".join(segments)
+    if not all(usable_name(part) for part in (*segments, name)):
+        return f"agent name {name!r} is not a usable name"
 
     served = skills or {}
-    name = f"{prefix}{name}"
     card = {
         "name": name,
         "description": " ".join(description.split()),

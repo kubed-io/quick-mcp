@@ -99,7 +99,7 @@ def test_a_broken_manifest_refuses_the_plugin(tmp_path, manifest, reason):
     assert str(root) in str(refused.value)
 
 
-async def test_declared_paths_replace_the_conventions_and_an_escape_is_dropped(
+async def test_declared_skills_add_the_rest_replace_and_an_escape_is_dropped(
     tmp_path, caplog
 ):
     root = copy(
@@ -122,17 +122,17 @@ async def test_declared_paths_replace_the_conventions_and_an_escape_is_dropped(
     with caplog.at_level(logging.WARNING):
         mcp = served((root, None))
     plugin = mcp.plugins[0]
-    assert plugin.components.skills == ("extra",)
+    assert plugin.components.skills == ("skills", "extra")
     assert plugin.components.commands == ("cmds",)
     assert plugin.components.agents == ("team/lead.md",)
-    assert plugin.skills == ("skill://t/more/SKILL.md",)
+    assert plugin.skills == (ENTRY, "skill://t/more/SKILL.md")
     assert plugin.prompts == ("hello",)
     assert plugin.agents == ("lead",)
     warned = caplog.text
     assert "skills path '../outside' leaves the plugin root" in warned
     assert "skills path '/etc' leaves the plugin root" in warned
     assert "agents path './../../lead.md' leaves the plugin root" in warned
-    assert await skill_uris(mcp) == ["skill://t/more/SKILL.md"]
+    assert await skill_uris(mcp) == [ENTRY, "skill://t/more/SKILL.md"]
 
 
 def test_a_manifest_symlinked_out_of_the_root_is_not_read(tmp_path):
@@ -221,12 +221,10 @@ def test_an_empty_namespace_is_refused(namespace):
         QuickMCP("t").add_plugin(DEMO, namespace=namespace)
 
 
-async def test_a_skill_keeps_its_path_under_skills(tmp_path):
-    root = write(tmp_path / "deep", {"skills/tools/lint/SKILL.md": skill("lint")})
-    assert await skill_uris(served((root, None))) == ["skill://t/tools/lint/SKILL.md"]
-    assert await skill_uris(served((root, "lib"))) == [
-        "skill://lib/tools/lint/SKILL.md"
-    ]
+async def test_a_skill_is_its_name_under_the_namespace(tmp_path):
+    root = write(tmp_path / "flat", {"skills/lint/SKILL.md": skill("lint")})
+    assert await skill_uris(served((root, None))) == ["skill://t/lint/SKILL.md"]
+    assert await skill_uris(served((root, "lib"))) == ["skill://lib/lint/SKILL.md"]
 
 
 async def test_a_namespaced_plugin_serves_under_it():
@@ -455,3 +453,231 @@ def test_the_registry_is_the_plugins_served():
             agents=("helper",),
         ),
     )
+
+
+# ---- layout and names, as Claude Code reads them ---------------------------------
+# The fixtures are shaped like Claude Code's own --plugin-dir probes (material
+# delivery F63): agents and commands at any depth, each folder a `_` segment where
+# Claude Code writes `:`; skills one level below skills/.
+
+
+def agent_md(name: str | None, description: str = "An agent.") -> str:
+    named = f"name: {name}\n" if name else ""
+    return f"---\n{named}description: {description}\n---\nGo.\n"
+
+
+def command_md(description: str = "A command.") -> str:
+    return f"---\ndescription: {description}\n---\nDo it.\n"
+
+
+PROBE = {
+    "agents/flat.md": agent_md("flat"),
+    "agents/review/security.md": agent_md("security"),
+    "agents/explorer/AGENT.md": agent_md("explorer"),
+    "agents/bare/AGENT.md": agent_md(None),
+    "agents/noname.md": agent_md(None),
+    "agents/x@y/r.md": agent_md("r"),
+    "commands/flat.md": command_md(),
+    "commands/db/migrate.md": command_md(),
+    "commands/a/b/deep.md": command_md(),
+    "commands/a:b/c.md": command_md(),
+    "skills/top/SKILL.md": skill("top"),
+    "skills/group/nested/SKILL.md": skill("nested"),
+    "skills/wrong/SKILL.md": skill("other"),
+}
+
+
+async def listed(mcp: QuickMCP) -> tuple[list[str], list[str], list[str]]:
+    """The prompt names, agent names and skill URIs a client is served."""
+    async with Client(mcp.server) as client:
+        prompts = sorted(p.name for p in await client.list_prompts())
+        agents = [a["name"] for a in (await request(client, "agents/list"))["agents"]]
+        resources = await client.list_resources()
+    uris = sorted(str(r.uri) for r in resources if str(r.uri).startswith("skill://"))
+    return prompts, agents, uris
+
+
+async def test_the_probe_plugin_is_named_as_claude_code_names_it(tmp_path, caplog):
+    root = write(tmp_path / "probe", PROBE)
+    with caplog.at_level(logging.WARNING):
+        mcp = served((root, None))
+    assert await listed(mcp) == (
+        ["a_b_deep", "db_migrate", "flat"],
+        ["bare_AGENT", "explorer_explorer", "flat", "noname", "review_security"],
+        ["skill://t/top/SKILL.md"],
+    )
+    plugin = mcp.plugins[0]
+    # Path order: a/b/deep.md before db/migrate.md before flat.md.
+    assert plugin.prompts == ("a_b_deep", "db_migrate", "flat")
+    assert plugin.components.notes == (
+        "skills/group/nested/SKILL.md is not served: a skill is one folder below "
+        "its skills folder",
+    )
+    warned = caplog.text
+    assert "agent name 'x@y_r' is not a usable name" in warned
+    assert "prompt name 'a:b_c' is not a usable name" in warned
+    assert "not a valid Agent Skill" in warned  # skills/wrong names itself "other"
+
+
+async def test_under_another_namespace_the_names_take_its_prefix(tmp_path):
+    root = write(tmp_path / "probe", PROBE)
+    assert await listed(served((root, "kb"))) == (
+        ["kb_a_b_deep", "kb_db_migrate", "kb_flat"],
+        [
+            "kb_bare_AGENT",
+            "kb_explorer_explorer",
+            "kb_flat",
+            "kb_noname",
+            "kb_review_security",
+        ],
+        ["skill://kb/top/SKILL.md"],
+    )
+
+
+async def test_an_unusable_name_claims_nothing(tmp_path):
+    root = write(
+        tmp_path / "p",
+        {
+            "agents/x@y/r.md": agent_md("r"),
+            "agents/r.md": agent_md("r", "The usable one."),
+        },
+    )
+    mcp = served((root, None))
+    assert mcp.plugins[0].agents == ("r",)
+
+
+@pytest.mark.parametrize("bad", ["a b", "a:b", "a@b"])
+async def test_a_frontmatter_name_must_be_usable(tmp_path, bad, caplog):
+    root = write(tmp_path / "p", {"agents/x.md": agent_md(f"'{bad}'")})
+    with caplog.at_level(logging.WARNING):
+        mcp = served((root, None))
+    assert mcp.plugins[0].agents == ()
+    assert f"agent name {bad!r} is not a usable name" in caplog.text
+
+
+async def test_the_first_in_path_order_wins_a_joined_name(tmp_path, caplog):
+    root = write(
+        tmp_path / "p",
+        {
+            "agents/review/security.md": agent_md("security", "Nested."),
+            "agents/review_security.md": agent_md("review_security", "Flat."),
+            "commands/db/migrate.md": command_md("Nested."),
+            "commands/db_migrate.md": command_md("Flat."),
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        mcp = served((root, None))
+    async with Client(mcp.server) as client:
+        prompts = await client.list_prompts()
+        agents = (await request(client, "agents/list"))["agents"]
+    assert [(p.name, p.description) for p in prompts] == [("db_migrate", "Nested.")]
+    assert [(a["name"], a["description"]) for a in agents] == [
+        ("review_security", "Nested.")
+    ]
+    base = root.resolve()
+    assert (
+        f"agent review_security is already served by "
+        f"{base / 'agents/review/security.md'}; "
+        f"{base / 'agents/review_security.md'} is skipped"
+    ) in caplog.text
+    assert (
+        f"prompt db_migrate is already served by {base / 'commands/db/migrate.md'}; "
+        f"{base / 'commands/db_migrate.md'} is skipped"
+    ) in caplog.text
+
+
+async def test_a_clash_across_plugins_is_still_refused(tmp_path):
+    first = write(tmp_path / "one", {"commands/db/migrate.md": command_md()})
+    second = write(tmp_path / "two", {"commands/db_migrate.md": command_md()})
+    mcp = served((first, None))
+    with pytest.raises(PluginError, match="prompt db_migrate is already served"):
+        mcp.add_plugin(second)
+
+
+def manifest(root: Path, data: dict) -> Path:
+    return write(root, {".claude-plugin/plugin.json": json.dumps(data)})
+
+
+async def test_a_manifest_skills_key_adds_to_the_default_scan(tmp_path):
+    root = write(
+        tmp_path / "p",
+        {"skills/top/SKILL.md": skill("top"), "more/extra/SKILL.md": skill("extra")},
+    )
+    mcp = served((manifest(root, {"skills": "./more"}), None))
+    assert mcp.plugins[0].components.skills == ("skills", "more")
+    assert mcp.plugins[0].components.notes == ()
+    assert await skill_uris(mcp) == [
+        "skill://t/extra/SKILL.md",
+        "skill://t/top/SKILL.md",
+    ]
+
+
+IGNORED_AGENTS = 'Default agents/ folder is ignored because the manifest sets "agents"'
+IGNORED_COMMANDS = (
+    'Default commands/ folder is ignored because the manifest sets "commands"'
+)
+
+
+@pytest.mark.parametrize(
+    ("agents", "served_names", "notes"),
+    [
+        # A listed file replaces the folder, and takes no folder segment.
+        (["./team/lead.md"], ("lead",), (IGNORED_AGENTS,)),
+        # A folder is never an agents entry.
+        ("./team", (), ("agents entry 'team' is not a .md file", IGNORED_AGENTS)),
+        # A file inside agents/ reads the folder for that file: no note.
+        (["./agents/review/security.md"], ("security",), ()),
+    ],
+)
+async def test_a_manifest_agents_key_replaces_the_folder(
+    tmp_path, agents, served_names, notes
+):
+    root = write(
+        tmp_path / "p",
+        {
+            "agents/flat.md": agent_md("flat"),
+            "agents/review/security.md": agent_md("security"),
+            "team/lead.md": agent_md("lead"),
+            "team/sub/deputy.md": agent_md("deputy"),
+        },
+    )
+    mcp = served((manifest(root, {"agents": agents}), None))
+    assert mcp.plugins[0].agents == served_names
+    assert mcp.plugins[0].components.notes == notes
+    assert (await listed(mcp))[1] == sorted(served_names)
+
+
+@pytest.mark.parametrize(
+    ("commands", "served_names", "notes"),
+    [
+        # A folder is read at any depth, its own subfolders the segments.
+        ("./cmds", ("x_y", "z"), (IGNORED_COMMANDS,)),
+        (["./cmds/z.md"], ("z",), (IGNORED_COMMANDS,)),
+        # The default folder named outright reads as the default: no note.
+        ("./commands/", ("db_migrate", "flat"), ()),
+    ],
+)
+async def test_a_manifest_commands_key_replaces_the_folder(
+    tmp_path, commands, served_names, notes
+):
+    root = write(
+        tmp_path / "p",
+        {
+            "commands/flat.md": command_md(),
+            "commands/db/migrate.md": command_md(),
+            "cmds/x/y.md": command_md(),
+            "cmds/z.md": command_md(),
+        },
+    )
+    mcp = served((manifest(root, {"commands": commands}), None))
+    assert mcp.plugins[0].prompts == served_names
+    assert mcp.plugins[0].components.notes == notes
+    assert (await listed(mcp))[0] == sorted(served_names)
+
+
+async def test_a_dot_folder_under_commands_is_not_read(tmp_path):
+    root = write(
+        tmp_path / "p",
+        {"commands/.drafts/x.md": command_md(), "commands/y.md": command_md()},
+    )
+    assert served((root, None)).plugins[0].prompts == ("y",)

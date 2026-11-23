@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A plugin's agents and commands are read at any depth, each folder a `_` segment of the name, as Claude Code reads them: `commands/db/migrate.md` is `db_migrate`; a skill is one folder below `skills/`.
+
+### Fixed
+
+- A manifest's `skills` key adds to the default `skills/` scan instead of replacing it.
+
 ## [0.1.0] - 2026-11-23
 
 ### Added

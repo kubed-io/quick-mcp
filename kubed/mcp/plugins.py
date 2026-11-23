@@ -5,13 +5,17 @@ the rest. A ``PluginLoader`` turns the address into a local folder, and that is 
 loader does: ``LocalLoader`` serves a folder in place, and a loader for any other
 scheme is registered with ``mcp.add_loader``. The folder is read here, never by a
 loader, as a Claude plugin: ``.claude-plugin/plugin.json`` for its metadata and the
-component paths it declares, else the conventional ``skills/``, ``commands/`` and
-``agents/``. What the manifest says is fetched content, never trusted as a path: a
-component path that leaves the plugin root is dropped with a warning naming it.
+component paths it declares beside or instead of the conventional ``skills/``,
+``commands/`` and ``agents/``. What the manifest says is fetched content, never
+trusted as a path: a component path that leaves the plugin root is dropped with a
+warning naming it.
 
 Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
 prompts (``kubed.mcp.prompts``) and agents through the agents extension
-(``kubed.mcp.agents``). A plugin added with no namespace is the server's own, its
+(``kubed.mcp.agents``). The layout and names are Claude Code's: a skill is one folder
+below ``skills/``, while commands and agents are files at any depth, each folder adding
+a name segment, Claude Code's ``:`` written ``_`` (``commands/db/migrate.md`` is
+``db_migrate``). A plugin added with no namespace is the server's own, its
 skills under ``skill://<server name>/``; there is no root, and an empty namespace is
 refused. Plugins added under one namespace merge, and a second thing at one address is
 refused.
@@ -99,9 +103,10 @@ class LocalLoader:
 class Components:
     """Where each kind is read from, as root-relative paths (``.`` is the root).
 
-    ``skills`` are folders. ``commands`` and ``agents`` are folders, whose ``*.md``
-    files are read, or ``.md`` files. ``notes`` name what the manifest got wrong without
-    failing the plugin.
+    ``skills`` are folders. ``commands`` are folders, whose ``*.md`` files are read at
+    any depth, or ``.md`` files; ``agents`` likewise, a folder only by convention.
+    ``notes`` name what the manifest or the layout got wrong without failing the
+    plugin.
     """
 
     skills: tuple[str, ...] = ()
@@ -204,15 +209,26 @@ def _declared(data: dict, field: str, notes: list[str]) -> tuple[str, ...] | Non
     return paths
 
 
+def _ignores(kind: str, declared: tuple[str, ...]) -> bool:
+    """Whether paths ``declared`` for ``kind`` leave its default folder unread.
+
+    A path that is the folder, one inside it, or the root reads it.
+    """
+    return not any(
+        path in (".", kind) or path.startswith(f"{kind}/") for path in declared
+    )
+
+
 def read_plugin(root: str | os.PathLike[str]) -> Plugin:
     """The plugin in folder ``root``, from its manifest and the conventions.
 
     The manifest is the first of ``MANIFEST_FILES`` that is a regular file inside the
     root; a symlink out of it is not read. ``name``, ``description`` and ``version``
-    come from it, the name falling back to the folder's. Each kind's paths are the ones
-    it declares, else the conventional folder when there is one. A manifest that is not
-    a JSON object, or a component field that is not a string or a list of strings, is
-    refused with ``PluginError``.
+    come from it, the name falling back to the folder's. Declared ``skills`` add to the
+    conventional ``skills/``; declared ``commands`` and ``agents`` replace their
+    folder, noted when it is there. A manifest that is not a JSON object, or a
+    component field that is not a string or a list of strings, is refused with
+    ``PluginError``.
     """
     root = Path(root)
     if not root.is_dir():
@@ -237,12 +253,18 @@ def read_plugin(root: str | os.PathLike[str]) -> Plugin:
     found: dict[str, tuple[str, ...]] = {}
     for kind in KINDS:
         declared = _declared(data, kind, notes)
-        if declared is not None:
-            found[kind] = declared
-        elif (base / kind).is_dir() and _inside(base / kind, base) is not None:
-            found[kind] = (kind,)
+        default = (base / kind).is_dir() and _inside(base / kind, base) is not None
+        if declared is None:
+            found[kind] = (kind,) if default else ()
+        elif kind == "skills":
+            found[kind] = tuple(dict.fromkeys(((kind,) if default else ()) + declared))
         else:
-            found[kind] = ()
+            found[kind] = declared
+            if default and _ignores(kind, declared):
+                notes.append(
+                    f"Default {kind}/ folder is ignored because the manifest sets "
+                    f'"{kind}"'
+                )
     name = _text(data.get("name"))
     return Plugin(
         name=name if _usable(name) else root.name,
@@ -256,50 +278,78 @@ def read_plugin(root: str | os.PathLike[str]) -> Plugin:
 # ---- reading each kind -------------------------------------------------------------
 
 
-def _skill_folders(base: Path, folder: str, notes: list[str]) -> list[tuple[str, Path]]:
-    """Each skill under ``folder``, as its path below the folder and its own folder.
+def _skill_folders(
+    base: Path, folder: str, notes: list[str]
+) -> tuple[list[tuple[str, Path]], list[Path]]:
+    """Each skill in ``folder``, as its name and its folder, and the nested ones.
 
-    A skill is a folder holding a ``SKILL.md``, and owns everything under it, so no
-    folder below one is searched. A dot folder is never searched. A declared folder
-    that is a skill itself is its own name.
+    A skill is a folder directly in ``folder`` holding a ``SKILL.md``: one level only,
+    as Claude Code reads it. A declared folder that is a skill itself is its own name.
+    Every ``SKILL.md`` deeper, in a folder that is no skill, is returned as nested,
+    not served. A dot folder is never searched, and nothing below a skill is.
     """
     start = base / folder
     if _inside(start, base) is None or not start.is_dir():
         notes.append(f"skills entry '{folder}' is not a folder in the plugin")
-        return []
-    found = []
+        return [], []
+    if (start / skills.ENTRY).is_file():
+        return [(start.name, start)], []
+    found: list[tuple[str, Path]] = []
+    nested: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(start):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-        if skills.ENTRY in filenames:
-            here = Path(dirpath)
-            rel = here.relative_to(start).as_posix()
-            found.append((here.name if rel == "." else rel, here))
-            dirnames[:] = []
-    return sorted(found)
+        here = Path(dirpath)
+        if here == start or skills.ENTRY not in filenames:
+            continue
+        if here.parent == start:
+            found.append((here.name, here))
+        else:
+            nested.append(here / skills.ENTRY)
+        dirnames[:] = []
+    return sorted(found), nested
 
 
-def _md_files(base: Path, kind: str, entries: Iterable[str], notes: list[str]):
-    """The ``.md`` files each entry names: itself, or a folder's direct files."""
-    found: list[Path] = []
+def _md_files(
+    base: Path, kind: str, entries: Iterable[str], notes: list[str]
+) -> list[tuple[Path, tuple[str, ...]]]:
+    """The ``.md`` files each entry names, each with its folders' name segments.
+
+    A listed file is itself, with no segment. A folder is read at any depth, in path
+    order, each folder between it and the file a segment; a dot folder is not read,
+    and a file that resolves outside the root is not either.
+    """
+    found: list[tuple[Path, tuple[str, ...]]] = []
     for entry in entries:
         path = base / entry
         if entry.endswith(".md"):
             if _readable(base, entry) is None:
                 notes.append(f"{kind} entry '{entry}' is not in the plugin")
             else:
-                found.append(path)
+                found.append((path, ()))
             continue
         if _inside(path, base) is None or not path.is_dir():
             notes.append(f"{kind} entry '{entry}' is not a folder in the plugin")
             continue
-        try:
-            found += sorted(
-                child
-                for child in path.iterdir()
-                if child.suffix == ".md" and _readable(base, child.relative_to(base))
-            )
-        except OSError as exc:
+
+        def unlisted(exc: OSError, entry: str = entry) -> None:
+            where = Path(exc.filename or base / entry)
+            if where.is_relative_to(base):
+                entry = where.relative_to(base).as_posix()
             notes.append(f"{kind} entry '{entry}' cannot be listed: {exc}")
+
+        files: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(path, onerror=unlisted):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            here = Path(dirpath)
+            files += (
+                here / name
+                for name in filenames
+                if name.endswith(".md")
+                and not name.startswith(".")
+                and _readable(base, (here / name).relative_to(base))
+            )
+        for file in sorted(files, key=lambda f: f.relative_to(path).parts):
+            found.append((file, file.relative_to(path).parent.parts))
     return found
 
 
@@ -431,8 +481,13 @@ class Plugins:
 
         catalogue: dict[str, skills.Skill] = {}
         by_name: dict[str, str] = {}
+        folders: set[Path] = set()
+        nested: list[Path] = []
         for folder in parts.skills:
-            for path, location in _skill_folders(base, folder, notes):
+            found, deeper = _skill_folders(base, folder, notes)
+            nested += deeper
+            for path, location in found:
+                folders.add(location)
                 key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
                 if not self._claim(uri, plugin, uri, seen):
@@ -442,18 +497,31 @@ class Plugins:
                     continue
                 catalogue[key] = skill
                 by_name.setdefault(skill.name, uri)
+        # A skills folder read as well, the root say, may hold one found as nested.
+        for entry in nested:
+            if entry.parent not in folders:
+                notes.append(
+                    f"{entry.relative_to(base).as_posix()} is not served: a skill is "
+                    "one folder below its skills folder"
+                )
 
         # The server is already a scope for prompts and agents: only an explicit
         # namespace other than its own is a prefix.
         own = prefix == self._server.name
         named = "" if own else prefix.replace("/", "_") + "_"
         prompts: list[FilePrompt] = []
-        for path in _md_files(base, "commands", parts.commands, notes):
-            if not _usable(path.stem):
-                log.warning("prompt %s is skipped: not a usable name", path)
+        for path, segments in _md_files(base, "commands", parts.commands, notes):
+            segments = (*segments, path.stem)
+            name = named + "_".join(segments)
+            if not all(_usable(part) for part in (*segments, name)):
+                log.warning(
+                    "prompt %s is skipped: prompt name %r is not a usable name",
+                    path,
+                    name,
+                )
                 continue
             try:
-                prompt = load_prompt(path, name=f"{named}{path.stem}")
+                prompt = load_prompt(path, name=name)
             except (OSError, ValueError, yaml.YAMLError) as exc:
                 log.warning("prompt %s is skipped: %s", path, exc)
                 continue
@@ -463,13 +531,13 @@ class Plugins:
                 prompts.append(prompt)
 
         agents: list[Agent] = []
-        for path in _md_files(base, "agents", parts.agents, notes):
+        for path, segments in _md_files(base, "agents", parts.agents, notes):
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
                 log.warning("agent file %s is skipped: %s", path, exc)
                 continue
-            agent = parse_agent(text, by_name, named)
+            agent = parse_agent(text, by_name, named, stem=path.stem, folders=segments)
             if isinstance(agent, str):
                 log.warning("agent file %s is skipped: %s", path, agent)
             elif self._claim(
