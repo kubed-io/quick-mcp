@@ -25,12 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-11-23
 ### Added
 
 - `mcp.websocket_route(path, endpoint, name=)` serves a WebSocket beside the custom routes.
 - `await mcp.get_tool(name)` is the tool as registered, not as `list_tools` shows a caller.
 - `request_values(request)` reads a given Starlette request, such as a custom route's.
+
+## [0.1.1] - 2026-11-23
 
 ### Changed
 
