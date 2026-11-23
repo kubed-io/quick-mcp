@@ -79,6 +79,7 @@ SOURCES = {
     },
     "kubed.mcp.skills": {
         "Skill": "fastmcp.skills",
+        "SkillFileResource": "fastmcp.skills.provider",
     },
 }
 

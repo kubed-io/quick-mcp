@@ -59,6 +59,7 @@ __all__ = [
     "Folders",
     "NameTheIndex",
     "Skill",
+    "SkillFileResource",
     "SkillsExtension",
     "load_skill",
     "serve",
