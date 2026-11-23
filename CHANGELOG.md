@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-23
+
 ### Added
 
 - `mcp.websocket_route(path, endpoint, name=)` serves a WebSocket beside the custom routes.
