@@ -14,6 +14,7 @@ from typing import Any, Protocol, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
+from starlette.routing import WebSocketRoute
 
 from .container import (
     _CALL,
@@ -118,7 +119,26 @@ class QuickMCP:
         self.add_extension = self.server.add_extension
         self.add_transform = self.server.add_transform
         self.custom_route = self.server.custom_route
+        # The tool as registered, not as a caller is shown it: see the docstring of
+        # QuickMCP.get_tool.
+        self.get_tool = self.server.get_tool
         self._plugins = Plugins(self.server)
+
+    def websocket_route(
+        self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
+    ) -> None:
+        """Serves a WebSocket at ``path`` on the HTTP app, beside the custom routes.
+
+        ``endpoint`` is a Starlette WebSocket endpoint: ``async def f(websocket)``.
+        ``path`` is used as given, as ``custom_route`` does, so a server that mounts
+        under a prefix puts the prefix in it. Nothing is served on stdio.
+        """
+        # FastMCP's ``custom_route`` makes only HTTP routes and it has no public way
+        # to add a WebSocket one, though its app serves whatever Route is in this list.
+        # This is the one place quick-mcp touches the private list.
+        self.server._additional_http_routes.append(
+            WebSocketRoute(path, endpoint, name=name)
+        )
 
     def add_plugin(
         self, address: str | os.PathLike[str], *, namespace: str | None = None

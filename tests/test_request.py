@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastmcp import Client
 from fastmcp.server.dependencies import _background_task_headers
 from fastmcp.utilities.tests import asgi_server
+from starlette.requests import Request
 
 from kubed.mcp import QuickMCP
 from kubed.mcp.request import request_values
@@ -61,3 +62,25 @@ def test_a_background_tasks_snapshot_comes_back_with_no_query() -> None:
 
 def test_outside_any_request_it_is_none() -> None:
     assert request_values() is None
+
+
+def test_a_given_request_is_read_with_the_same_rules() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/x",
+            "query_string": b"workspace=alpha&tag=a&tag=b",
+            "headers": [(b"sf-workspace", b"beta"), (b"X-Two", b"x")],
+        }
+    )
+    assert request_values(request) == (
+        {"workspace": ["alpha"], "tag": ["a", "b"]},
+        {"sf-workspace": ["beta"], "x-two": ["x"]},
+    )
+
+
+def test_a_given_request_is_not_snapshotted() -> None:
+    request = Request({"type": "http", "query_string": b"", "headers": [(b"a", b"1")]})
+    found = request_values(request, snapshot=lambda headers: {"a": ["changed"]})
+    assert found == ({}, {"a": ["1"]})

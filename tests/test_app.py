@@ -14,6 +14,8 @@ from fastmcp.server.transforms import Namespace
 from fastmcp.utilities.tests import asgi_server
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocket
 
 import kubed.mcp.container
 from kubed.mcp import Context, Inject, QuickMCP, lookup
@@ -545,6 +547,30 @@ async def test_a_custom_route_answers_over_http() -> None:
         answer = await http.get(str(running.app.url_path_for("health")))
     assert answer.status_code == 200
     assert answer.json() == {"status": "ok"}
+
+
+async def test_a_websocket_route_is_served_over_http() -> None:
+    mcp = server()
+
+    async def echo(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text("echo " + await websocket.receive_text())
+        await websocket.close()
+
+    mcp.websocket_route("/live/{name}", echo, name="live")
+    app = mcp.server.http_app()
+    with TestClient(app) as client, client.websocket_connect("/live/a") as socket:
+        socket.send_text("hi")
+        assert socket.receive_text() == "echo hi"
+    assert app.url_path_for("live", name="a") == "/live/a"
+
+
+async def test_get_tool_is_the_tool_as_registered() -> None:
+    mcp = server()
+    tool = await mcp.get_tool("navigate")
+    assert tool is not None
+    assert set(tool.parameters["properties"]) == {"url"}  # no Inject, no Context
+    assert await mcp.get_tool("nothing") is None
 
 
 # -- run() ---------------------------------------------------------------------
