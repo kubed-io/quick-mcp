@@ -88,6 +88,11 @@ markers = [
 # The oldest interpreter supported, so ruff flags what would break there.
 target-version = "py311"
 
+[tool.ruff.format]
+# Python only: ruff also formats code blocks in Markdown, which rewrote the README and the wiki's
+# designs (docs/ is the wiki submodule) every time a contributor ran `ruff format .`.
+exclude = ["*.md", "docs/**"]
+
 [tool.ruff.lint]
 select = [
   "E", "W",   # pycodestyle
