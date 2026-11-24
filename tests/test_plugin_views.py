@@ -382,14 +382,18 @@ async def test_the_build_key_is_one_extendable_value(monkeypatch):  # #28's seam
     monkeypatch.setattr(
         type(mcp._plugins),
         "_key",
-        lambda self, state, view: (*plain(self, state, view), extra["now"]),
+        lambda self, state, view, prefix: (
+            *plain(self, state, view, prefix),
+            extra["now"],
+        ),
     )
     for now in ("a", "b", "a"):
         extra["now"] = now
         async with Client(mcp.server) as client:
             await client.list_prompts()
     assert built == ["a", "b"]  # one view key, two build keys, each built once
-    assert plain(mcp._plugins, mcp._plugins._state, View("k", bool)) == (
+    assert plain(mcp._plugins, mcp._plugins._state, View("k", bool), None) == (
         mcp.generation,
         "k",
+        None,
     )

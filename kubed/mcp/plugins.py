@@ -51,7 +51,7 @@ from fastmcp.server.providers import Provider
 from fastmcp.skills.provider import SkillCatalogProvider
 from fastmcp.utilities.versions import VersionSpec
 
-from . import skills
+from . import gateway, skills
 from ._rewrite import (
     Kind,
     RewriteFailed,
@@ -742,6 +742,17 @@ class _Renderer(skills.EntryOnlySkillProvider):
         return self._catalogue
 
 
+class _Prefixed(FilePrompt):
+    """A command that writes the prefix into what it renders (GW-7): its text is
+    rewritten with the build, but an argument is given at the request, so the
+    rendered text is written again. An address already prefixed is left alone."""
+
+    prefix: str
+
+    async def render(self, arguments: dict | None = None) -> str:
+        return gateway.prefixed(await super().render(arguments), self.prefix)
+
+
 class _Rewrite:
     """One build's rewriting: ``chain`` run over what each admitted plugin serves.
 
@@ -1043,12 +1054,26 @@ class Plugins:
 
     def _chain(self, key: _Key) -> tuple[Rewriter, ...]:
         """The rewriters a build for ``key`` runs, in order: the one place the order
-        is decided. Empty means no rewriting, and no copies."""
-        return self._rewriters
+        is decided. Empty means no rewriting, and no copies.
 
-    def _key(self, state: _State, view: View) -> _Key:
-        """The build key of ``view`` over ``state``: the one place a key is made."""
-        return (state.generation, view.key)
+        A prefix (GW-5) is written by one last rewriter, after the server's own, so
+        none of them sees the prefix and none can undo it.
+        """
+        if key[2] is None:
+            return self._rewriters
+        prefix = key[2]
+        assert isinstance(prefix, str)
+
+        def write(site: Site, text: str) -> str:
+            return gateway.prefixed(text, prefix)
+
+        return (*self._rewriters, write)
+
+    def _key(self, state: _State, view: View, prefix: str | None) -> _Key:
+        """The build key of ``view`` over ``state`` and the request's ``prefix``: the
+        one place a key is made. No prefix is None, so a server behind no gateway
+        keeps the one build it always had (GW-6)."""
+        return (state.generation, view.key, prefix)
 
     async def pinned(self) -> _Pin:
         """The request's pin, made by its first reader; off a request, a fresh one.
@@ -1082,7 +1107,7 @@ class Plugins:
         memo = self._memo
         state = self._state
         view = self._view() if self._view else _EVERY
-        key = self._key(state, view)
+        key = self._key(state, view, gateway.prefix())
         build = await self._build_for(memo, state, view, key)
         return _Pin(state, view, key, build)
 
@@ -1145,7 +1170,14 @@ class Plugins:
                     catalogue[k] = built
             for file in served.prompts:
                 if (prompt := rewrite.prompt(served, file)) is not None:
-                    prompts.append(prompt)
+                    prompts.append(
+                        prompt
+                        if key[2] is None
+                        else _Prefixed(
+                            **{f: getattr(prompt, f) for f in FilePrompt.model_fields},
+                            prefix=key[2],
+                        )
+                    )
             for file in served.agents:
                 if (agent := rewrite.agent(served, file)) is not None:
                     agents.append(agent)
