@@ -32,6 +32,8 @@ from kubed.mcp.container import Container
 ADDRESS = "http://pyroscope.example.com:4040"
 CHILD = Path(__file__).with_name("otel_child.py")
 EVENTS: list[str | tuple[str, str]] = []
+# Every provider initialize() sets, as _Otel's owned names them.
+EVERY_KIND = frozenset({"tracer", "meter", "logger"})
 
 
 def _reset_otel() -> None:
@@ -792,7 +794,7 @@ def test_a_provider_that_hangs_on_shutdown_is_left_behind(monkeypatch, caplog) -
     monkeypatch.setattr(_logs, "get_logger_provider", Logger)
     began = time.monotonic()
     try:
-        _Otel(owned=True, logging_instrumented=False).stop()
+        _Otel(owned=EVERY_KIND, logging_instrumented=False).stop()
         assert time.monotonic() - began < 2
     finally:
         release.set()
@@ -820,7 +822,7 @@ def test_a_provider_that_fails_to_stop_is_logged_by_type(monkeypatch, caplog) ->
         (_logs, "get_logger_provider"),
     ):
         monkeypatch.setattr(module, getter, Failing)
-    _Otel(owned=True, logging_instrumented=False).stop()
+    _Otel(owned=EVERY_KIND, logging_instrumented=False).stop()
     records = [r for r in caplog.records if r.name.startswith("kubed.mcp")]
     assert [r.getMessage() for r in records] == [
         "OpenTelemetry did not stop cleanly: RuntimeError"
@@ -896,17 +898,65 @@ def _fake_providers(monkeypatch) -> list[str]:
     return stopped
 
 
+def _stand_in_providers(
+    monkeypatch, kept: frozenset[str] = frozenset()
+) -> tuple[list[str], types.FunctionType]:
+    """Global providers that count their shutdowns, and what sets them.
+
+    The kinds in ``kept`` are set from the start. The rest are OpenTelemetry's proxies
+    until the function returned is called, as initialize() sets them. The list is the
+    kinds shut down, in order.
+    """
+    from opentelemetry import _logs, metrics, trace
+    from opentelemetry._logs._internal import ProxyLoggerProvider
+    from opentelemetry.metrics._internal import _ProxyMeterProvider
+
+    stopped: list[str] = []
+
+    class Provider:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        def shutdown(self, **kwargs) -> None:
+            stopped.append(self.kind)
+
+    proxies = {
+        "tracer": trace.ProxyTracerProvider(),
+        "meter": _ProxyMeterProvider(),
+        "logger": ProxyLoggerProvider(),
+    }
+    current = {
+        kind: Provider(kind) if kind in kept else proxy
+        for kind, proxy in proxies.items()
+    }
+
+    def install() -> None:
+        for kind in EVERY_KIND - kept:
+            current[kind] = Provider(kind)
+
+    for module, getter, kind in (
+        (trace, "get_tracer_provider", "tracer"),
+        (metrics, "get_meter_provider", "meter"),
+        (_logs, "get_logger_provider", "logger"),
+    ):
+        monkeypatch.setattr(module, getter, lambda kind=kind: current[kind])
+    return stopped, install
+
+
 def test_a_configure_that_fails_halfway_shuts_its_providers_down(
     monkeypatch, caplog
 ) -> None:
     import kubed.mcp._otel
 
-    # Unconfigured before initialize(), configured after it raised.
-    answers = iter([False, True])
-    monkeypatch.setattr(kubed.mcp._otel, "_sdk_configured", lambda: next(answers))
+    # Unset before initialize(), set by it before it raised.
+    stopped, install = _stand_in_providers(monkeypatch)
+
+    def initialize(**kwargs) -> None:
+        install()
+        _raise_secret()
+
     # Replaces the guard's recorder: this test means initialize() to run, and raise.
-    monkeypatch.setattr(kubed.mcp._otel, "initialize", _raise_secret)
-    stopped = _fake_providers(monkeypatch)
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", initialize)
     otel = kubed.mcp._otel.start("half", TelemetrySettings(otel=True), None)
     assert otel is None
     assert stopped == ["tracer", "meter", "logger"]
@@ -916,6 +966,78 @@ def test_a_configure_that_fails_halfway_shuts_its_providers_down(
         (logging.ERROR, "OpenTelemetry did not start; serving without it: RuntimeError")
     ]
     assert_safe(caplog.records, "s3cret")
+
+
+def test_a_meter_provider_already_set_is_kept_and_never_owned(monkeypatch) -> None:
+    import kubed.mcp._otel
+
+    stopped, install = _stand_in_providers(monkeypatch, kept=frozenset({"meter"}))
+    initialized: list[dict] = []
+
+    def initialize(**kwargs) -> None:
+        initialized.append(kwargs)
+        install()
+
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", initialize)
+    otel = kubed.mcp._otel.start("kept", TelemetrySettings(otel=True), None)
+    # No tracer provider was set, so initialize() ran: it set the tracer and the logger.
+    assert initialized == [{"swallow_exceptions": False}]
+    assert otel._owned == frozenset({"tracer", "logger"})
+    otel.stop()
+    assert stopped == ["tracer", "logger"]
+    assert kubed.mcp._otel._stopped is True
+
+
+def test_a_configure_that_fails_halfway_keeps_a_provider_already_set(
+    monkeypatch,
+) -> None:
+    import kubed.mcp._otel
+
+    stopped, install = _stand_in_providers(monkeypatch, kept=frozenset({"meter"}))
+
+    def initialize(**kwargs) -> None:
+        install()
+        _raise_secret()
+
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", initialize)
+    assert kubed.mcp._otel.start("half", TelemetrySettings(otel=True), None) is None
+    assert stopped == ["tracer", "logger"]
+
+
+@pytest.mark.parametrize("exporter", [None, "prometheus"])
+def test_a_kept_providers_exporter_is_off_for_initialize_and_put_back(
+    monkeypatch, exporter
+) -> None:
+    import kubed.mcp._otel
+
+    if exporter is not None:
+        monkeypatch.setenv("OTEL_METRICS_EXPORTER", exporter)
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
+    _, install = _stand_in_providers(monkeypatch, kept=frozenset({"meter"}))
+    seen: list[tuple[str | None, str | None]] = []
+
+    def initialize(**kwargs) -> None:
+        seen.append(
+            (
+                os.environ.get("OTEL_METRICS_EXPORTER"),
+                os.environ.get("OTEL_TRACES_EXPORTER"),
+            )
+        )
+        install()
+
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", initialize)
+    otel = kubed.mcp._otel.start("kept", TelemetrySettings(otel=True), None)
+    assert otel is not None
+    # The kept meter's exporter is off; the tracer, which initialize() sets, keeps its own.
+    assert seen == [("none", "console")]
+    assert os.environ.get("OTEL_METRICS_EXPORTER") == exporter
+    assert os.environ["OTEL_TRACES_EXPORTER"] == "console"
+
+
+def test_a_meter_provider_the_process_set_is_kept_and_records_the_calls() -> None:
+    out = _child("own_meter")
+    result = json.loads(out.stdout.splitlines()[-1])
+    assert result == {"kept": True, "points": 1, "tracer_is_sdk": True}
 
 
 def test_an_initialize_that_sets_no_provider_owns_nothing(monkeypatch) -> None:

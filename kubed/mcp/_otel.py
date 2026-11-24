@@ -3,7 +3,9 @@
 ``start`` runs OpenTelemetry's standard configuration, ``initialize()``, read from
 the ``OTEL_*`` variables, after filling a few defaults. Its providers are set once per
 process, so once ours have stopped, no later start configures them again. An SDK
-something else configured first is kept, and only log records are given its trace.
+something else configured first is kept, and only log records are given its trace. A
+provider something else set without a tracer provider is kept too: the stop shuts down
+only the providers ``initialize()`` set.
 With profiles on too, each root span tags the profile samples taken while it runs.
 """
 
@@ -23,12 +25,16 @@ import opentelemetry.distro
 import opentelemetry.sdk._logs as _sdk_logs
 import opentelemetry.sdk.trace
 from opentelemetry import _logs, metrics, trace
+
+# The proxies a provider's global is until one is set. Only the tracer's is public.
+from opentelemetry._logs._internal import ProxyLoggerProvider
 from opentelemetry.context import Context
 from opentelemetry.instrumentation.auto_instrumentation import initialize
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.logging.handler import (
     LoggingHandler as _InstrumentationHandler,
 )
+from opentelemetry.metrics._internal import _ProxyMeterProvider
 
 from .telemetry import Telemetry
 
@@ -38,6 +44,13 @@ log = logging.getLogger(__name__)
 _stopped: bool = False
 
 _SHUTDOWN_SECONDS = 5
+
+# The variable that names each provider's exporters, for initialize() to build.
+_EXPORTER_VARIABLES = {
+    "tracer": "OTEL_TRACES_EXPORTER",
+    "meter": "OTEL_METRICS_EXPORTER",
+    "logger": "OTEL_LOGS_EXPORTER",
+}
 
 # The loggers initialize() writes its failures to, each with a traceback.
 _TRACEBACK_LOGGERS = (
@@ -107,6 +120,43 @@ def _set_defaults(name: str, tags: Mapping[str, str]) -> None:
 def _sdk_configured() -> bool:
     """Whether something in the process already set a tracer provider."""
     return not isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider)
+
+
+def _providers_set() -> frozenset[str]:
+    """The kinds of provider set in the process: those whose global isn't the proxy."""
+    found = (
+        ("tracer", trace.get_tracer_provider(), trace.ProxyTracerProvider),
+        ("meter", metrics.get_meter_provider(), _ProxyMeterProvider),
+        ("logger", _logs.get_logger_provider(), ProxyLoggerProvider),
+    )
+    return frozenset(
+        kind for kind, provider, proxy in found if not isinstance(provider, proxy)
+    )
+
+
+@contextmanager
+def _exporters_off(kept: frozenset[str]) -> Iterator[None]:
+    """Inside the block, no exporter for the providers in ``kept``; then as they were.
+
+    initialize() builds every provider with its exporters before it sets it, and a set
+    over one already set is refused: that pipeline would run with nothing recording to
+    it, and Prometheus's would hold the port.
+    """
+    saved = {
+        variable: os.environ.get(variable)
+        for kind, variable in _EXPORTER_VARIABLES.items()
+        if kind in kept
+    }
+    for variable in saved:
+        os.environ[variable] = "none"
+    try:
+        yield
+    finally:
+        for variable, value in saved.items():
+            if value is None:
+                os.environ.pop(variable, None)
+            else:
+                os.environ[variable] = value
 
 
 class _NoTraceback(logging.Filter):
@@ -291,12 +341,15 @@ def _link_profiles(
 
 
 class _Otel:
-    """What a start set up, so its stop undoes what it owns and nothing else."""
+    """What a start set up, so its stop undoes what it owns and nothing else.
+
+    ``owned`` names the providers the start set, of "tracer", "meter" and "logger".
+    """
 
     def __init__(
         self,
         *,
-        owned: bool,
+        owned: frozenset[str],
         logging_instrumented: bool,
         link: _ProfileLink | None = None,
     ) -> None:
@@ -324,6 +377,9 @@ class _Otel:
             ("meter", metrics.get_meter_provider),
             ("logger", _logs.get_logger_provider),
         ):
+            if kind not in self._owned:
+                # Set before the start, by something else: it keeps running.
+                continue
             try:
                 provider = provided()
                 if hasattr(provider, "shutdown"):
@@ -359,11 +415,16 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
                     "OpenTelemetry did not instrument logging: %s", type(error).__name__
                 )
                 instrumented = False
-            return _Otel(owned=False, logging_instrumented=instrumented, link=link)
+            return _Otel(
+                owned=frozenset(), logging_instrumented=instrumented, link=link
+            )
         instrumentor = LoggingInstrumentor()
         before = instrumentor.is_instrumented_by_opentelemetry
+        # Someone else's meter or logger provider, with no tracer provider: kept.
+        kept = _providers_set()
         try:
-            with _logging_kept(), _without_tracebacks():
+            # The exporters back before _logging_kept reads OTEL_LOGS_EXPORTER.
+            with _logging_kept(), _without_tracebacks(), _exporters_off(kept):
                 initialize(swallow_exceptions=False)
         except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
             log.error(
@@ -372,15 +433,16 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
             )
             # A configure that failed halfway may have set providers: they go too.
             _Otel(
-                owned=_sdk_configured(),
+                owned=_providers_set() - kept,
                 logging_instrumented=(
                     instrumentor.is_instrumented_by_opentelemetry and not before
                 ),
             ).stop()
             return None
-        # Ours only if initialize() set a provider: else a stop would claim one stopped.
+        # Ours only if initialize() set it: else a stop would claim it, or shut down
+        # someone else's.
         return _Otel(
-            owned=_sdk_configured(),
+            owned=_providers_set() - kept,
             logging_instrumented=instrumentor.is_instrumented_by_opentelemetry
             and not before,
             link=_link_profiles(trace.get_tracer_provider(), profiles),
