@@ -6,8 +6,9 @@ touches, re-exported as the same objects, so ``isinstance`` and pydantic keep wo
 Protocol plumbing is in ``kubed.mcp.protocol``, auth in ``kubed.mcp.auth`` and the
 request's headers and query in ``kubed.mcp.request``.
 
-The names resolve on first use, so importing ``kubed.mcp`` loads no FastMCP until one of
-them is used, and a config module can import ``TelemetrySettings`` alone.
+Every name but ``Telemetry`` and ``TelemetrySettings`` resolves on first use, so
+importing ``kubed.mcp`` loads no FastMCP until one of them is used, and a config module
+can import ``TelemetrySettings`` alone.
 """
 
 from __future__ import annotations

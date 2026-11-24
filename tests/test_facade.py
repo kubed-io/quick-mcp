@@ -164,9 +164,9 @@ def _run(code: str) -> list[str]:
         [sys.executable, "-I", "-c", code + "\n" + REPORT],
         capture_output=True,
         text=True,
-        check=True,
         timeout=60,
     )
+    assert out.returncode == 0, out.stderr
     return out.stdout.splitlines()
 
 
