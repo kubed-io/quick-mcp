@@ -16,14 +16,17 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from fastmcp.exceptions import PromptError
 from fastmcp.prompts import Prompt, PromptArgument
 from pydantic import Field
 
-__all__ = ["FilePrompt", "load_prompt"]
+if TYPE_CHECKING:
+    from .plugins import Plugin
+
+__all__ = ["FilePrompt", "load_prompt", "read_command"]
 
 PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
@@ -85,6 +88,19 @@ def load_prompt(path: Path, name: str | None = None) -> FilePrompt:
     read.
     """
     return parse_prompt(path.read_text(encoding="utf-8"), name or path.stem)
+
+
+def read_command(text: str, path: str, name: str, plugin: Plugin) -> FilePrompt | str:
+    """The default ``command_reader`` (PLUG-62): a command file's ``text`` as a prompt
+    named ``name``, or the reason it is not one.
+
+    ``path`` and ``plugin`` are a reader's other arguments, unused here: the file is
+    read by its text alone, as ``parse_prompt`` reads it.
+    """
+    try:
+        return parse_prompt(text, name)
+    except (ValueError, yaml.YAMLError) as exc:
+        return str(exc)
 
 
 def parse_prompt(text: str, name: str) -> FilePrompt:

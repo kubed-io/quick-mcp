@@ -36,11 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A server's own `file` loader replaces the built-in one.
 - A server behind a multiplexing gateway takes its `X-MCP-Resource-Prefix` (or `?prefix=`) off the addresses clients send and writes it into the text it serves.
 - `kubed.mcp.gateway.prefix()` and `prefixed(text, prefix)` prefix a server's own text the same way.
+- `mcp.command_reader(fn)` reads a server's own command dialects as prompts.
+- Same-named agents from two plugins are both served, the later as `name@plugin`.
+- `Plugin.agent_files` gives each agent's file and whether it was renamed.
+- `mcp.agent_meta(fn)` adds a server's own `_meta` to `agents/get`.
+- A Copilot prompt file, `x.prompt.md`, is served as the prompt `x`.
 
 ### Changed
 
 - A `skill://`, `prompts://` or `agents://` address holding an escaped `/` (`%2F`) now fails as a missing one does.
 - `resources/read` resolves `.` and `..` segments in a `skill://`, `prompts://` or `agents://` address.
+- Under a namespace, prompt and agent names are prefixed with its first segment only.
 
 ## [0.1.2] - 2026-11-23
 

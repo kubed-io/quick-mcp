@@ -27,7 +27,17 @@ from .container import (
     _Call,
 )
 from .gateway import _TakeThePrefix
-from .plugins import Plugin, PluginLoader, Plugins, PluginSet, Site, View, _PinScope
+from .plugins import (
+    AgentMeta,
+    CommandReader,
+    Plugin,
+    PluginLoader,
+    Plugins,
+    PluginSet,
+    Site,
+    View,
+    _PinScope,
+)
 
 T = TypeVar("T")
 
@@ -217,6 +227,47 @@ class QuickMCP:
         request.
         """
         self._plugins.add_rewriter(fn)
+
+    def command_reader(self, fn: CommandReader) -> CommandReader:
+        """Reads the commands of every plugin read from now on with ``fn``, and returns
+        ``fn``, so it works as a decorator (PLUG-62).
+
+        ``fn(text, path, name, plugin)`` is given the command file's text as served,
+        its ``path`` from the plugin root, ``/``-separated, the ``name`` it is served
+        under and the ``Plugin`` it is in, and returns a FastMCP ``Prompt`` to serve, or
+        a string: the reason the command is skipped. It runs once when the plugin is
+        read, where a string, a raise or any other result skips the command with the
+        warning ``prompt <path> is skipped: <reason>``; and again in each build whose
+        text for the command differs from the text read (a rewriter's, PLUG-56), where
+        a skip fails the prompt for that build alone. With no rewriter, or text a build
+        leaves unchanged, the first ``Prompt`` is served.
+
+        A plugin is read and built by the reader set when it was read, and no build
+        reads the disk. A ``Prompt`` named otherwise is served under the layer's name,
+        and the name, namespace, clash and gateway prefix rules apply to it as to any
+        command. The default reader is ``kubed.mcp.prompts.read_command``.
+        """
+        self._plugins.set_command_reader(fn)
+        return fn
+
+    def agent_meta(self, fn: AgentMeta) -> AgentMeta:
+        """Adds ``fn``'s keys to each agent's ``agents/get`` ``_meta``, beside the
+        layer's ``io.kubed/agent``, and returns ``fn``, so it works as a decorator
+        (PLUG-73). A second call replaces the first.
+
+        ``fn(name, plugin)`` runs once per agent when its plugin enters a set, after
+        the agent's name is decided (PLUG-64), with that name and the ``Plugin`` as it
+        enters, and never on a read; so it runs again on every set entry, each
+        ``add_plugin`` included, and must be pure. It returns a dict, or None for
+        nothing to add, and its JSON round trip is what is served. A returned
+        ``io.kubed/agent`` key is dropped with a warning, as is a result that is not a
+        dict or does not survive a trip through JSON. An ``fn`` that raises leaves
+        that agent unserved in that set, logged at error and in the plugin's
+        ``skipped`` as ``agent_meta failed: <reason>``. The ``agents/list`` card is
+        unchanged.
+        """
+        self._plugins.set_agent_meta(fn)
+        return fn
 
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.
