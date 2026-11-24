@@ -52,6 +52,8 @@ test = [
   "pytest",
   "pytest-asyncio",
   "ruff",
+  # The suite checks the keywords it passes against the real pyroscope configure.
+  "kubed-mcp[telemetry]",
 ]
 
 [build-system]
