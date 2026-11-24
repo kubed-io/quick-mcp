@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.plugin_view(fn)` serves each request only the plugins its view admits.
 - `mcp.add_rewriter(fn)` rewrites the text a server serves, with digests that match.
 - `to_mcp_form` rewrites `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_SKILL_DIR}` and `<plugin>:<skill>` as `skill://` addresses.
+- A server's own `file` loader replaces the built-in one.
 
 ## [0.1.2] - 2026-11-23
 

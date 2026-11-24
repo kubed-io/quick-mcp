@@ -48,6 +48,7 @@ from fastmcp.resources import Resource, TextResource
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
+from fastmcp.skills.provider import SkillCatalogProvider
 from fastmcp.utilities.versions import VersionSpec
 
 from . import skills
@@ -635,7 +636,7 @@ class _Build:
     agents: tuple[Agent, ...]
     rewritten: bool  # the rewriter chain was not empty
     indexes: Mapping[str, TextResource | None]
-    _renderer: object = None  # kept alive with the build it rendered
+    _renderers: tuple[object, ...] = ()  # kept alive with the build they rendered
 
 
 @dataclass(frozen=True)
@@ -722,6 +723,23 @@ def _owned(served: _Served) -> dict[str, str]:
         **{f"prompt:{prompt}": name for prompt in served.plugin.prompts},
         **{f"agent:{agent}": name for agent in served.plugin.agents},
     }
+
+
+class _Renderer(skills.EntryOnlySkillProvider):
+    """One skill of a rewritten build, alone: what its indexes are rendered from.
+
+    A folder's children are its own skill's alone, so a renderer per skill lists each
+    one in time to the skill's size rather than the build's. The skill was trimmed of
+    its reserved files when it was read, so it is not trimmed (or warned of) again.
+    """
+
+    def __init__(self, key: str, skill: skills.Skill) -> None:
+        super().__init__()
+        self.skill = skill
+        self._catalogue = {key: skill}
+
+    async def load_skills(self) -> dict[str, skills.Skill]:
+        return self._catalogue
 
 
 class _Rewrite:
@@ -854,22 +872,21 @@ class _Rewrite:
         return agent
 
     async def indexes(
-        self,
-        served: _Served,
-        key: str,
-        skill: skills.Skill,
-        renderer: skills.EntryOnlySkillProvider,
+        self, served: _Served, key: str, renderer: _Renderer
     ) -> dict[str, TextResource | None]:
         """Each folder's ``_index.md`` and ``_index.json`` of the skill at ``key``,
-        rendered by ``renderer`` and rewritten; None for one that failed."""
+        both rendered from one listing of the folder by ``renderer`` and rewritten;
+        None for one that failed."""
         found: dict[str, TextResource | None] = {}
-        for rel in sorted(skills._folders_of(skill.files)):
+        for rel in sorted(skills._folders_of(renderer.skill.files)):
             path = _joined(served.skill_dirs[key], rel)
+            folder = skills._folder_uri(key, rel)
+            children = await renderer.children(folder)
+            if children is None:
+                continue
             for name in (skills.INDEX_MD, skills.INDEX_JSON):
-                uri = f"{skills._folder_uri(key, rel)}/{name}"
-                resource = await skills._index_resource(renderer, uri)
-                if not isinstance(resource, TextResource):
-                    continue
+                uri = f"{folder}/{name}"
+                resource = skills._index_of(uri, children)
                 site = self._site(served, "index", path, uri)
                 new = self._run(served, site, resource.text, uri)
                 found[uri] = (
@@ -956,6 +973,8 @@ class Plugins:
     def __init__(self, server: FastMCP) -> None:
         self._server = server
         self._loaders: dict[str, PluginLoader] = {}
+        # Schemes whose loader a server may replace once: the built-in file (PLUG-61).
+        self._replaceable: set[str] = {"file"}
         self._skills: _Skills | None = None
         self._prompts: _Prompts | None = None
         self._agents: _Agents | None = None
@@ -964,6 +983,7 @@ class Plugins:
         self._rewriters: tuple[Rewriter, ...] = ()
         self._memo = _Memo(OrderedDict(), {})
         self.add_loader(LocalLoader())
+        self._replaceable = {"file"}
 
     @property
     def current(self) -> tuple[_Served, ...]:
@@ -982,10 +1002,11 @@ class Plugins:
         if not schemes:
             raise ValueError(f"{type(loader).__name__} names no scheme")
         for scheme in schemes:
-            if scheme in self._loaders:
+            if scheme in self._loaders and scheme not in self._replaceable:
                 raise ValueError(f"a loader for {scheme}:// is already registered")
         for scheme in schemes:
             self._loaders[scheme] = loader
+            self._replaceable.discard(scheme)
 
     def _loader_for(self, address: str) -> PluginLoader:
         match = _SCHEME.match(address)
@@ -1128,17 +1149,20 @@ class Plugins:
             for file in served.agents:
                 if (agent := rewrite.agent(served, file)) is not None:
                     agents.append(agent)
-        # A throwaway renderer over the build: FastMCP keys what it loads per request
-        # by its id, so the build keeps it alive while a request may still see it.
-        renderer = skills.EntryOnlySkillProvider(catalogue)
+        # FastMCP refuses a catalogue with a skill nested in another, which no one
+        # skill's renderer can see: the build fails on it as the whole catalogue would.
+        SkillCatalogProvider(catalogue)
+        # Throwaway renderers, one per skill: FastMCP keys what it loads per request
+        # by a provider's id, so the build keeps them alive while a request may still
+        # see them.
+        renderers: list[_Renderer] = []
         indexes: dict[str, TextResource | None] = {}
         async with Context(fastmcp=self._server):
             for served in admitted:
                 for k in served.catalogue:
                     if k in catalogue:
-                        indexes |= await rewrite.indexes(
-                            served, k, catalogue[k], renderer
-                        )
+                        renderers.append(renderer := _Renderer(k, catalogue[k]))
+                        indexes |= await rewrite.indexes(served, k, renderer)
         return _Build(
             admitted=plugins,
             catalogue=MappingProxyType(catalogue),
@@ -1146,7 +1170,7 @@ class Plugins:
             agents=tuple(agents),
             rewritten=True,
             indexes=MappingProxyType(indexes),
-            _renderer=renderer,
+            _renderers=tuple(renderers),
         )
 
     def add(

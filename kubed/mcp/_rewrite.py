@@ -9,6 +9,7 @@ item it was rewriting (PLUG-59).
 
 from __future__ import annotations
 
+import functools
 import mimetypes
 import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -127,15 +128,35 @@ def to_mcp_form(site: Site, text: str) -> str:
     at or below a skill folder, and ``${CLAUDE_SKILL_DIR}`` inside a skill. What names
     nothing served stays as written."""
     text = _QUALIFIED.sub(lambda match: _qualified(site, match), text)
-    folders = sorted((key for key in site.skills if key), key=len, reverse=True)
-    if folders:
-        alternation = "|".join(re.escape(key) for key in folders)
-        pattern = re.compile(re.escape(_ROOT) + "/(" + alternation + ")" + _BOUNDARY)
+    pattern = _folders(tuple(site.skills))
+    if pattern is not None:
         text = pattern.sub(lambda match: site.skills[match[1]], text)
     if "" in site.skills:
         text = re.sub(re.escape(_ROOT) + "(?=/)", lambda _: site.skills[""], text)
     if site.kind == "skill":
-        own = [key for key in site.skills if not key or site.path.startswith(key + "/")]
-        if own:
-            text = text.replace(_SKILL_DIR, site.skills[max(own, key=len)])
+        own = _own(site.path, site.skills)
+        if own is not None:
+            text = text.replace(_SKILL_DIR, site.skills[own])
     return text
+
+
+@functools.lru_cache(maxsize=64)
+def _folders(keys: tuple[str, ...]) -> re.Pattern[str] | None:
+    """``${CLAUDE_PLUGIN_ROOT}/<folder>`` for any of the skill folders ``keys``, the
+    deepest tried first, so it wins; None when there is none but the root. Made once
+    per plugin's folders, not per file: a build shows it every text file it serves."""
+    folders = sorted((key for key in keys if key), key=len, reverse=True)
+    if not folders:
+        return None
+    alternation = "|".join(re.escape(key) for key in folders)
+    return re.compile(re.escape(_ROOT) + "/(" + alternation + ")" + _BOUNDARY)
+
+
+def _own(path: str, folders: Mapping[str, str]) -> str | None:
+    """The deepest of ``folders`` that ``path`` is inside, the root ``""`` last."""
+    parent = path
+    while parent:
+        parent = parent.rpartition("/")[0]
+        if parent in folders:
+            return parent
+    return None

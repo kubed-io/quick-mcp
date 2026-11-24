@@ -183,7 +183,7 @@ class QuickMCP:
 
     @property
     def generation(self) -> int:
-        """How many sets this server has served: 0 until the first plugin."""
+        """How many sets this server has served: 0 until a set is first served."""
         return self._plugins.generation
 
     def plugin_view(self, fn: Callable[[], View]) -> Callable[[], View]:
@@ -217,8 +217,9 @@ class QuickMCP:
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.
 
-        ``LocalLoader`` is always registered, for ``file``. A scheme that already has a
-        loader is refused with a ``ValueError``.
+        ``LocalLoader`` is registered for ``file`` until the server adds its own, which
+        replaces it. Any other scheme that already has a loader, or a second loader for
+        ``file``, is refused with a ``ValueError``, and nothing is registered.
         """
         self._plugins.add_loader(loader)
 

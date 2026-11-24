@@ -25,7 +25,7 @@ from plugin_server import (
 from skill_server import request
 
 from kubed.mcp import QuickMCP
-from kubed.mcp.plugins import View
+from kubed.mcp.plugins import _PINS, View, _Slot
 from kubed.mcp.protocol import MCPError
 from kubed.mcp.request import request_values
 
@@ -198,6 +198,77 @@ async def test_concurrent_requests_share_one_build(monkeypatch):
             request(client, "skills/list"),
         )
     assert len(made) == 1
+
+
+def first_hangs(monkeypatch, mcp: QuickMCP, name: str) -> anyio.Event:
+    """``Plugins.<name>`` hanging on its first call, until cancelled, and plain after:
+    the event is set once the first call has begun."""
+    entered, plain = anyio.Event(), getattr(type(mcp._plugins), name)
+
+    async def hanging(self, *args):
+        if not entered.is_set():
+            entered.set()
+            await anyio.sleep_forever()
+        return await plain(self, *args)
+
+    monkeypatch.setattr(type(mcp._plugins), name, hanging)
+    return entered
+
+
+async def until_awaited(event: anyio.Event) -> None:
+    while event.statistics().tasks_waiting == 0:
+        await anyio.sleep(0)
+
+
+async def test_a_reader_left_by_a_cancelled_pinner_pins_itself(monkeypatch):
+    mcp = served((DEMO, None))
+    plugins, entered, pins = mcp._plugins, first_hangs(monkeypatch, mcp, "_pin"), []
+    slot = _Slot()
+    token = _PINS.set({plugins: slot})  # one request's slot, as _PinScope opens it
+    try:
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tg:
+                pinner = anyio.CancelScope()
+
+                async def pin_first() -> None:
+                    with pinner:
+                        await plugins.pinned()
+
+                async def read() -> None:
+                    pins.append(await plugins.pinned())
+
+                tg.start_soon(pin_first)
+                await entered.wait()
+                tg.start_soon(read)
+                await until_awaited(slot.done)
+                pinner.cancel()
+    finally:
+        _PINS.reset(token)
+    assert pins == [slot.pin] and pins[0].build.prompts
+
+
+async def test_a_request_left_by_a_cancelled_build_builds_itself(monkeypatch):
+    mcp = served((DEMO, None))
+    plugins, entered, builds = mcp._plugins, first_hangs(monkeypatch, mcp, "_make"), []
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tg:
+            maker = anyio.CancelScope()
+
+            async def make_first() -> None:
+                with maker:
+                    await plugins.pinned()
+
+            async def share() -> None:
+                builds.append((await plugins.pinned()).build)
+
+            tg.start_soon(make_first)
+            await entered.wait()
+            tg.start_soon(share)
+            (flight,) = plugins._memo.flights.values()
+            await until_awaited(flight.done)
+            maker.cancel()
+    assert builds[0] is not None and builds[0].prompts
+    assert list(plugins._memo.builds.values()) == builds  # and it is kept
 
 
 async def test_builds_are_kept_per_key_least_recently_used_first():

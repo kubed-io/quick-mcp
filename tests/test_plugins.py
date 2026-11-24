@@ -279,10 +279,41 @@ async def test_a_custom_loader_is_registered_and_used(tmp_path):
     assert await skill_uris(mcp) == [ENTRY]
 
 
-def test_a_scheme_takes_one_loader(tmp_path):
+class Recording(LocalLoader):
+    def __init__(self):
+        self.asked = []
+
+    def materialise(self, address):
+        self.asked.append(address)
+        return super().materialise(address)
+
+
+def test_a_servers_file_loader_replaces_the_local_one():
+    mcp, loader = QuickMCP("t"), Recording()
+    mcp.add_loader(loader)
+    mcp.add_plugin(DEMO)
+    assert loader.asked == [str(DEMO)]
+
+
+def test_a_second_loader_for_a_scheme_is_refused(tmp_path):
     mcp = QuickMCP("t")
-    with pytest.raises(ValueError, match="already registered"):
+    mcp.add_loader(Recording())
+    with pytest.raises(ValueError, match=r"a loader for file:// is already registered"):
         mcp.add_loader(LocalLoader())
+    mcp.add_loader(Folders(tmp_path))
+    with pytest.raises(ValueError, match=r"fixture:// is already registered"):
+        mcp.add_loader(Folders(tmp_path))
+
+
+def test_a_refused_loader_replaces_nothing(tmp_path):
+    mcp = QuickMCP("t")
+    mcp.add_loader(Folders(tmp_path))
+    both = Recording()
+    both.schemes = ("file", "fixture")
+    with pytest.raises(ValueError):
+        mcp.add_loader(both)
+    mcp.add_plugin(DEMO)
+    assert both.asked == []
 
 
 # ---- namespaces --------------------------------------------------------------------
