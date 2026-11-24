@@ -27,6 +27,7 @@ HEAVY = (
     "opentelemetry.instrumentation",
     "pyroscope.otel",
     "kubed.mcp._otel",
+    "fastmcp.server.middleware.usage",
 )
 
 

@@ -1349,3 +1349,227 @@ def test_a_renamed_span_leaves_no_tag_behind(pyroscope_tags) -> None:
     span.end()
     assert pyroscope_tags == {}
     link.close()
+
+
+# -- call metrics -------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def metered(traced) -> object:
+    """A meter provider set globally, with one in-memory reader: the call metrics' sink.
+
+    It needs ``traced``: _sdk_configured() reads the tracer provider, so the SDK counts as
+    configured and initialize() never runs.
+    """
+    from opentelemetry import metrics
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+    # set_meter_provider only warns when one was set before: it must be this one.
+    assert metrics.get_meter_provider() is provider
+    return reader
+
+
+def _middleware(mcp: QuickMCP) -> list[type]:
+    """The server's middleware by class, less FastMCP's own default (it adds one)."""
+    from fastmcp.server.middleware.dereference import DereferenceRefsMiddleware
+
+    return [
+        type(m)
+        for m in mcp.server.middleware
+        if not isinstance(m, DereferenceRefsMiddleware)
+    ]
+
+
+def _metric_points(reader, metric: str) -> list:
+    data = reader.get_metrics_data()
+    if data is None:
+        return []
+    return [
+        point
+        for resource in data.resource_metrics
+        for scope in resource.scope_metrics
+        for found in scope.metrics
+        if found.name == metric
+        for point in found.data.data_points
+    ]
+
+
+def duration_points(reader, server: str) -> list:
+    """``mcp.server.operation.duration``'s points recorded by the server named ``server``."""
+    return [
+        point
+        for point in _metric_points(reader, "mcp.server.operation.duration")
+        if point.attributes.get("fastmcp.server.name") == server
+    ]
+
+
+async def test_each_tool_call_is_counted_under_the_tools_name(metered) -> None:
+    mcp = served("counted", TelemetrySettings(otel=True))
+    async with Client(mcp.server) as client:
+        await client.call_tool("ping", {})
+        await client.call_tool("ping", {})
+    points = duration_points(metered, "counted")
+    assert [(p.attributes["gen_ai.tool.name"], p.count) for p in points] == [
+        ("ping", 2)
+    ]
+    assert points[0].attributes["mcp.method.name"] == "tools/call"
+    assert "error.type" not in points[0].attributes
+    # user_id="omit": no salt asked for, and no user recorded
+    assert not [k for p in points for k in p.attributes if k.startswith("enduser.")]
+
+
+async def test_a_failed_tool_call_carries_error_type(metered) -> None:
+    from fastmcp.exceptions import ToolError
+
+    mcp = served("failing-calls", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def fail() -> str:
+        raise ToolError("no")
+
+    async with Client(mcp.server) as client:
+        await client.call_tool("fail", {}, raise_on_error=False)
+    (point,) = duration_points(metered, "failing-calls")
+    assert (point.attributes["gen_ai.tool.name"], point.attributes["error.type"]) == (
+        "fail",
+        "tool_error",
+    )
+
+
+async def test_an_unknown_tool_is_counted_without_its_name(metered) -> None:
+    mcp = served("unknown-calls", TelemetrySettings(otel=True))
+    async with Client(mcp.server) as client:
+        await client.call_tool("nope", {}, raise_on_error=False)
+    (point,) = duration_points(metered, "unknown-calls")
+    assert "gen_ai.tool.name" not in point.attributes
+    assert point.attributes["error.type"] == "tool_error"
+
+
+async def test_a_prompt_render_is_counted_under_the_prompts_name(metered) -> None:
+    mcp = served("prompted", TelemetrySettings(otel=True))
+
+    @mcp.prompt
+    def greet() -> str:
+        return "hello"
+
+    async with Client(mcp.server) as client:
+        await client.get_prompt("greet")
+    (point,) = duration_points(metered, "prompted")
+    assert (
+        point.attributes["mcp.method.name"],
+        point.attributes["gen_ai.prompt.name"],
+    ) == ("prompts/get", "greet")
+
+
+async def test_a_servers_own_counter_lands_beside_the_call_metrics(metered) -> None:
+    from opentelemetry import metrics
+
+    mcp = served("own-counter", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def count() -> str:
+        metrics.get_meter("tests").create_counter("tests.own.calls").add(1)
+        return "ok"
+
+    async with Client(mcp.server) as client:
+        await client.call_tool("count", {})
+    (own,) = _metric_points(metered, "tests.own.calls")
+    assert own.value == 1
+    (point,) = duration_points(metered, "own-counter")
+    assert point.attributes["gen_ai.tool.name"] == "count"
+
+
+class Leaky:
+    pass
+
+
+async def test_a_teardown_error_is_recorded_on_the_call(metered) -> None:
+    from fastmcp.exceptions import MCPError
+
+    @asynccontextmanager
+    async def leaky():
+        yield Leaky()
+        raise RuntimeError("teardown")
+
+    mcp = served("torn-down", TelemetrySettings(otel=True))
+    mcp.transient(Leaky, leaky)
+
+    @mcp.tool
+    def leaks(leaky: Inject[Leaky]) -> str:
+        return "ok"
+
+    async with Client(mcp.server) as client:
+        # The teardown fails outside the tool, so the client gets a protocol error.
+        with pytest.raises(MCPError):
+            await client.call_tool("leaks", {}, raise_on_error=False)
+    (point,) = duration_points(metered, "torn-down")
+    # UsageMiddleware names an error that isn't FastMCP's by its class
+    assert (point.attributes["gen_ai.tool.name"], point.attributes["error.type"]) == (
+        "leaks",
+        "RuntimeError",
+    )
+
+
+def test_call_metrics_are_outermost_with_otel_on() -> None:
+    from fastmcp.server.middleware import Middleware
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    from kubed.mcp.app import _CallScope
+
+    class Given(Middleware):
+        pass
+
+    class Added(Middleware):
+        pass
+
+    mcp = QuickMCP(
+        "ordered",
+        config=Config(telemetry=TelemetrySettings(otel=True)),
+        middleware=[Given()],
+    )
+    mcp.add_middleware(Added())
+    assert _middleware(mcp) == [
+        UsageMiddleware,
+        _CallScope,
+        Given,
+        Added,
+    ]
+
+
+@pytest.mark.parametrize(
+    "telemetry", [None, TelemetrySettings(), argparse.Namespace(profiles=None)]
+)
+def test_otel_off_adds_no_call_metrics(telemetry) -> None:
+    from kubed.mcp.app import _CallScope
+
+    mcp = QuickMCP("plain", config=Config(telemetry=telemetry))
+    assert _middleware(mcp) == [_CallScope]
+
+
+async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serves(
+    traced, monkeypatch, caplog
+) -> None:
+    import fastmcp.server.middleware.usage as usage
+
+    from kubed.mcp.app import _CallScope
+
+    def broken(**kwargs):
+        raise RuntimeError("https://user:s3cret@otlp.example.com")
+
+    monkeypatch.setattr(usage, "UsageMiddleware", broken)
+    mcp = served("unbuilt", TelemetrySettings(otel=True))
+    assert _middleware(mcp) == [_CallScope]
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (
+            logging.ERROR,
+            "Call metrics did not start; serving without them: RuntimeError",
+        )
+    ]
+    assert_safe(caplog.records, "s3cret")
