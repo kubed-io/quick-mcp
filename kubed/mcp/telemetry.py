@@ -7,6 +7,8 @@ imported until then. The ``telemetry`` extra installs what the signals use.
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Mapping
 from types import ModuleType
 from typing import Protocol
 
@@ -16,7 +18,10 @@ log = logging.getLogger(__name__)
 
 
 class Telemetry(Protocol):
-    """The settings telemetry reads."""
+    """What a config's ``telemetry`` section provides.
+
+    ``TelemetrySettings`` satisfies it, and so does a server's own section.
+    """
 
     @property
     def profiles(self) -> str | None: ...
@@ -56,8 +61,8 @@ class _Signals:
         """Stop what this start began. Never raises; frees the process's slot."""
         global _running
         try:
-            if self._profiles is not None:
-                self._profiles.shutdown()
+            if self._profiles is not None and self._profiles.shutdown() is False:
+                log.warning("Profiles did not stop cleanly")
         except Exception:  # TEL-6: telemetry never stops a server
             log.exception("Profiles did not stop cleanly")
         finally:
@@ -87,6 +92,21 @@ def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
         return None
 
 
+def _service_name(name: str) -> str:
+    """The service's name: OTEL_SERVICE_NAME when set and not empty, else ``name``."""
+    return os.environ.get("OTEL_SERVICE_NAME") or name
+
+
+def _profile_tags(tags: Mapping[str, str]) -> dict[str, str]:
+    """The pod's labels from POD_NAMESPACE and POD_NAME, then ``tags``, which win."""
+    labels: dict[str, str] = {}
+    for label, variable in (("namespace", "POD_NAMESPACE"), ("pod", "POD_NAME")):
+        if value := os.environ.get(variable):
+            labels[label] = value
+    labels.update(tags)
+    return labels
+
+
 def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
     """Configure pyroscope, imported only here so an install without it still works."""
     if not settings.profiles or not (settings.profile_cpu or settings.profile_memory):
@@ -94,12 +114,12 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
     try:
         import pyroscope
 
-        pyroscope.configure(
-            application_name=name,
+        started = pyroscope.configure(
+            application_name=_service_name(name),
             server_address=settings.profiles,
             cpu_enabled=settings.profile_cpu,
             mem_enabled=settings.profile_memory,
-            tags=dict(settings.tags),
+            tags=_profile_tags(settings.tags),
         )
     except ModuleNotFoundError as error:
         if error.name != "pyroscope":
@@ -113,5 +133,9 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
         return None
     except Exception:  # TEL-6: a profiler that fails never stops a server
         log.exception("Profiles did not start; serving without them")
+        return None
+    if started is False:
+        # Not ours to stop: another caller's agent already runs in this process.
+        log.error("Profiles did not start: a profiler already runs in this process")
         return None
     return pyroscope

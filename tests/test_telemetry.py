@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
 import logging
+import os
 import subprocess
 import sys
 import types
@@ -236,6 +239,38 @@ async def test_a_profiler_that_fails_to_stop_still_closes_the_container(
     assert [r.levelno for r in caplog.records if r.name == "kubed.mcp.telemetry"] == [
         logging.ERROR
     ]
+    # The slot is free, so a later start can run its own profiles.
+    assert kubed.mcp.telemetry._running is None
+
+
+async def test_a_profiler_already_running_is_one_error_and_never_shut_down(
+    pyroscope, monkeypatch, caplog
+) -> None:
+    # pyroscope-io's configure() returns False when an agent already runs in the process.
+    monkeypatch.setattr(sys.modules["pyroscope"], "configure", lambda **kwargs: False)
+    secret = "https://user:s3cret@pyroscope.example.com"
+    async with Client(
+        served("taken", TelemetrySettings(profiles=secret)).server
+    ) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
+    assert [r.levelno for r in records] == [logging.ERROR]
+    assert "s3cret" not in records[0].getMessage()
+    assert "profiles stopped" not in EVENTS
+
+
+async def test_a_shutdown_that_returns_false_is_one_warning_and_the_container_closes(
+    pyroscope, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(sys.modules["pyroscope"], "shutdown", lambda: False)
+    async with Client(
+        served("unclean", TelemetrySettings(profiles=ADDRESS)).server
+    ) as client:
+        await client.call_tool("ping", {})
+    assert EVENTS[-1] == "monitor stopped"
+    records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert kubed.mcp.telemetry._running is None
 
 
 async def test_the_first_server_owns_the_profiles(pyroscope) -> None:
@@ -250,6 +285,8 @@ async def test_the_first_server_owns_the_profiles(pyroscope) -> None:
 
 
 async def test_two_clients_on_one_server_start_one_profiler(pyroscope) -> None:
+    # FastMCP 4 ref-counts lifespan entries, so the second client never reaches our
+    # guard; test_the_first_server_owns_the_profiles covers it.
     mcp = served("shared", TelemetrySettings(profiles=ADDRESS))
     async with Client(mcp.server), Client(mcp.server):
         pass
@@ -305,3 +342,61 @@ async def test_a_section_missing_an_attribute_is_a_logged_error_and_the_server_s
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
     assert [r.levelno for r in records] == [logging.ERROR]
     assert "profiles stopped" not in EVENTS
+
+
+async def test_otel_service_name_names_the_profiles(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "selenium-flow")
+    async with Client(served("built-name", TelemetrySettings(profiles=ADDRESS)).server):
+        pass
+    assert pyroscope[0]["application_name"] == "selenium-flow"
+
+
+async def test_profiles_carry_the_pod_and_tags_win(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("POD_NAMESPACE", "tools")
+    monkeypatch.setenv("POD_NAME", "sf-0")
+    settings = TelemetrySettings(profiles=ADDRESS, tags={"pod": "pinned", "team": "a"})
+    async with Client(served("labelled", settings).server):
+        pass
+    assert pyroscope[0]["tags"] == {"namespace": "tools", "pod": "pinned", "team": "a"}
+
+
+async def test_an_empty_pod_variable_adds_no_label(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("POD_NAMESPACE", "")
+    monkeypatch.setenv("POD_NAME", "sf-0")
+    async with Client(served("blank", TelemetrySettings(profiles=ADDRESS)).server):
+        pass
+    assert pyroscope[0]["tags"] == {"pod": "sf-0"}
+
+
+@pytest.mark.parametrize(("cpu", "memory"), [(True, False), (False, True)])
+async def test_cpu_and_memory_switch_independently(pyroscope, cpu, memory) -> None:
+    settings = TelemetrySettings(
+        profiles=ADDRESS, profile_cpu=cpu, profile_memory=memory
+    )
+    async with Client(served("switched", settings).server):
+        pass
+    assert (pyroscope[0]["cpu_enabled"], pyroscope[0]["mem_enabled"]) == (cpu, memory)
+
+
+async def test_every_keyword_passed_is_one_configure_takes(request) -> None:
+    # A real import: CI installs the extra, so there it must not skip.
+    real = (
+        importlib.import_module("pyroscope")
+        if os.environ.get("CI")
+        else pytest.importorskip("pyroscope")
+    )
+    configure = inspect.signature(real.configure)
+    calls = request.getfixturevalue(
+        "pyroscope"
+    )  # the fake goes in only after the real import
+    settings = TelemetrySettings(profiles=ADDRESS, tags={"team": "a"})
+    async with Client(served("checked", settings).server):
+        pass
+    assert set(calls[0]) <= set(configure.parameters)
+    assert set(calls[0]) == {
+        "application_name",
+        "server_address",
+        "cpu_enabled",
+        "mem_enabled",
+        "tags",
+    }

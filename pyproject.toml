@@ -111,7 +111,7 @@ select = [
   "PTH",      # pathlib over os.path
   "RET",      # return-flow noise
   "RUF",      # ruff's own, incl. RUF100 for noqas that stopped applying
-  "BLE",      # blind except: each one must carry a noqa saying why
+  "BLE",      # blind except: each one must log it, or carry a noqa saying why
 ]
 
 [tool.ruff.lint.per-file-ignores]
