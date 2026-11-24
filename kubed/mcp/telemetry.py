@@ -1,4 +1,4 @@
-"""What a server reports about itself: profiles now, OpenTelemetry later.
+"""What a server reports about itself: profiles, and OpenTelemetry.
 
 Every signal is off until the server's config turns it on, and nothing a signal needs is
 imported until then. The ``telemetry`` extra installs what the signals use.
@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from types import ModuleType
 from typing import Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
 
@@ -40,31 +40,60 @@ class TelemetrySettings(BaseModel):
 
     ``profiles`` is the address of the Pyroscope server. Setting it turns profiles
     on; there is no separate enabled flag. ``profile_cpu`` and ``profile_memory``
-    choose which profiles are sent. ``otel`` is for OpenTelemetry, which a later
-    release reads: nothing reads it yet. ``tags`` are labels added to every profile.
+    choose which profiles are sent. ``otel`` turns OpenTelemetry on, configured by
+    the standard ``OTEL_*`` variables. ``tags`` are labels added to every profile
+    and resource attributes on every trace and metric. An unknown key is an error,
+    so a typo stops the boot; a server's own section may subclass it to add keys.
     """
 
-    profiles: str | None = None
-    profile_cpu: bool = True
-    profile_memory: bool = True
-    otel: bool = False
-    tags: dict[str, str] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
+
+    profiles: str | None = Field(
+        default=None,
+        description="Pyroscope server address; setting it turns profiles on.",
+    )
+    profile_cpu: bool = Field(
+        default=True, description="Sample CPU while profiles are on."
+    )
+    profile_memory: bool = Field(
+        default=True, description="Sample allocations while profiles are on."
+    )
+    otel: bool = Field(
+        default=False,
+        description="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+    )
+    tags: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Labels on every profile, and resource attributes on every trace "
+            "and metric."
+        ),
+    )
 
 
 class _Signals:
     """What a start began, so the same call can stop it."""
 
-    def __init__(self, profiles: ModuleType | None) -> None:
+    def __init__(self, profiles: ModuleType | None, otel: object | None = None) -> None:
         self._profiles = profiles
+        self._otel = otel
 
     def stop(self) -> None:
-        """Stop what this start began. Never raises; frees the process's slot."""
+        """Stop what this start began. Never raises; frees the process's slot.
+
+        OpenTelemetry stops first, so no span still tags a thread once profiles stop.
+        """
         global _running
+        try:
+            if self._otel is not None:
+                self._otel.stop()
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
         try:
             if self._profiles is not None and self._profiles.shutdown() is False:
                 log.warning("Profiles did not stop cleanly")
-        except Exception:  # TEL-6: telemetry never stops a server
-            log.exception("Profiles did not stop cleanly")
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("Profiles did not stop cleanly: %s", type(error).__name__)
         finally:
             _running = None
 
@@ -83,12 +112,15 @@ def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
         if _running is not None or settings is None:
             return None
         profiles = _start_profiles(name, settings)
-        if profiles is None:
+        otel = _start_otel(name, settings, profiles)
+        if profiles is None and otel is None:
             return None
-        _running = _Signals(profiles)
+        _running = _Signals(profiles, otel)
         return _running
-    except Exception:  # TEL-6: telemetry never stops a server
-        log.exception("Telemetry did not start; serving without it")
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "Telemetry did not start; serving without it: %s", type(error).__name__
+        )
         return None
 
 
@@ -124,18 +156,52 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
     except ModuleNotFoundError as error:
         if error.name != "pyroscope":
             # Some other module is missing: a failed start, not a missing package.
-            log.exception("Profiles did not start; serving without them")
+            log.error(
+                "Profiles did not start; serving without them: %s",
+                type(error).__name__,
+            )
             return None
         log.warning(
             "Profiles are on, but pyroscope-io is not installed: "
             "install kubed-mcp[telemetry]"
         )
         return None
-    except Exception:  # TEL-6: a profiler that fails never stops a server
-        log.exception("Profiles did not start; serving without them")
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "Profiles did not start; serving without them: %s", type(error).__name__
+        )
         return None
     if started is False:
         # Not ours to stop: another caller's agent already runs in this process.
         log.error("Profiles did not start: a profiler already runs in this process")
         return None
     return pyroscope
+
+
+def _start_otel(
+    name: str, settings: Telemetry, profiles: ModuleType | None
+) -> object | None:
+    """Start OpenTelemetry when ``settings.otel``, imported only then. Never raises."""
+    try:
+        if not settings.otel:
+            return None
+        from . import _otel
+    except ModuleNotFoundError as error:
+        if not (error.name or "").startswith("opentelemetry"):
+            # Some other module is missing: a failed start, not a missing package.
+            log.error(
+                "OpenTelemetry did not start; serving without it: %s",
+                type(error).__name__,
+            )
+            return None
+        log.warning(
+            "OpenTelemetry is on, but its packages are not installed: "
+            "install kubed-mcp[telemetry]"
+        )
+        return None
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "OpenTelemetry did not start; serving without it: %s", type(error).__name__
+        )
+        return None
+    return _otel.start(name, settings, profiles)
