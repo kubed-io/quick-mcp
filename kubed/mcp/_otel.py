@@ -2,7 +2,8 @@
 
 ``start`` runs OpenTelemetry's standard configuration, ``initialize()``, read from
 the ``OTEL_*`` variables, after filling a few defaults. Its providers are set once per
-process, so once ours have stopped, no later start configures them again.
+process, so once ours have stopped, no later start configures them again. An SDK
+something else configured first is kept, and only log records are given its trace.
 """
 
 from __future__ import annotations
@@ -147,6 +148,21 @@ def _logging_kept() -> Iterator[None]:
                 root.addHandler(handler)
 
 
+def _instrument_logging() -> bool:
+    """Put the current trace on log records, unless something already does.
+
+    Returns whether this call did, so the stop undoes only that. The instrumentor
+    reads ``OTEL_PYTHON_LOG_CORRELATION``, which ``_set_defaults`` turns on.
+    """
+    instrumentor = LoggingInstrumentor()
+    if instrumentor.is_instrumented_by_opentelemetry:
+        return False
+    with _logging_kept():
+        instrumentor.instrument()
+    # instrument() returns without instrumenting when its dependencies conflict.
+    return instrumentor.is_instrumented_by_opentelemetry
+
+
 def _shutdown(kind: str, provider: object) -> None:
     """Shut ``provider`` down, waiting at most ``_SHUTDOWN_SECONDS`` for it."""
     if kind == "meter":
@@ -228,7 +244,15 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
         _set_defaults(name, settings.tags)
         if _sdk_configured():
             # Someone else's providers: kept as they are, and never shut down by us.
-            return _Otel(owned=False, logging_instrumented=False)
+            try:
+                instrumented = _instrument_logging()
+            except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+                # Their providers still trace: only the records go without the trace.
+                log.error(
+                    "OpenTelemetry did not instrument logging: %s", type(error).__name__
+                )
+                instrumented = False
+            return _Otel(owned=False, logging_instrumented=instrumented)
         instrumentor = LoggingInstrumentor()
         before = instrumentor.is_instrumented_by_opentelemetry
         try:

@@ -630,8 +630,9 @@ def test_the_real_configuration_exports_a_named_tagged_span() -> None:
     assert out.stderr.count("OpenTelemetry runs once per process") == 1
 
 
-def test_otel_leaves_a_bare_root_logger_bare() -> None:
-    out = _child("bare")
+@pytest.mark.parametrize("mode", ["bare", "bare-configured"])
+def test_otel_leaves_a_bare_root_logger_bare(mode) -> None:
+    out = _child(mode)
     lines = [line for line in out.stdout.splitlines() if line.startswith("root=")]
     assert len(lines) == 2  # inside the tool, and after the server stopped
     for line in lines:
@@ -641,6 +642,15 @@ def test_otel_leaves_a_bare_root_logger_bare() -> None:
         assert seen["level"] == logging.WARNING
     # So logging.lastResort still prints the tool's WARNING.
     assert "inside" in out.stderr.splitlines()
+    if mode == "bare-configured":
+        # The child's own provider traced: initialize() never replaced it.
+        server = [
+            o for o in _json_objects(out.stdout) if o.get("kind") == "SpanKind.SERVER"
+        ]
+        assert "tools/call log" in [o["name"] for o in server]
+        assert {o["resource"]["attributes"]["service.name"] for o in server} == {
+            "preset"
+        }
 
 
 def test_otel_off_imports_no_sdk() -> None:
@@ -855,3 +865,199 @@ def test_an_initialize_that_sets_no_provider_owns_nothing(monkeypatch) -> None:
     # Nothing of ours to shut down, so a later server may still configure it.
     assert stopped == []
     assert kubed.mcp._otel._stopped is False
+
+
+# An SDK someone configured before the server started, as opentelemetry-instrument does.
+# A tracer provider is set once per process, so from the first test that asks for it,
+# it stays set for the rest of the session: tests of the initialize() path patch
+# _sdk_configured rather than rely on an unconfigured process.
+
+
+@pytest.fixture(scope="session")
+def traced() -> Iterator[tuple[object, object]]:
+    """A tracer provider set globally, and the exporter its spans go to."""
+    from opentelemetry import trace
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+
+    exporter = InMemorySpanExporter()
+    # Set up before _clean runs: the shell's OTEL_* (a sampler, OTEL_SDK_DISABLED) go.
+    with pytest.MonkeyPatch.context() as env:
+        for name in [n for n in os.environ if n.startswith("OTEL_")]:
+            env.delenv(name)
+        provider = TracerProvider(
+            sampler=ALWAYS_ON,
+            resource=Resource.create({"service.name": "preset"}),
+        )
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    # set_tracer_provider only warns when one was set before: it must be this one.
+    assert trace.get_tracer_provider() is provider
+    yield provider, exporter
+    if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+        LoggingInstrumentor().uninstrument()
+
+
+@pytest.fixture
+def spans(traced) -> object:
+    """The session's exporter, emptied of the spans earlier tests left in it."""
+    _, exporter = traced
+    exporter.clear()
+    return exporter
+
+
+def server_spans(spans) -> list[str]:
+    """The names of the finished tool-call spans the server side opened."""
+    from opentelemetry.trace import SpanKind
+
+    # FastMCP's server/discover and tools/list are SERVER spans too.
+    return [
+        s.name
+        for s in spans.get_finished_spans()
+        if s.kind is SpanKind.SERVER and s.name.startswith("tools/call")
+    ]
+
+
+async def test_a_configured_sdk_keeps_its_providers(traced, spans) -> None:
+    from opentelemetry import trace
+
+    import kubed.mcp._otel
+
+    provider, _ = traced
+    # The guard fails this test if initialize() runs: a configured SDK is kept as it is.
+    async with Client(served("kept", TelemetrySettings(otel=True)).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert trace.get_tracer_provider() is provider
+    assert server_spans(spans) == ["tools/call ping"]
+    # Never shut down: the provider still exports after the server stopped.
+    with provider.get_tracer("t").start_as_current_span("after"):
+        pass
+    assert "after" in [s.name for s in spans.get_finished_spans()]
+    assert kubed.mcp._otel._stopped is False
+
+
+class Keep(logging.Handler):
+    """Keeps every record it handles."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+async def test_log_records_carry_the_trace_and_root_keeps_its_handlers(
+    traced, spans
+) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.trace import SpanKind
+
+    from kubed.mcp._otel import _OTEL_HANDLERS
+
+    # Else the start would find logging instrumented, and correctly leave it be.
+    assert not LoggingInstrumentor().is_instrumented_by_opentelemetry
+    root = logging.getLogger()
+    factory, keep = logging.getLogRecordFactory(), Keep()
+    inside: list[list[logging.Handler]] = []
+    mcp = served("correlated", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def log() -> str:
+        inside.append(list(root.handlers))
+        logging.getLogger("tests.tool").warning("inside")
+        return "logged"
+
+    root.addHandler(keep)
+    try:
+        async with Client(mcp.server) as client:
+            assert (await client.call_tool("log", {})).data == "logged"
+        after = list(root.handlers)
+    finally:
+        root.removeHandler(keep)
+        if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+            LoggingInstrumentor().uninstrument()
+            pytest.fail("the server's stop left logging instrumented")
+    calls = [
+        s
+        for s in spans.get_finished_spans()
+        if s.kind is SpanKind.SERVER and s.name == "tools/call log"
+    ]
+    records = [r for r in keep.records if r.getMessage() == "inside"]
+    assert len(calls) == 1
+    assert len(records) == 1
+    assert records[0].otelTraceID == format(calls[0].context.trace_id, "032x")
+    assert records[0].otelSpanID != "0"
+    assert records[0].otelServiceName == "preset"
+    # The server's handler stays, and the instrumentor's own is gone again. Under pytest
+    # root has handlers, so basicConfig does nothing here and root's level and format
+    # can't change: test_otel_leaves_a_bare_root_logger_bare pins those.
+    for handlers in (inside[0], after):
+        assert keep in handlers
+        assert not any(isinstance(h, _OTEL_HANDLERS) for h in handlers)
+    # Uninstrumented at stop: records are made as they were before the server.
+    assert logging.getLogRecordFactory() is factory
+
+
+async def test_logging_someone_else_instrumented_stays_instrumented(
+    traced, spans
+) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+
+    # As opentelemetry-instrument leaves it: correlation on, before the server starts.
+    instrumentor = LoggingInstrumentor()
+    instrumentor.instrument(
+        inject_trace_context=True, enable_log_auto_instrumentation=False
+    )
+    try:
+        factory = logging.getLogRecordFactory()
+        async with Client(
+            served("borrowed", TelemetrySettings(otel=True)).server
+        ) as client:
+            assert (await client.call_tool("ping", {})).data == "pong"
+        # Not ours, so our stop left it as it was.
+        assert instrumentor.is_instrumented_by_opentelemetry
+        assert logging.getLogRecordFactory() is factory
+    finally:
+        if instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.uninstrument()
+
+
+async def test_logging_that_fails_to_instrument_still_keeps_the_trace(
+    traced, spans, monkeypatch, caplog
+) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+
+    import kubed.mcp.telemetry
+
+    def refuse(self, **kwargs) -> None:
+        raise RuntimeError("https://user:s3cret@otlp.example.com")
+
+    monkeypatch.setattr(LoggingInstrumentor, "instrument", refuse)
+    handles: list[object] = []
+    mcp = served("unlogged", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def held() -> str:
+        running = kubed.mcp.telemetry._running
+        handles.append(running and running._otel)
+        return "held"
+
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+        assert (await client.call_tool("held", {})).data == "held"
+    # start returned a handle: only the records go without the trace.
+    assert handles and handles[0] is not None
+    assert server_spans(spans) == ["tools/call ping", "tools/call held"]
+    records = [r for r in caplog.records if r.name.startswith("kubed.mcp")]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.ERROR, "OpenTelemetry did not instrument logging: RuntimeError")
+    ]
+    assert_safe(caplog.records, "s3cret")
+    assert not LoggingInstrumentor().is_instrumented_by_opentelemetry

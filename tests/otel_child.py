@@ -6,6 +6,7 @@ not in pytest's. The tests read what this writes: spans on stdout, log lines on 
 - ``console``: a traced server, then a second one with ``otel`` on after the first stopped.
 - ``off``: servers with telemetry off, then the modules they loaded.
 - ``bare``: a traced server in a process that configured no logging, and root as it saw it.
+- ``bare-configured``: the same, with an SDK already configured, as opentelemetry-instrument does.
 """
 
 from __future__ import annotations
@@ -105,8 +106,27 @@ async def bare() -> None:
     root_seen()
 
 
+async def bare_configured() -> None:
+    """``bare``, after an SDK of its own was set: ``start`` takes the configured path."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+
+    provider = TracerProvider(resource=Resource.create({"service.name": "preset"}))
+    provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
+    await bare()
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
-    if mode != "bare":
+    if not mode.startswith("bare"):
         configure_logging()
-    asyncio.run({"console": console, "off": off, "bare": bare}[mode]())
+    modes = {
+        "console": console,
+        "off": off,
+        "bare": bare,
+        "bare-configured": bare_configured,
+    }
+    asyncio.run(modes[mode]())
