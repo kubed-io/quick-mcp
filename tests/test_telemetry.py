@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -846,6 +847,32 @@ def test_every_package_the_extra_names_is_installed() -> None:
     pyroscope = real("pyroscope")
     for tag in (pyroscope.add_thread_tag, pyroscope.remove_thread_tag):
         assert list(inspect.signature(tag).parameters) == ["key", "value"]
+    prometheus = real("opentelemetry.exporter.prometheus")
+    assert hasattr(prometheus, "PrometheusMetricReader")
+    real("prometheus_client")
+
+
+def test_prometheus_serves_the_call_metrics_on_a_port_of_its_own() -> None:
+    with socket.socket() as probe:
+        probe.bind(("localhost", 0))
+        port = probe.getsockname()[1]
+    out = _child(
+        "prometheus",
+        OTEL_METRICS_EXPORTER="prometheus",
+        OTEL_EXPORTER_PROMETHEUS_PORT=str(port),
+    )
+    lines = out.stdout.splitlines()
+    # real initialize(), after the middleware was built in __init__: the proxy meter rebound
+    assert any(
+        line.startswith("mcp_server_operation_duration_seconds_count{")
+        and 'gen_ai_tool_name="ping"' in line
+        and line.endswith(" 1.0")
+        for line in lines
+    )
+    assert any(
+        line.startswith("tests_own_calls_total") and line.endswith(" 1.0")
+        for line in lines
+    )
 
 
 def _fake_providers(monkeypatch) -> list[str]:

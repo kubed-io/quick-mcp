@@ -120,6 +120,38 @@ async def bare_configured() -> None:
     await bare()
 
 
+async def prometheus() -> None:
+    """The call metrics and a server's own counter, scraped from the exporter's port."""
+    import os
+    import urllib.request
+
+    from opentelemetry import metrics
+
+    config = argparse.Namespace(
+        transport="http",
+        host="0.0.0.0",
+        port=8000,
+        telemetry=TelemetrySettings(otel=True),
+    )
+    mcp = QuickMCP("prom", config=config)
+
+    @mcp.tool
+    def ping() -> str:
+        metrics.get_meter("tests").create_counter("tests.own.calls").add(1)
+        return "pong"
+
+    url = f"http://localhost:{os.environ['OTEL_EXPORTER_PROMETHEUS_PORT']}/metrics"
+    async with Client(mcp.server) as client:
+        await client.call_tool("ping", {})
+        with urllib.request.urlopen(url, timeout=10) as response:
+            body = response.read().decode()
+    for line in body.splitlines():
+        if line.startswith(
+            ("mcp_server_operation_duration_seconds_count", "tests_own_calls_total")
+        ):
+            print(line)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if not mode.startswith("bare"):
@@ -129,5 +161,6 @@ if __name__ == "__main__":
         "off": off,
         "bare": bare,
         "bare-configured": bare_configured,
+        "prometheus": prometheus,
     }
     asyncio.run(modes[mode]())
