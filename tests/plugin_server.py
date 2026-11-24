@@ -52,9 +52,14 @@ def command_md(description: str = "A command.") -> str:
 async def listed(mcp: QuickMCP) -> tuple[list[str], list[str], list[str]]:
     """The prompt names, agent names and skill URIs a client is served."""
     async with Client(mcp.server) as client:
-        prompts = sorted(p.name for p in await client.list_prompts())
-        agents = [a["name"] for a in (await request(client, "agents/list"))["agents"]]
-        resources = await client.list_resources()
+        return await listed_by(client)
+
+
+async def listed_by(client: Client) -> tuple[list[str], list[str], list[str]]:
+    """The prompt names, agent names and skill URIs an open client is served."""
+    prompts = sorted(p.name for p in await client.list_prompts())
+    agents = [a["name"] for a in (await request(client, "agents/list"))["agents"]]
+    resources = await client.list_resources()
     uris = sorted(str(r.uri) for r in resources if str(r.uri).startswith("skill://"))
     return prompts, agents, uris
 

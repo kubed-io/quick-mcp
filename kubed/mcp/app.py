@@ -26,7 +26,7 @@ from .container import (
     Recipe,
     _Call,
 )
-from .plugins import Plugin, PluginLoader, Plugins, PluginSet
+from .plugins import Plugin, PluginLoader, Plugins, PluginSet, View, _PinScope
 
 T = TypeVar("T")
 
@@ -123,6 +123,8 @@ class QuickMCP:
         # QuickMCP.get_tool.
         self.get_tool = self.server.get_tool
         self._plugins = Plugins(self.server)
+        # Right inside _CallScope, outside everything that reads plugins.
+        self.server.middleware.insert(1, _PinScope(self._plugins))
 
     def websocket_route(
         self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
@@ -183,6 +185,19 @@ class QuickMCP:
     def generation(self) -> int:
         """How many sets this server has served: 0 until the first plugin."""
         return self._plugins.generation
+
+    def plugin_view(self, fn: Callable[[], View]) -> Callable[[], View]:
+        """Sets the server's view, and returns ``fn``, so it works as a decorator
+        (PLUG-53).
+
+        ``fn()`` runs once per MCP request, inside it, so it can read the request
+        (``request_values()``). Its ``View`` says which plugins the request is served:
+        one it does not admit is absent for that request. ``admits`` runs only when a
+        build is made, once per generation and view key, so the key must decide what
+        it admits. A ``fn()`` that raises fails the request with its error.
+        """
+        self._plugins.set_view(fn)
+        return fn
 
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.

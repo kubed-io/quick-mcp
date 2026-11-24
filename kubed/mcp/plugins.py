@@ -13,13 +13,14 @@ warning naming it.
 Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
 prompts (``kubed.mcp.prompts``) and agents through the agents extension
 (``kubed.mcp.agents``). A server has one provider of each kind, whatever its plugins,
-and each reads the plugins served once per call. The layout and names are Claude
-Code's: a skill is one folder below ``skills/``, while commands and agents are files at
-any depth, each folder adding a name segment, Claude Code's ``:`` written ``_``
-(``commands/db/migrate.md`` is ``db_migrate``). A plugin added with no namespace is the
-server's own, its skills under ``skill://<server name>/``; there is no root, and an
-empty namespace is refused. Plugins added under one namespace merge, and a second thing
-at one address is refused.
+and each reads what its request is pinned to: the plugins served when the request
+began that its view admits (``mcp.plugin_view``), built once per build key and reused.
+The layout and names are Claude Code's: a skill is one folder below ``skills/``, while
+commands and agents are files at any depth, each folder adding a name segment, Claude
+Code's ``:`` written ``_`` (``commands/db/migrate.md`` is ``db_migrate``). A plugin
+added with no namespace is the server's own, its skills under ``skill://<server
+name>/``; there is no root, and an empty namespace is refused. Plugins added under one
+namespace merge, and a second thing at one address is refused.
 """
 
 from __future__ import annotations
@@ -28,15 +29,21 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlparse
 
+import anyio
 import yaml
 from fastmcp import FastMCP
 from fastmcp.prompts import Prompt
+from fastmcp.resources import TextResource
+from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 
 from . import skills
@@ -52,6 +59,7 @@ __all__ = [
     "PluginError",
     "PluginLoader",
     "PluginSet",
+    "View",
     "read_plugin",
 ]
 
@@ -459,40 +467,46 @@ class _Served:
 
 
 class _Skills(skills.EntryOnlySkillProvider):
-    """The server's one skills provider: every plugin's skills, in the order added."""
+    """The server's one skills provider: the skills of the request's build, in the
+    order their plugins were added."""
 
     def __init__(self, plugins: Plugins) -> None:
         super().__init__()
         self._plugins = plugins
 
     async def load_skills(self) -> dict[str, skills.Skill]:
-        return {
-            key: skill
-            for served in self._plugins.current
-            for key, skill in served.catalogue.items()
-        }
+        return dict((await self._plugins.pinned()).build.catalogue)
+
+    async def get_tasks(self) -> list:
+        return []  # see _Prompts.get_tasks
 
 
 class _Prompts(Provider):
-    """The server's one prompts provider: every plugin's commands."""
+    """The server's one prompts provider: the commands of the request's build."""
 
     def __init__(self, plugins: Plugins) -> None:
         super().__init__()
         self._plugins = plugins
 
     async def _list_prompts(self) -> list[Prompt]:
-        return [prompt for served in self._plugins.current for prompt in served.prompts]
+        return list((await self._plugins.pinned()).build.prompts)
+
+    async def get_tasks(self) -> list:
+        # FastMCP lists every component when a server starts, to find the ones that
+        # run as background tasks. Only a tool can, and a plugin serves none, so the
+        # listing would only call the view's fn() outside any request (PLUG-53).
+        return []
 
 
 class _Agents(AgentsExtension):
-    """The server's one agents extension: every plugin's agents."""
+    """The server's one agents extension: the agents of the request's build."""
 
     def __init__(self, plugins: Plugins) -> None:
         super().__init__()
         self._plugins = plugins
 
-    def _served(self) -> list[Agent]:
-        return [agent for served in self._plugins.current for agent in served.agents]
+    async def _agents(self) -> tuple[Agent, ...]:
+        return (await self._plugins.pinned()).build.agents
 
     def clone(self) -> _Agents:
         return type(self)(self._plugins)
@@ -507,6 +521,125 @@ class _State:
 
     generation: int
     current: tuple[_Served, ...]
+
+
+# ---- views, builds and the pin -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class View:
+    """What a request is served (PLUG-53): ``admits(plugin)`` says whether a plugin is
+    in it, and ``key``, any hashable value, names it.
+
+    ``admits`` runs only when a build is made (PLUG-55), and a build is reused for
+    every request with its key, so the key must decide what it admits.
+    """
+
+    key: Hashable
+    admits: Callable[[Plugin], bool]
+
+
+def _every(plugin: Plugin) -> bool:
+    return True
+
+
+# The view of a server that sets none: one key, every plugin.
+_EVERY = View(None, _every)
+
+# How many builds are kept, the least recently used dropped first (PLUG-55).
+BUILDS = 64
+
+# A build key, made by Plugins._key alone.
+_Key = tuple[Hashable, ...]
+
+
+@dataclass(frozen=True)
+class _Build:
+    """What one build key is served: the admitted plugins and what they serve."""
+
+    admitted: tuple[Plugin, ...]
+    catalogue: Mapping[str, skills.Skill]
+    prompts: tuple[FilePrompt, ...]
+    agents: tuple[Agent, ...]
+    rewritten: bool  # the rewriter chain was not empty
+    indexes: Mapping[str, TextResource | None]
+    _renderer: object = None  # kept alive with the build it rendered
+
+
+@dataclass(frozen=True)
+class _Pin:
+    """What one request reads: the state, view and key it began with, and the build."""
+
+    state: _State
+    view: View
+    key: _Key
+    build: _Build
+
+
+@dataclass
+class _Slot:
+    """One request's pin, made by its first reader and shared with the rest."""
+
+    done: anyio.Event | None = None
+    pin: _Pin | None = None
+    error: Exception | None = None
+
+
+# Each server's slot for the request running, opened by _PinScope.
+_PINS: ContextVar[dict[Plugins, _Slot] | None] = ContextVar(
+    "kubed_mcp_pins", default=None
+)
+
+
+class _PinScope(Middleware):
+    """Opens a request's pin slot for one server's plugins, and fails the request
+    when pinning failed.
+
+    A request made inside another, a tool's ``ctx.read_resource`` say, finds the slot
+    open and shares it. FastMCP logs and swallows what a provider raises, so an error
+    stored in the slot is raised again here, after the request is handled, in place of
+    whatever the request made of its absence (an unknown skill, say).
+    """
+
+    def __init__(self, plugins: Plugins) -> None:
+        self._plugins = plugins
+
+    async def on_request(self, context: Any, call_next: Any) -> Any:
+        pins = _PINS.get() or {}
+        slot = pins.get(self._plugins)
+        token = None
+        if slot is None:
+            slot = _Slot()
+            token = _PINS.set({**pins, self._plugins: slot})
+        try:
+            result = await call_next(context)
+        except Exception:
+            if slot.error is None:
+                raise
+            raise slot.error from None
+        finally:
+            if token is not None:
+                _PINS.reset(token)
+        if slot.error is not None:
+            raise slot.error
+        return result
+
+
+@dataclass
+class _Flight:
+    """The one build being made for a key, which every reader of the key awaits."""
+
+    done: anyio.Event
+    build: _Build | None = None
+    error: Exception | None = None
+
+
+@dataclass
+class _Memo:
+    """The builds kept, least recently used first, and the ones being made."""
+
+    builds: OrderedDict[_Key, _Build]
+    flights: dict[_Key, _Flight]
 
 
 def _owned(served: _Served) -> dict[str, str]:
@@ -588,8 +721,10 @@ class Plugins:
 
     Everything a plugin serves is read and checked against the set it joins before any
     of it is served, so a refused plugin leaves no trace. What is served is a
-    ``_State``, replaced whole by ``serve`` and never changed in place; the server's
-    one skills provider, prompts provider and agents extension read its ``current``.
+    ``_State``, replaced whole by ``serve`` and never changed in place. The server's
+    one skills provider, prompts provider and agents extension read the request's pin
+    instead (``pinned``): a build of what the view admits of the state the request
+    began with.
     """
 
     def __init__(self, server: FastMCP) -> None:
@@ -599,6 +734,8 @@ class Plugins:
         self._prompts: _Prompts | None = None
         self._agents: _Agents | None = None
         self._state = _State(0, ())
+        self._view: Callable[[], View] | None = None
+        self._memo = _Memo(OrderedDict(), {})
         self.add_loader(LocalLoader())
 
     @property
@@ -644,6 +781,98 @@ class Plugins:
         served = tuple(staging._served)
         self._providers(served)
         self._state = _State(self._state.generation + 1, served)
+        self._memo = _Memo(OrderedDict(), {})  # last: no build of the old set is kept
+
+    def set_view(self, fn: Callable[[], View]) -> None:
+        """Makes ``fn`` the view, called once per request (PLUG-53)."""
+        self._view = fn
+        self._memo = _Memo(OrderedDict(), {})  # last: no build of the old view is kept
+
+    def _key(self, state: _State, view: View) -> _Key:
+        """The build key of ``view`` over ``state``: the one place a key is made."""
+        return (state.generation, view.key)
+
+    async def pinned(self) -> _Pin:
+        """The request's pin, made by its first reader; off a request, a fresh one.
+
+        A failure to pin is stored in the request's slot and raised to every reader,
+        and ``_PinScope`` fails the request with it.
+        """
+        slot = (_PINS.get() or {}).get(self)
+        if slot is None:
+            return await self._pin()
+        while slot.pin is None and slot.error is None:
+            if slot.done is None:
+                done = slot.done = anyio.Event()
+                try:
+                    slot.pin = await self._pin()
+                except Exception as exc:  # noqa: BLE001 - any failure to pin must fail the request (PLUG-53), not be swallowed by FastMCP
+                    slot.error = exc
+                finally:
+                    if slot.pin is None and slot.error is None:
+                        slot.done = None  # cancelled: the next reader pins afresh
+                    done.set()
+            else:
+                await slot.done.wait()
+        if slot.error is not None:
+            raise slot.error
+        return slot.pin
+
+    async def _pin(self) -> _Pin:
+        """One pin, made fresh. The memo is taken first, so a build begun before a
+        change is never stored where a request after the change finds it."""
+        memo = self._memo
+        state = self._state
+        view = self._view() if self._view else _EVERY
+        key = self._key(state, view)
+        build = await self._build_for(memo, state, view, key)
+        return _Pin(state, view, key, build)
+
+    async def _build_for(
+        self, memo: _Memo, state: _State, view: View, key: _Key
+    ) -> _Build:
+        """The build for ``key``: kept, in flight, or made now and kept while ``memo``
+        is still the server's."""
+        if key in memo.builds:
+            memo.builds.move_to_end(key)
+            return memo.builds[key]
+        flight = memo.flights.get(key)
+        if flight is not None:
+            await flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            if flight.build is None:  # its maker was cancelled: make it again
+                return await self._build_for(memo, state, view, key)
+            return flight.build
+        flight = memo.flights[key] = _Flight(anyio.Event())
+        try:
+            flight.build = await self._make(state, view, key)
+        except Exception as exc:
+            flight.error = exc  # every reader awaiting the flight raises it too
+            raise
+        finally:
+            del memo.flights[key]
+            flight.done.set()
+        if memo is self._memo:
+            memo.builds[key] = flight.build
+            while len(memo.builds) > BUILDS:
+                memo.builds.popitem(last=False)
+        return flight.build
+
+    async def _make(self, state: _State, view: View, key: _Key) -> _Build:
+        """A build of what ``view`` admits of ``state``, from what was read: it never
+        reads the disk."""
+        admitted = tuple(s for s in state.current if view.admits(s.plugin))
+        return _Build(
+            admitted=tuple(s.plugin for s in admitted),
+            catalogue=MappingProxyType(
+                {path: skill for s in admitted for path, skill in s.catalogue.items()}
+            ),
+            prompts=tuple(prompt for s in admitted for prompt in s.prompts),
+            agents=tuple(agent for s in admitted for agent in s.agents),
+            rewritten=False,
+            indexes=MappingProxyType({}),
+        )
 
     def add(
         self,
