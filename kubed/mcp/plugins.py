@@ -41,15 +41,15 @@ from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlparse
 
 import anyio
-import yaml
 from fastmcp import FastMCP
-from fastmcp.prompts import Prompt
+from fastmcp.prompts import Message, Prompt, PromptResult
 from fastmcp.resources import Resource, TextResource
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.skills.provider import SkillCatalogProvider
 from fastmcp.utilities.versions import VersionSpec
+from mcp_types import TextContent
 
 from . import gateway, skills
 from ._rewrite import (
@@ -64,10 +64,11 @@ from ._rewrite import (
 )
 from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
 from .agents import usable_name as _usable
-from .prompts import FilePrompt, parse_prompt
+from .prompts import read_command
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
+    "CommandReader",
     "Components",
     "LocalLoader",
     "Plugin",
@@ -91,6 +92,33 @@ _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
 
 class PluginError(ValueError):
     """A plugin that is not served, and why."""
+
+
+# What reads a command file (PLUG-62): ``fn(text, path, name, plugin)`` gives the
+# ``Prompt`` to serve under ``name``, or the reason the command is not served.
+CommandReader = Callable[[str, str, str, "Plugin"], Prompt | str]
+
+
+def _read_command(
+    reader: CommandReader, text: str, path: str, name: str, plugin: Plugin
+) -> Prompt | str:
+    """What ``reader`` makes of a command: the one place a reader is called.
+
+    A raise is its reason, its message else its type's name, and a result neither a
+    ``Prompt`` nor a ``str`` is a reason too. A ``Prompt`` named otherwise is served
+    under ``name``, the layer's (PLUG-62).
+    """
+    try:
+        result = reader(text, path, name, plugin)
+    except Exception as exc:  # noqa: BLE001 - a server's reader fails one command, never its plugin (PLUG-62)
+        return str(exc) or type(exc).__name__
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, Prompt):
+        return f"command_reader returned {type(result).__name__}, not a Prompt or str"
+    if result.name != name:
+        return result.model_copy(update={"name": name})
+    return result
 
 
 # ---- loaders -----------------------------------------------------------------------
@@ -463,7 +491,7 @@ class _File:
     uri: str
     data: bytes
     text: str
-    item: FilePrompt | Agent
+    item: Prompt | Agent
     stem: str
     folders: tuple[str, ...]
 
@@ -516,7 +544,8 @@ class _Served:
     """One plugin as served: the plugin, and what it serves of each kind.
 
     ``skill_dirs`` maps a catalogue key to the skill's root-relative folder (``""``
-    for the root). ``by_name`` and ``prefix`` are what its agents were parsed with.
+    for the root). ``by_name`` and ``prefix`` are what its agents were parsed with,
+    ``reader`` what its commands were read with, and what a build reads them with.
     """
 
     plugin: Plugin
@@ -526,6 +555,7 @@ class _Served:
     agents: tuple[_File, ...]
     by_name: Mapping[str, str]
     prefix: str
+    reader: CommandReader
 
 
 class _Skills(skills.EntryOnlySkillProvider):
@@ -633,7 +663,7 @@ class _Build:
 
     admitted: tuple[Plugin, ...]
     catalogue: Mapping[str, skills.Skill]
-    prompts: tuple[FilePrompt, ...]
+    prompts: tuple[Prompt, ...]
     agents: tuple[Agent, ...]
     rewritten: bool  # the rewriter chain was not empty
     indexes: Mapping[str, TextResource | None]
@@ -743,15 +773,37 @@ class _Renderer(skills.EntryOnlySkillProvider):
         return self._catalogue
 
 
-class _Prefixed(FilePrompt):
+class _Prefixed(Prompt):
     """A command that writes the prefix into what it renders (GW-7): its text is
     rewritten with the build, but an argument is given at the request, so the
-    rendered text is written again. An address already prefixed is left alone."""
+    rendered text is written again. An address already prefixed is left alone.
 
+    It wraps any ``Prompt`` a reader gives (PLUG-62), served as ``inner`` is, its own
+    ``_render`` and ``convert_result`` included, and prefixes the text of each text
+    message in the result. Other content passes as it is.
+    """
+
+    inner: Prompt
     prefix: str
 
-    async def render(self, arguments: dict | None = None) -> str:
-        return gateway.prefixed(await super().render(arguments), self.prefix)
+    async def _render(self, arguments: dict[str, Any] | None = None) -> PromptResult:
+        # FastMCP serves a prompt by its _render, so the inner prompt's own _render and
+        # convert_result decide what is served, and only its texts are written here.
+        result = await self.inner._render(arguments)
+        if not result.messages:  # an InputRequiredPromptResult, say: nothing to write
+            return result
+        return result.model_copy(
+            update={"messages": [self._message(m) for m in result.messages]}
+        )
+
+    def _message(self, message: Message) -> Message:
+        content = message.content
+        if not isinstance(content, TextContent):
+            return message
+        text = gateway.prefixed(content.text, self.prefix)
+        return message.model_copy(
+            update={"content": content.model_copy(update={"text": text})}
+        )
 
 
 class _Rewrite:
@@ -843,9 +895,9 @@ class _Rewrite:
             return None
         return built
 
-    def prompt(self, served: _Served, file: _File) -> FilePrompt | None:
-        """A command, rewritten: the one read when its text is unchanged, else
-        re-parsed under its name."""
+    def prompt(self, served: _Served, file: _File) -> Prompt | None:
+        """A command, rewritten: the one read when its text is unchanged, else read
+        again under its name by the reader it was read with (PLUG-62)."""
         item = file.item
         what = f"prompt {item.name}"
         site = self._site(served, "command", file.path, file.uri)
@@ -854,11 +906,11 @@ class _Rewrite:
             return None
         if new == file.text:
             return item
-        try:
-            return parse_prompt(new, item.name)
-        except (ValueError, yaml.YAMLError) as exc:
-            self._failed(served, None, file.path, what, str(exc))
+        prompt = _read_command(served.reader, new, file.path, item.name, served.plugin)
+        if isinstance(prompt, str):
+            self._failed(served, None, file.path, what, prompt)
             return None
+        return prompt
 
     def agent(self, served: _Served, file: _File) -> Agent | None:
         """An agent, rewritten: the one read when its text is unchanged, else
@@ -993,6 +1045,7 @@ class Plugins:
         self._state = _State(0, ())
         self._view: Callable[[], View] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
+        self._reader: CommandReader = read_command
         self._memo = _Memo(OrderedDict(), {})
         self.add_loader(LocalLoader())
         self._replaceable = {"file"}
@@ -1052,6 +1105,11 @@ class Plugins:
         """Adds ``fn`` to the end of the rewriters, run by every build (PLUG-56)."""
         self._rewriters = (*self._rewriters, fn)
         self._memo = _Memo(OrderedDict(), {})  # last: no build without it is kept
+
+    def set_command_reader(self, fn: CommandReader) -> None:
+        """Makes ``fn`` the reader of every plugin read from now on (PLUG-62). A
+        plugin read already keeps the reader it was read with, so no build changes."""
+        self._reader = fn
 
     def _chain(self, key: _Key) -> tuple[Rewriter, ...]:
         """The rewriters a build for ``key`` runs, in order: the one place the order
@@ -1179,7 +1237,7 @@ class Plugins:
             )
         rewrite = _Rewrite(chain, view.key, plugins)
         catalogue: dict[str, skills.Skill] = {}
-        prompts: list[FilePrompt] = []
+        prompts: list[Prompt] = []
         agents: list[Agent] = []
         for served in admitted:
             for k, skill in served.catalogue.items():
@@ -1191,7 +1249,8 @@ class Plugins:
                         prompt
                         if prefix is None
                         else _Prefixed(
-                            **{f: getattr(prompt, f) for f in FilePrompt.model_fields},
+                            **{f: getattr(prompt, f) for f in Prompt.model_fields},
+                            inner=prompt,
                             prefix=prefix,
                         )
                     )
@@ -1255,7 +1314,14 @@ class Plugins:
                 raise PluginError(str(exc) or type(exc).__name__) from exc
             plugin = read_plugin(root, manifest)
             notes = list(plugin.components.notes)
-            read = self._read(plugin, prefix, notes, owners)
+            reader = self._reader
+            read = self._read(
+                replace(plugin, address=address, namespace=prefix),
+                prefix,
+                notes,
+                owners,
+                reader,
+            )
         except PluginError as exc:
             raise PluginError(f"plugin {address} is not served: {exc}") from None
         for note in dict.fromkeys(notes):
@@ -1281,6 +1347,7 @@ class Plugins:
             agents=tuple(read.agents),
             by_name=dict(read.by_name),
             prefix=read.prefix,
+            reader=reader,
         )
 
     def _claim(
@@ -1316,7 +1383,12 @@ class Plugins:
         return True
 
     def _read(
-        self, plugin: Plugin, prefix: str, notes: list[str], owners: dict[str, str]
+        self,
+        plugin: Plugin,
+        prefix: str,
+        notes: list[str],
+        owners: dict[str, str],
+        reader: CommandReader,
     ) -> _Read:
         base = plugin.root.resolve()
         parts = plugin.components
@@ -1372,10 +1444,14 @@ class Plugins:
             try:
                 data = path.read_bytes()
                 text = _decoded(data)
-                prompt = parse_prompt(text, name)
-            except (OSError, ValueError, yaml.YAMLError) as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 log.warning("prompt %s is skipped: %s", path, exc)
                 skip(path, str(exc))
+                continue
+            prompt = _read_command(reader, text, skip.relative(path), name, plugin)
+            if isinstance(prompt, str):
+                log.warning("prompt %s is skipped: %s", path, prompt)
+                skip(path, prompt)
                 continue
             if self._claim(
                 f"prompt:{prompt.name}",
