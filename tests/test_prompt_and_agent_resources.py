@@ -6,7 +6,7 @@ import json
 import logging
 
 import pytest
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.prompts import Prompt
 from gateway_server import kit, over_http
 from mcp_types import INVALID_PARAMS
@@ -20,13 +20,23 @@ from plugin_server import (
     skill,
     write,
 )
-from skill_server import read_directory, read_json, request
+from skill_server import DEMO as SKILL_DEMO
+from skill_server import ROOT as SKILL_ROOT
+from skill_server import ExtensionParams, read_directory, read_json, request
 
 from kubed.mcp import QuickMCP
+from kubed.mcp.agents import EXTENSION_ID as AGENTS_ID
 from kubed.mcp.agents import META_KEY as AGENT_KEY
 from kubed.mcp.plugins import PluginError, View
 from kubed.mcp.prompts import META_KEY as PROMPT_KEY
 from kubed.mcp.protocol import MCPError
+from kubed.mcp.skills import (
+    DIRECTORY_READ,
+    NameTheIndex,
+    SkillsExtension,
+    load_skill,
+    serve,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -469,8 +479,9 @@ async def test_the_namespace_is_the_top_folder(tmp_path):
 
 
 def kit_with(tmp_path, name: str, files: dict[str, str]):
-    """A plugin ``name`` holding ``files`` and a skill, so the Skills extension binds
-    resources/directory/read (Task 4 binds it without one)."""
+    """A plugin ``name`` holding ``files`` and a skill: its first plugin brings both
+    the Skills extension and the agents extension, which binds
+    resources/directory/read."""
     files = {".claude-plugin/plugin.json": manifest(name), **files}
     return write(tmp_path / name, {f"skills/{name}/SKILL.md": skill(name), **files})
 
@@ -980,3 +991,140 @@ async def test_a_files_read_carries_its_rows_meta(tmp_path, rewritten):
                 read = await request(client, "resources/read", uri=row["uri"])
                 (content,) = read["contents"]
                 assert content["_meta"] == row["_meta"]
+
+
+# ---- the folder methods without skills (PLUG-68) -----------------------------------
+
+
+def prompts_only(tmp_path):
+    """A plugin with one command in a folder, and no skill."""
+    return write(tmp_path / "p", {"commands/db/migrate.md": command_md("Migrate.")})
+
+
+def holders(server) -> list[str]:
+    """The extension identifiers FastMCP bound resources/directory/read for.
+
+    FastMCP has no public record of which extension bound a method, so this reads its
+    ``_extension_methods``.
+    """
+    return [
+        i for i, bound in server._extension_methods.items() if DIRECTORY_READ in bound
+    ]
+
+
+async def test_folders_answer_with_no_skill(tmp_path):
+    mcp = served((prompts_only(tmp_path), None))
+    async with Client(mcp.server, mode="legacy") as client:
+        extensions = client.session.server_capabilities.extensions or {}
+        top = await rows_of(client, "prompts://t")
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource("prompts://t/db")
+        index_md = await read_text(client, "prompts://t/db/_index.md")
+    assert [(r["uri"], r["mimeType"]) for r in top] == [
+        ("prompts://t/db", "inode/directory")
+    ]
+    assert caught.value.error.message == (
+        "Resource not found: 'prompts://t/db'. prompts://t/db is a folder: "
+        "read prompts://t/db/_index.md to list it."
+    )
+    assert index_md == "prompts://t/db/migrate.md: Migrate.\n"
+    # Answered, never declared: no Skills extension without a skill (PLUG-20).
+    assert SkillsExtension.identifier not in extensions
+    assert extensions[AGENTS_ID] == {"listChanged": False}
+    assert holders(mcp.server) == [AGENTS_ID]
+
+
+# Whichever extension registers first binds resources/directory/read.
+FIRST = {"prompts-first": AGENTS_ID, "skills-first": SkillsExtension.identifier}
+
+
+@pytest.mark.parametrize("order", FIRST)
+async def test_a_skills_plugin_after_a_prompts_one(tmp_path, order):
+    # Review Focus 1, and its reverse: both browsable, each bound and added once.
+    plugins = [(prompts_only(tmp_path), None), (DEMO, "kit")]
+    mcp = served(*(plugins if order == "prompts-first" else reversed(plugins)))
+    async with over_http(mcp, mode="legacy") as client:
+        extensions = client.session.server_capabilities.extensions or {}
+        prompts = await rows_of(client, "prompts://t")
+        guide = await rows_of(client, "skill://kit/demo-guide")
+    assert [r["uri"] for r in prompts] == ["prompts://t/db"]
+    assert "skill://kit/demo-guide/SKILL.md" in [r["uri"] for r in guide]
+    assert extensions[SkillsExtension.identifier] == {"directoryRead": True}
+    assert extensions[AGENTS_ID] == {"listChanged": False}
+    assert sum(isinstance(m, NameTheIndex) for m in mcp.server.middleware) == 1
+    assert holders(mcp.server) == [FIRST[order]]
+
+
+@pytest.mark.parametrize("order", FIRST)
+async def test_a_servers_own_skills_beside_its_plugins(tmp_path, order):
+    # skills.serve on the server's own catalogue, before or after its first plugin.
+    mcp = QuickMCP("t")
+    if order == "skills-first":
+        serve(mcp.server, [load_skill(SKILL_DEMO)])
+    mcp.add_plugin(prompts_only(tmp_path))
+    if order == "prompts-first":
+        serve(mcp.server, [load_skill(SKILL_DEMO)])
+    async with Client(mcp.server, mode="legacy") as client:
+        extensions = client.session.server_capabilities.extensions or {}
+        own = await rows_of(client, SKILL_ROOT)
+        prompts = await rows_of(client, "prompts://t")
+    assert f"{SKILL_ROOT}/SKILL.md" in [r["uri"] for r in own]
+    assert [r["uri"] for r in prompts] == ["prompts://t/db"]
+    assert extensions[SkillsExtension.identifier] == {"directoryRead": True}
+    assert sum(isinstance(m, NameTheIndex) for m in mcp.server.middleware) == 1
+    assert holders(mcp.server) == [FIRST[order]]
+
+
+async def test_a_skills_extension_registered_again_keeps_the_method():
+    # FastMCP's same-identifier path: an explicit registration replaces the bundled
+    # one, and the method it held stays bound.
+    mcp = served((DEMO, None))
+    mcp.server.add_extension(SkillsExtension())
+    async with Client(mcp.server) as client:
+        guide = await rows_of(client, "skill://t/demo-guide")
+        prompts = await rows_of(client, "prompts://t")
+    assert "skill://t/demo-guide/SKILL.md" in [r["uri"] for r in guide]
+    assert [r["uri"] for r in prompts] == ["prompts://t/greet.md"]
+    assert holders(mcp.server) == [SkillsExtension.identifier]
+
+
+async def test_a_parent_mounting_a_plugin_server_binds_the_method():
+    # The parent registers a clone of the Skills extension, which binds the method
+    # there. "Directory not found" for the mounted server's folders is a known
+    # limitation (no children pass-through across a mount), not a contract.
+    parent = FastMCP("parent")
+    parent.mount(served((DEMO, None)).server)
+    async with Client(parent) as client:
+        with pytest.raises(MCPError) as caught:
+            await read_directory(client, uri="skill://t/demo-guide")
+    assert (caught.value.error.code, caught.value.error.message) == (
+        INVALID_PARAMS,
+        "Directory not found",
+    )
+    assert holders(parent) == [SkillsExtension.identifier]
+
+
+async def test_a_skills_server_built_with_serve_still_binds_directory_read():
+    server = FastMCP("s")
+    serve(server, [load_skill(SKILL_DEMO)])
+    async with Client(server) as client:
+        rows = await rows_of(client, SKILL_ROOT)
+        extensions = client.session.server_capabilities.extensions or {}
+    assert f"{SKILL_ROOT}/SKILL.md" in [r["uri"] for r in rows]
+    assert extensions[SkillsExtension.identifier] == {"directoryRead": True}
+    assert holders(server) == [SkillsExtension.identifier]
+
+
+async def test_a_handler_added_by_hand_is_refused_by_fastmcp():
+    # A handler outside any extension is not another extension's binding, so the
+    # Skills extension binds the method and FastMCP refuses it, as it would anyway.
+    # FastMCP has no public way to add a raw handler: this is its low-level server's.
+    server = FastMCP("s")
+
+    async def handler(ctx, params):
+        return {"resources": []}
+
+    server._mcp_server.add_request_handler(DIRECTORY_READ, ExtensionParams, handler)
+    with pytest.raises(ValueError, match="'resources/directory/read' is already"):
+        serve(server, [load_skill(SKILL_DEMO)])
+    assert holders(server) == []

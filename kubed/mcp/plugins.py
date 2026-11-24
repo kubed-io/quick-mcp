@@ -46,6 +46,7 @@ from fastmcp import FastMCP
 from fastmcp.prompts import Message, Prompt, PromptResult
 from fastmcp.resources import Resource, TextResource
 from fastmcp.server.context import Context
+from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.skills.provider import SkillCatalogProvider
@@ -703,11 +704,24 @@ class _Files(Provider):
 
 
 class _Agents(AgentsExtension):
-    """The server's one agents extension: the agents of the request's build."""
+    """The server's one agents extension: the agents of the request's build.
+
+    It also binds ``resources/directory/read`` over every provider on the server
+    (``skills.Folders``), so the folders answer from the first plugin, whatever its
+    plugins serve (PLUG-68), unless a Skills extension registered before it binds it
+    already. It declares nothing more than the agents extension does.
+    """
 
     def __init__(self, plugins: Plugins) -> None:
         super().__init__()
         self._plugins = plugins
+
+    def methods(self) -> Sequence[MethodBinding]:
+        return skills._with_directory_read(self, super().methods())
+
+    async def children(self, uri: str) -> list[dict] | None:
+        """The children of folder ``uri`` from the server's providers, per request."""
+        return await skills._served_children(self.server, uri)
 
     async def _agents(self) -> tuple[Agent, ...]:
         return (await self._plugins.pinned()).build.agents
@@ -1992,8 +2006,9 @@ class Plugins:
 
     def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
-        # first plugin the prompts provider, the files provider (PLUG-66) and the
-        # agents extension (PLUG-27).
+        # first plugin the prompts provider, the files provider (PLUG-66), the agents
+        # extension (PLUG-27), which binds resources/directory/read, and NameTheIndex
+        # (PLUG-68).
         if self._skills is None and any(each.catalogue for each in served):
             self._skills = _Skills(self)
             skills.serve(self._server, self._skills)
@@ -2011,3 +2026,4 @@ class Plugins:
             self._server.add_middleware(
                 AdvertiseLegacyExtensions({EXTENSION_ID: SETTINGS})
             )
+            skills._name_the_index(self._server)
