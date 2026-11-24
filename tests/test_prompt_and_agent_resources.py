@@ -6,10 +6,24 @@ import json
 import logging
 
 import pytest
-from plugin_server import agent_md, command_md, listed, served, write
+from fastmcp import Client
+from gateway_server import kit, over_http
+from mcp_types import INVALID_PARAMS
+from plugin_server import (
+    DEMO,
+    ENTRY,
+    agent_md,
+    command_md,
+    listed,
+    served,
+    skill,
+    write,
+)
+from skill_server import read_directory, read_json, request
 
 from kubed.mcp import QuickMCP
-from kubed.mcp.plugins import PluginError
+from kubed.mcp.plugins import PluginError, View
+from kubed.mcp.protocol import MCPError
 
 pytestmark = pytest.mark.unit
 
@@ -374,3 +388,408 @@ def test_a_file_at_an_index_address_is_skipped(tmp_path, caplog, path, said, add
     assert plugin.prompts == ("kit_ok",)
     assert plugin.agents == ()
     assert f"{said} {root.resolve() / path} is skipped: {reason}" in caplog.messages
+
+
+# ---- the files, their folders and indexes (PLUG-66 to PLUG-68, PLUG-71) -------------
+
+FLOW = {  # selenium-flow's shape, served with no namespace on a server named so
+    "skills/driving-a-browser/SKILL.md": skill("driving-a-browser"),
+    "commands/build_flow.md": (
+        "---\ndescription: Build a flow.\nargument-hint: <site>\n"
+        "arguments:\n- name: site\n  required: true\n---\nBuild a flow for {{ site }}.\n"
+    ),
+    "commands/repair_flow.md": (
+        "---\ndescription: Repair a flow.\ndisable-model-invocation: true\n"
+        "arguments:\n- name: flow\n  required: true\n---\nRepair {{ flow }}.\n"
+    ),
+    "agents/explorer.md": agent_md("explorer", "Explores a site."),
+}
+FLOW_FILES = {
+    "commands/build_flow.md": "prompts://selenium-flow/build_flow.md",
+    "commands/repair_flow.md": "prompts://selenium-flow/repair_flow.md",
+    "agents/explorer.md": "agents://selenium-flow/explorer.md",
+}
+
+
+def flow(tmp_path) -> QuickMCP:
+    return served((write(tmp_path / "flow", FLOW), None), name="selenium-flow")
+
+
+async def rows_of(client, uri: str) -> list[dict]:
+    """The children ``resources/directory/read`` gives folder ``uri``."""
+    return (await read_directory(client, uri=uri))["resources"]
+
+
+async def read_text(client, uri: str) -> str:
+    contents = await client.read_resource(uri)
+    assert len(contents) == 1
+    return contents[0].text
+
+
+async def test_each_prompt_and_agent_reads_at_its_address(tmp_path):
+    async with Client(flow(tmp_path).server) as client:
+        for file, uri in FLOW_FILES.items():
+            (content,) = await client.read_resource(uri)
+            assert content.text == FLOW[file]
+            assert content.mime_type == "text/markdown"
+
+
+async def test_they_are_never_listed(tmp_path):
+    async with Client(flow(tmp_path).server) as client:
+        resources = [str(r.uri) for r in await client.list_resources()]
+        templates = [t.uriTemplate for t in await client.list_resource_templates()]
+    assert resources == ["skill://selenium-flow/driving-a-browser/SKILL.md"]
+    assert templates == []
+
+
+async def test_the_namespace_is_the_top_folder(tmp_path):
+    async with Client(flow(tmp_path).server) as client:
+        rows = await rows_of(client, "prompts://selenium-flow")
+        agents = await rows_of(client, "agents://selenium-flow")
+        index_md = await read_text(client, "prompts://selenium-flow/_index.md")
+        index_json = await read_json(client, "prompts://selenium-flow/_index.json")
+    assert [r["uri"] for r in rows] == [
+        "prompts://selenium-flow/build_flow.md",
+        "prompts://selenium-flow/repair_flow.md",
+    ]
+    assert rows[0]["name"] == "build_flow"
+    assert rows[0]["description"] == "Build a flow."
+    assert rows[0]["mimeType"] == "text/markdown"
+    assert [(r["uri"], r["name"], r["description"]) for r in agents] == [
+        ("agents://selenium-flow/explorer.md", "explorer", "Explores a site.")
+    ]
+    assert index_md == (
+        "prompts://selenium-flow/build_flow.md: Build a flow.\n"
+        "prompts://selenium-flow/repair_flow.md: Repair a flow.\n"
+    )
+    assert index_json == rows
+
+
+def kit_with(tmp_path, name: str, files: dict[str, str]):
+    """A plugin ``name`` holding ``files`` and a skill, so the Skills extension binds
+    resources/directory/read (Task 4 binds it without one)."""
+    files = {".claude-plugin/plugin.json": manifest(name), **files}
+    return write(tmp_path / name, {f"skills/{name}/SKILL.md": skill(name), **files})
+
+
+async def test_a_nested_file_makes_its_folders(tmp_path):
+    root = kit_with(tmp_path, "p", {"commands/db/migrate.md": command_md("Migrate.")})
+    async with Client(served((root, "kit")).server) as client:
+        top = await rows_of(client, "prompts://kit")
+        db = await rows_of(client, "prompts://kit/db")
+        db_md = await read_text(client, "prompts://kit/db/_index.md")
+    assert top == [
+        {
+            "uri": "prompts://kit/db",
+            "mimeType": "inode/directory",
+            "name": "kit/db",
+            "description": "A folder of prompts in kit",
+        }
+    ]
+    assert [(r["uri"], r["name"]) for r in db] == [
+        ("prompts://kit/db/migrate.md", "kit_db_migrate")
+    ]
+    assert db_md == "prompts://kit/db/migrate.md: Migrate.\n"
+
+
+async def test_a_namespace_above_is_a_folder_only_with_a_plugin_under_it(tmp_path):
+    tools = kit_with(tmp_path, "tools", {"commands/a.md": command_md()})
+    top = kit_with(tmp_path, "top", {"commands/b.md": command_md()})
+    async with Client(served((tools, "kit/tools")).server) as client:
+        with pytest.raises(MCPError) as caught:
+            await read_directory(client, uri="prompts://kit")
+        under = await rows_of(client, "prompts://kit/tools")
+    assert (caught.value.error.code, caught.value.error.message) == (
+        INVALID_PARAMS,
+        "Directory not found",
+    )
+    assert [r["uri"] for r in under] == ["prompts://kit/tools/a.md"]
+
+    async with Client(served((tools, "kit/tools"), (top, "kit")).server) as client:
+        rows = await rows_of(client, "prompts://kit")
+    assert [(r["uri"], r["name"]) for r in rows] == [
+        ("prompts://kit/b.md", "kit_b"),
+        ("prompts://kit/tools", "kit/tools"),
+    ]
+    assert rows[1] == {
+        "uri": "prompts://kit/tools",
+        "mimeType": "inode/directory",
+        "name": "kit/tools",
+        "description": "A folder of prompts in kit/tools",
+    }
+
+
+async def test_an_agent_folder_is_a_folder_of_agents(tmp_path):
+    root = kit_with(tmp_path, "p", {"agents/review/security.md": agent_md("security")})
+    async with Client(served((root, "kit")).server) as client:
+        top = await rows_of(client, "agents://kit")
+        review = await rows_of(client, "agents://kit/review")
+    assert top == [
+        {
+            "uri": "agents://kit/review",
+            "mimeType": "inode/directory",
+            "name": "kit/review",
+            "description": "A folder of agents in kit",
+        }
+    ]
+    assert [(r["uri"], r["name"]) for r in review] == [
+        ("agents://kit/review/security.md", "kit_review_security")
+    ]
+
+
+async def test_an_address_is_percent_quoted(tmp_path):
+    root = kit_with(tmp_path, "p", {"commands/caf\u00e9/x.md": command_md("X.")})
+    async with Client(served((root, "kit")).server) as client:
+        text = await read_text(client, "prompts://kit/caf%C3%A9/x.md")
+        top = await rows_of(client, "prompts://kit")
+        folder = await rows_of(client, "prompts://kit/caf%C3%A9")
+    assert text == command_md("X.")
+    assert [(r["uri"], r["name"]) for r in top] == [
+        ("prompts://kit/caf%C3%A9", "kit/caf\u00e9")
+    ]
+    assert [r["uri"] for r in folder] == ["prompts://kit/caf%C3%A9/x.md"]
+
+
+@pytest.mark.parametrize(
+    ("namespace", "files"),
+    [
+        ("kit/x.md", {"commands/y.md": command_md("Y.")}),
+        ("kit", {"commands/x.md/y.md": command_md("Y.")}),
+    ],
+    ids=["namespace", "folder"],
+)
+async def test_a_file_and_a_folder_at_one_uri_keep_the_files_row(
+    tmp_path, namespace, files
+):
+    # No spec row covers this yet: the file's row is kept, and nothing is refused.
+    first = kit_with(tmp_path, "a", {"commands/x.md": command_md("The file.")})
+    second = kit_with(tmp_path, "b", files)
+    async with Client(served((first, "kit"), (second, namespace)).server) as client:
+        top = await rows_of(client, "prompts://kit")
+        text = await read_text(client, "prompts://kit/x.md")
+    at = [r for r in top if r["uri"] == "prompts://kit/x.md"]
+    assert len(at) == 1
+    assert (at[0]["mimeType"], at[0]["description"]) == ("text/markdown", "The file.")
+    assert text == command_md("The file.")
+
+
+async def test_a_folder_read_names_its_index(tmp_path):
+    async with Client(flow(tmp_path).server) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource("prompts://selenium-flow")
+    assert caught.value.error.message == (
+        "Resource not found: 'prompts://selenium-flow'. prompts://selenium-flow is a "
+        "folder: read prompts://selenium-flow/_index.md to list it."
+    )
+
+
+async def test_a_plugin_the_view_leaves_out_has_no_files(tmp_path):
+    first = kit_with(tmp_path, "kit", {"commands/x.md": command_md()})
+    second = kit_with(tmp_path, "lab", {"commands/x.md": command_md()})
+    mcp = served((first, "kit"), (second, "lab"))
+    mcp.plugin_view(lambda: View("kit", lambda plugin: plugin.namespace == "kit"))
+    async with Client(mcp.server) as client:
+        assert await read_text(client, "prompts://kit/x.md") == command_md()
+        with pytest.raises(MCPError) as file:
+            await client.read_resource("prompts://lab/x.md")
+        with pytest.raises(MCPError) as index:
+            await client.read_resource("prompts://lab/_index.md")
+        with pytest.raises(MCPError) as folder:
+            await read_directory(client, uri="prompts://lab")
+    assert file.value.error.message == "Resource not found: 'prompts://lab/x.md'"
+    assert index.value.error.message.startswith("Resource not found")
+    assert folder.value.error.message == "Directory not found"
+
+
+async def test_a_rewriters_text_is_what_reads(tmp_path):
+    mcp = flow(tmp_path)
+    seen: list[tuple[str, str]] = []
+
+    def make(site, text):
+        seen.append((site.kind, site.uri))
+        return text.replace("Build", "Make")
+
+    mcp.add_rewriter(make)
+    async with Client(mcp.server) as client:
+        text = await read_text(client, "prompts://selenium-flow/build_flow.md")
+        index_md = await read_text(client, "prompts://selenium-flow/_index.md")
+        rows = await rows_of(client, "prompts://selenium-flow")
+        index_json = await read_json(client, "prompts://selenium-flow/_index.json")
+    assert text.startswith("---\ndescription: Make a flow.")
+    assert ("index", "prompts://selenium-flow/_index.json") in seen
+    assert ("index", "agents://selenium-flow/_index.md") in seen
+    assert "Make a flow." in index_md
+    assert rows[0]["description"] == "Make a flow."
+    assert index_json == rows
+
+
+async def test_an_index_site_is_its_folder_in_the_first_plugin(tmp_path):
+    root = kit_with(tmp_path, "p", {"commands/db/migrate.md": command_md()})
+    extra = write(
+        tmp_path / "q",
+        {
+            ".claude-plugin/plugin.json": manifest("q", commands=["./extra/x.md"]),
+            "extra/x.md": command_md(),
+        },
+    )
+    mcp = served((root, "kit"), (extra, "lab"))
+    sites: dict[str, tuple[str, str]] = {}
+
+    def record(site, text):
+        if site.kind == "index":
+            sites[site.uri] = (site.plugin.name, site.path)
+        return text
+
+    mcp.add_rewriter(record)
+    await listed(mcp)
+    assert {uri: at for uri, at in sites.items() if uri.startswith("prompts://")} == {
+        "prompts://kit/_index.md": ("p", "commands"),
+        "prompts://kit/_index.json": ("p", "commands"),
+        "prompts://kit/db/_index.md": ("p", "commands/db"),
+        "prompts://kit/db/_index.json": ("p", "commands/db"),
+        "prompts://lab/_index.md": ("q", ""),
+        "prompts://lab/_index.json": ("q", ""),
+        "prompts://lab/extra/_index.md": ("q", "extra"),
+        "prompts://lab/extra/_index.json": ("q", "extra"),
+    }
+
+
+async def test_a_renamed_agents_index_site_is_where_its_file_was_read(tmp_path):
+    alpha = write(
+        tmp_path / "alpha",
+        {
+            ".claude-plugin/plugin.json": manifest("alpha"),
+            "agents/sub_x.md": agent_md(None),
+        },
+    )
+    beta = write(
+        tmp_path / "beta",
+        {
+            ".claude-plugin/plugin.json": manifest("beta"),
+            "agents/sub/x.md": agent_md(None),
+        },
+    )
+    mcp = served((alpha, "kit"), (beta, "kit/tools"))
+    assert mcp.plugins[1].agents == ("kit_sub_x@beta",)
+    sites: dict[str, tuple[str, str]] = {}
+
+    def record(site, text):
+        if site.kind == "index":
+            sites[site.uri] = (site.plugin.name, site.path)
+        return text
+
+    mcp.add_rewriter(record)
+    await listed(mcp)
+    assert sites["agents://kit/tools/_index.md"] == ("beta", "agents")
+    assert sites["agents://kit/_index.md"] == ("alpha", "agents")
+
+
+async def test_a_failed_prompt_has_no_file(tmp_path):
+    mcp = flow(tmp_path)
+
+    def fail(site, text):
+        if site.uri == "prompts://selenium-flow/build_flow.md":
+            raise ValueError("no")
+        return text
+
+    mcp.add_rewriter(fail)
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource("prompts://selenium-flow/build_flow.md")
+        index = await read_json(client, "prompts://selenium-flow/_index.json")
+    assert caught.value.error.message.startswith("Resource not found")
+    assert [r["uri"] for r in index] == ["prompts://selenium-flow/repair_flow.md"]
+
+
+async def test_a_failed_index_is_missing_but_its_folder_is_not(tmp_path):
+    mcp = flow(tmp_path)
+
+    def fail(site, text):
+        if site.uri == "prompts://selenium-flow/_index.md":
+            raise ValueError("no")
+        return text
+
+    mcp.add_rewriter(fail)
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.read_resource("prompts://selenium-flow/_index.md")
+        rows = await rows_of(client, "prompts://selenium-flow")
+        index = await read_json(client, "prompts://selenium-flow/_index.json")
+    assert caught.value.error.message.startswith("Resource not found")
+    assert index == rows
+    assert len(rows) == 2
+
+
+CRLF = b"---\r\ndescription: C.\r\n---\r\nDo it.\r\n"
+
+
+def crlf(tmp_path, kind: str = "commands") -> QuickMCP:
+    """A server over one CRLF file, ``<kind>/c.md`` under ``kit``."""
+    root = tmp_path / "p"
+    (root / kind).mkdir(parents=True)
+    (root / kind / "c.md").write_bytes(CRLF)
+    return served((root, "kit"))
+
+
+async def test_a_file_reads_as_its_bytes(tmp_path):  # Review Focus 3
+    async with Client(crlf(tmp_path).server) as client:
+        assert await read_text(client, "prompts://kit/c.md") == CRLF.decode("utf-8")
+
+
+async def test_a_rewritten_crlf_file_reads_as_the_chains_text(tmp_path):
+    # The chain is shown the text as read_text gives it, so what it returns is LF.
+    mcp = crlf(tmp_path)
+    mcp.add_rewriter(lambda site, text: text.replace("Do it", "Done"))
+    async with Client(mcp.server) as client:
+        text = await read_text(client, "prompts://kit/c.md")
+    assert text == "---\ndescription: C.\n---\nDone.\n"
+
+
+async def test_a_rewriter_that_changes_nothing_serves_the_bytes(tmp_path):
+    mcp = crlf(tmp_path, "agents")
+    mcp.add_rewriter(lambda site, text: text)
+    async with Client(mcp.server) as client:
+        assert await read_text(client, "agents://kit/c.md") == CRLF.decode("utf-8")
+
+
+async def test_a_renamed_agent_reads_at_its_served_name(tmp_path):
+    mcp = served(*alpha_beta(tmp_path))
+    async with Client(mcp.server) as client:
+        renamed = await read_text(client, "agents://t/review@beta.md")
+        plain = await read_text(client, "agents://t/review.md")
+    assert renamed == plain == agent_md("review")
+
+
+async def test_the_files_read_behind_a_prefix(tmp_path):  # Review Focus 4
+    async with over_http(kit(tmp_path), header="kb+") as client:
+        ask = await request(client, "resources/read", uri="kb+prompts://lib/ask.md")
+        index = await request(
+            client, "resources/read", uri="kb+agents://lib/_index.json"
+        )
+        rows = await read_directory(client, uri="kb+prompts://lib")
+    text = ask["contents"][0]["text"]
+    assert "kb+prompts://lib/ask.md" in text
+    assert "kb+skill://lib/guide/SKILL.md" in text
+    assert [r["uri"] for r in json.loads(index["contents"][0]["text"])] == [
+        "kb+agents://lib/scout.md"
+    ]
+    assert [r["uri"] for r in rows["resources"]] == ["prompts://lib/ask.md"]
+
+
+async def test_the_extensions_are_unchanged():  # PLUG-71
+    mcp = served((DEMO, None))
+    assert await listed(mcp) == (["greet"], ["helper"], [ENTRY])
+    async with Client(mcp.server) as client:
+        greeting = await client.get_prompt("greet", {"who": "x"})
+        detail = await request(client, "agents/get", name="helper")
+    assert greeting.messages[0].content.text.startswith("Greet x warmly. ")
+    assert sorted(detail) == [
+        "_meta",
+        "agent",
+        "cacheScope",
+        "instructions",
+        "modelRoutingHint",
+        "resultType",
+        "tools",
+        "ttlMs",
+    ]
