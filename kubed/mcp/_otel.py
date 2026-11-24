@@ -4,6 +4,7 @@
 the ``OTEL_*`` variables, after filling a few defaults. Its providers are set once per
 process, so once ours have stopped, no later start configures them again. An SDK
 something else configured first is kept, and only log records are given its trace.
+With profiles on too, each root span tags the profile samples taken while it runs.
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ from types import ModuleType
 from urllib.parse import quote
 
 # The SDK by name: without it a missing install is the one warning, not a failed start.
-import opentelemetry.sdk.trace  # noqa: F401
+import opentelemetry.sdk.trace
 from opentelemetry import _logs, metrics, trace
+from opentelemetry.context import Context
 from opentelemetry.instrumentation.auto_instrumentation import initialize
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.logging.handler import (
@@ -184,6 +186,104 @@ def _shutdown(kind: str, provider: object) -> None:
         log.warning("OpenTelemetry did not stop in time: %s", kind)
 
 
+def _is_root(span: opentelemetry.sdk.trace.ReadableSpan) -> bool:
+    """Whether ``span`` starts a trace here: the spans pyroscope-otel tags."""
+    return span.parent is None or span.parent.is_remote
+
+
+class _ProfileLink(opentelemetry.sdk.trace.SpanProcessor):
+    """Delegates to pyroscope-otel's processor until it's closed. Never raises.
+
+    The SDK can't remove a processor and doesn't catch one that raises, so a provider
+    that outlives our profiles keeps calling this one: closed, it does nothing.
+    """
+
+    def __init__(
+        self, inner: opentelemetry.sdk.trace.SpanProcessor, profiles: ModuleType
+    ) -> None:
+        self._inner = inner
+        # The pyroscope the inner processor tags threads through.
+        self._profiles = profiles
+        self._open = True
+        self._failed = False
+        # Each root span's name as it started, by span id: the inner one tagged that.
+        self._started: dict[int, str] = {}
+
+    def _failure(self, error: Exception) -> None:
+        if not self._failed:
+            self._failed = True
+            log.error("Span profiles failed: %s", type(error).__name__)
+
+    def on_start(
+        self, span: opentelemetry.sdk.trace.Span, parent_context: Context | None = None
+    ) -> None:
+        if not self._open:
+            return
+        try:
+            if _is_root(span):
+                self._started[span.context.span_id] = span.name
+            self._inner.on_start(span, parent_context)
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            self._failure(error)
+
+    def on_end(self, span: opentelemetry.sdk.trace.ReadableSpan) -> None:
+        if not self._open:
+            return
+        try:
+            started = self._started.pop(span.context.span_id, None)
+            self._inner.on_end(span)
+            # The inner one untags by the span's name now, so a span renamed since it
+            # started, as FastMCP's tools/call is, would leave its first name behind.
+            if started is not None and started != span.name:
+                self._profiles.remove_thread_tag("span_name", started)
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            self._failure(error)
+
+    def shutdown(self) -> None:
+        """Nothing to release: ``close`` is what stops it."""
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        """Nothing is buffered."""
+        return True
+
+    def close(self) -> None:
+        """Stop delegating, for good."""
+        self._open = False
+        self._started.clear()
+
+
+def _link_profiles(
+    provider: object, profiles: ModuleType | None
+) -> _ProfileLink | None:
+    """Link ``provider``'s root spans to profiles, when profiles started. Never raises.
+
+    Only an SDK provider takes a span processor. Without the link, OpenTelemetry and
+    profiles still run, each on its own.
+    """
+    if profiles is None or not isinstance(
+        provider, opentelemetry.sdk.trace.TracerProvider
+    ):
+        return None
+    try:
+        try:
+            from pyroscope.otel import PyroscopeSpanProcessor
+        except ModuleNotFoundError as error:
+            # Only pyroscope-otel itself missing: a module it imports is a failure.
+            if error.name != "pyroscope.otel":
+                raise
+            log.warning(
+                "Span profiles are on, but pyroscope-otel is not installed: "
+                "install kubed-mcp[telemetry]"
+            )
+            return None
+        link = _ProfileLink(PyroscopeSpanProcessor(), profiles)
+        provider.add_span_processor(link)
+        return link
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error("Span profiles did not start: %s", type(error).__name__)
+        return None
+
+
 class _Otel:
     """What a start set up, so its stop undoes what it owns and nothing else."""
 
@@ -192,7 +292,7 @@ class _Otel:
         *,
         owned: bool,
         logging_instrumented: bool,
-        link: object | None = None,
+        link: _ProfileLink | None = None,
     ) -> None:
         self._owned = owned
         self._logging_instrumented = logging_instrumented
@@ -202,7 +302,7 @@ class _Otel:
         """Close the link, uninstrument logging, stop our providers. Never raises."""
         global _stopped
         try:
-            if self._link is not None and hasattr(self._link, "close"):
+            if self._link is not None:
                 self._link.close()
         except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
             log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
@@ -244,6 +344,7 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
         _set_defaults(name, settings.tags)
         if _sdk_configured():
             # Someone else's providers: kept as they are, and never shut down by us.
+            link = _link_profiles(trace.get_tracer_provider(), profiles)
             try:
                 instrumented = _instrument_logging()
             except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
@@ -252,7 +353,7 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
                     "OpenTelemetry did not instrument logging: %s", type(error).__name__
                 )
                 instrumented = False
-            return _Otel(owned=False, logging_instrumented=instrumented)
+            return _Otel(owned=False, logging_instrumented=instrumented, link=link)
         instrumentor = LoggingInstrumentor()
         before = instrumentor.is_instrumented_by_opentelemetry
         try:
@@ -276,6 +377,7 @@ def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel 
             owned=_sdk_configured(),
             logging_instrumented=instrumentor.is_instrumented_by_opentelemetry
             and not before,
+            link=_link_profiles(trace.get_tracer_provider(), profiles),
         )
     except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
         log.error(

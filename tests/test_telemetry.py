@@ -30,7 +30,7 @@ from kubed.mcp.container import Container
 
 ADDRESS = "http://pyroscope.example.com:4040"
 CHILD = Path(__file__).with_name("otel_child.py")
-EVENTS: list[str] = []
+EVENTS: list[str | tuple[str, str]] = []
 
 
 def _reset_otel() -> None:
@@ -1061,3 +1061,253 @@ async def test_logging_that_fails_to_instrument_still_keeps_the_trace(
     ]
     assert_safe(caplog.records, "s3cret")
     assert not LoggingInstrumentor().is_instrumented_by_opentelemetry
+
+
+# Span profiles (TEL-14): with both signals on, each root span tags the profile samples
+# taken while it runs. The SDK can't remove a processor, so every link a test adds stays
+# on the session's provider, closed: none of these tests may see one an earlier test left.
+
+
+@pytest.fixture
+def span_profiles(pyroscope, monkeypatch) -> types.ModuleType:
+    """A fake pyroscope.otel, whose processor records each root span's start and end."""
+    from opentelemetry.sdk.trace import SpanProcessor
+
+    module = types.ModuleType("pyroscope.otel")
+
+    class PyroscopeSpanProcessor(SpanProcessor):
+        # The real one's test: only a root span tags the thread. Recording every span
+        # would hide that in-process the root is the client's span, not the server's.
+        @staticmethod
+        def _root(span) -> bool:
+            return span.parent is None or span.parent.is_remote
+
+        def on_start(self, span, parent_context=None) -> None:
+            if self._root(span):
+                EVENTS.append(("start", span.name))
+
+        def on_end(self, span) -> None:
+            if self._root(span):
+                EVENTS.append(("end", span.name))
+
+    module.PyroscopeSpanProcessor = PyroscopeSpanProcessor
+    monkeypatch.setitem(sys.modules, "pyroscope.otel", module)
+    return module
+
+
+def _added(monkeypatch, provider) -> list[object]:
+    """Each span processor added to ``provider`` from now on, then added as asked."""
+    added: list[object] = []
+    add = provider.add_span_processor
+
+    def record(processor) -> None:
+        added.append(processor)
+        add(processor)
+
+    monkeypatch.setattr(provider, "add_span_processor", record)
+    return added
+
+
+async def test_profiles_and_otel_link_each_root_span(
+    pyroscope, span_profiles, traced, spans, monkeypatch
+) -> None:
+    from opentelemetry.context import Context
+
+    provider, _ = traced
+    profiles = sys.modules["pyroscope"]
+    shutdown = profiles.shutdown
+
+    def traced_shutdown() -> None:
+        # A root span while profiles stop: OpenTelemetry stopped first, so it's untagged.
+        provider.get_tracer("t").start_span(
+            "profiles stopping", context=Context()
+        ).end()
+        shutdown()
+
+    monkeypatch.setattr(profiles, "shutdown", traced_shutdown)
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    async with Client(served("linked", settings).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    # In-process the root is the client's tools/call span, the server's is its child:
+    # behind a real transport the server's span has a remote parent and is the root.
+    assert ("start", "tools/call ping") in EVENTS
+    assert ("end", "tools/call ping") in EVENTS
+    assert ("start", "tools/call") not in EVENTS
+    assert "profiles stopped" in EVENTS
+    assert "profiles stopping" in [s.name for s in spans.get_finished_spans()]
+    assert not [
+        e for e in EVENTS if isinstance(e, tuple) and e[1] == "profiles stopping"
+    ]
+    assert server_spans(spans) == ["tools/call ping"]
+
+
+async def test_the_link_goes_quiet_when_the_signals_stop(
+    pyroscope, span_profiles, traced, spans, monkeypatch
+) -> None:
+    from kubed.mcp._otel import _ProfileLink
+
+    provider, _ = traced
+    added = _added(monkeypatch, provider)
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    async with Client(served("quiet", settings).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert ("start", "tools/call ping") in EVENTS
+    EVENTS.clear()
+    # The provider isn't ours, so it serves on, and can't let go of the link.
+    assert [type(p) for p in added] == [_ProfileLink]
+    with provider.get_tracer("t").start_as_current_span("after"):
+        pass
+    assert not [e for e in EVENTS if isinstance(e, tuple)]
+    assert "after" in [s.name for s in spans.get_finished_spans()]
+
+
+async def test_a_failing_link_never_fails_a_call(
+    pyroscope, span_profiles, traced, spans, monkeypatch, caplog
+) -> None:
+    def refuse(self, span, parent_context=None) -> None:
+        raise RuntimeError("https://user:s3cret@pyroscope.example.com")
+
+    monkeypatch.setattr(span_profiles.PyroscopeSpanProcessor, "on_start", refuse)
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    async with Client(served("failing-link", settings).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert server_spans(spans) == ["tools/call ping", "tools/call ping"]
+    assert_safe(caplog.records, "s3cret")
+    # Logged once, though every root span failed.
+    assert [
+        r.getMessage() for r in caplog.records if "Span profiles" in r.getMessage()
+    ] == ["Span profiles failed: RuntimeError"]
+    # Still delegating after the first failure: the end of each root span was seen.
+    assert ("end", "tools/call ping") in EVENTS
+
+
+async def test_a_link_that_fails_to_be_added_is_logged_and_otel_runs(
+    pyroscope, span_profiles, traced, spans, monkeypatch, caplog
+) -> None:
+    def refuse(self) -> None:
+        raise RuntimeError("https://user:s3cret@pyroscope.example.com")
+
+    monkeypatch.setattr(span_profiles.PyroscopeSpanProcessor, "__init__", refuse)
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    async with Client(served("unlinked", settings).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert server_spans(spans) == ["tools/call ping"]
+    records = [r for r in caplog.records if r.name.startswith("kubed.mcp")]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.ERROR, "Span profiles did not start: RuntimeError")
+    ]
+    assert_safe(caplog.records, "s3cret")
+
+
+async def test_otel_without_profiles_adds_no_link(traced, spans, monkeypatch) -> None:
+    provider, _ = traced
+    added = _added(monkeypatch, provider)
+    monkeypatch.delitem(sys.modules, "pyroscope.otel", raising=False)
+    async with Client(
+        served("unprofiled", TelemetrySettings(otel=True)).server
+    ) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert "pyroscope.otel" not in sys.modules
+    assert added == []
+
+
+async def test_pyroscope_otel_missing_is_one_warning(
+    pyroscope, traced, spans, monkeypatch, caplog
+) -> None:
+    provider, _ = traced
+    added = _added(monkeypatch, provider)
+    monkeypatch.setitem(sys.modules, "pyroscope.otel", None)
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    async with Client(served("half-linked", settings).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage() for r in warnings] == [
+        "Span profiles are on, but pyroscope-otel is not installed: "
+        "install kubed-mcp[telemetry]"
+    ]
+    assert server_spans(spans) == ["tools/call ping"]
+    assert added == []
+
+
+def test_the_initialize_path_links_the_provider_it_set(
+    pyroscope, span_profiles, monkeypatch
+) -> None:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    import kubed.mcp._otel
+    from kubed.mcp._otel import _ProfileLink
+
+    configured = TracerProvider()
+    added = _added(monkeypatch, configured)
+    initialized: list[dict] = []
+    unset = trace.ProxyTracerProvider()
+    # Unconfigured until initialize() runs, which sets this provider: a link added any
+    # earlier would find no SDK provider to add to.
+    monkeypatch.setattr(
+        kubed.mcp._otel, "initialize", lambda **kwargs: initialized.append(kwargs)
+    )
+    monkeypatch.setattr(
+        trace, "get_tracer_provider", lambda: configured if initialized else unset
+    )
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    otel = kubed.mcp._otel.start("initialized", settings, sys.modules["pyroscope"])
+    assert otel is not None
+    assert initialized == [{"swallow_exceptions": False}]
+    assert [type(p) for p in added] == [_ProfileLink]
+    with configured.get_tracer("t").start_as_current_span("during"):
+        pass
+    assert EVENTS == [("start", "during"), ("end", "during")]
+    _fake_providers(monkeypatch)
+    otel.stop()
+    EVENTS.clear()
+    with configured.get_tracer("t").start_as_current_span("after"):
+        pass
+    assert EVENTS == []
+
+
+@pytest.fixture
+def pyroscope_tags(monkeypatch) -> dict[str, str]:
+    """The thread's tags, live, as the real pyroscope.otel adds and removes them."""
+    pyroscope_otel = importlib.import_module("pyroscope.otel")
+    tags: dict[str, str] = {}
+
+    def add(key: str, value: str) -> None:
+        tags[key] = value
+
+    def remove(key: str, value: str) -> None:
+        # As pyroscope does: only the pair that was added goes.
+        if tags.get(key) == value:
+            del tags[key]
+
+    # The module object the real processor calls, bound when pyroscope.otel was imported.
+    monkeypatch.setattr(pyroscope_otel.pyroscope, "add_thread_tag", add)
+    monkeypatch.setattr(pyroscope_otel.pyroscope, "remove_thread_tag", remove)
+    return tags
+
+
+def test_a_renamed_span_leaves_no_tag_behind(pyroscope_tags) -> None:
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.trace import TracerProvider
+    from pyroscope import otel as pyroscope_otel
+
+    from kubed.mcp._otel import _ProfileLink
+
+    provider = TracerProvider()
+    link = _ProfileLink(
+        pyroscope_otel.PyroscopeSpanProcessor(), pyroscope_otel.pyroscope
+    )
+    provider.add_span_processor(link)
+    # As FastMCP's server span: started as tools/call, renamed once the tool is known.
+    span = provider.get_tracer("t").start_span("tools/call", context=Context())
+    assert pyroscope_tags["span_name"] == "tools/call"
+    span.update_name("tools/call ping")
+    span.end()
+    assert pyroscope_tags == {}
+    # An unrenamed span is the inner processor's alone to untag.
+    span = provider.get_tracer("t").start_span("tools/list", context=Context())
+    assert set(pyroscope_tags) == {"span_id", "span_name", "trace_id"}
+    span.end()
+    assert pyroscope_tags == {}
+    link.close()
