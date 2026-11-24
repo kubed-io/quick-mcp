@@ -34,7 +34,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
@@ -64,9 +64,11 @@ from ._rewrite import (
 )
 from .agents import (
     EXTENSION_ID,
+    META_KEY,
     SETTINGS,
     Agent,
     AgentsExtension,
+    _survives_json,
     parse_agent,
     served_as,
 )
@@ -76,6 +78,7 @@ from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
     "AgentFile",
+    "AgentMeta",
     "CommandReader",
     "Components",
     "LocalLoader",
@@ -523,7 +526,7 @@ class _File:
     stem: str
     folders: tuple[str, ...]
     read_name: str = ""
-    meta: Mapping[str, object] = MappingProxyType({})
+    meta: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def _decoded(data: bytes) -> str:
@@ -796,28 +799,30 @@ def _enter(
     """``served`` as it enters a set whose ``owners`` are given (PLUG-64).
 
     Built from the plugin and agents as read, never as an earlier set served them, so
-    each entry is decided afresh. Names come first: an agent keeps its read name when
-    the set has none of it, else is served as ``<name>@<plugin>``, else is skipped,
-    taken or not usable. ``meta`` is for each agent's own ``_meta`` keys after that,
-    on the plugin so named (PLUG-73), and is not run yet. A rename's or a skip's
-    warning is logged only when the plugin as last served did not have it, so
-    re-entering does not warn again. With nothing
-    renamed or skipped this is the ``_Served`` read; with the outcome of the last
-    entry, ``served`` itself, so a ``Plugin`` a server holds stays the one served.
+    each entry is decided afresh, in two passes. Names first: an agent keeps its read
+    name when the set has none of it, else is served as ``<name>@<plugin>``, else is
+    skipped, taken or not usable; that gives the plugin as it enters. Then ``meta``,
+    once per agent named, with that name and that plugin (PLUG-73): its keys are added
+    to the agent's ``_meta``, and a raise skips the agent, so it claims no name.
+
+    A rename's or a skip's warning is logged only when the plugin as last served did
+    not have it, so re-entering does not warn again, and a rename's only once the
+    agent is served so; a bad result of ``meta`` is warned of on each entry. With
+    nothing renamed, skipped or given keys this is the ``_Served`` read; with the
+    outcome of the last entry, ``served`` itself, so a ``Plugin`` a server holds stays
+    the one served.
     """
-    del meta  # PLUG-73 is not served yet
     read = served.read
     last = served.plugin
-    agents: list[_File] = []
-    files: list[AgentFile] = []
+    named: list[tuple[_File, AgentFile]] = []
+    clashes: dict[str, str] = {}  # a renamed agent's path -> the plain name's owner
     skipped = list(read.skipped)
     changed = False
     for file in served.read_agents:
         name = file.item.name
         owner = owners.get(f"agent:{name}")
         if owner is None:
-            agents.append(file)
-            files.append(AgentFile(name, file.path))
+            named.append((file, AgentFile(name, file.path)))
             continue
         changed = True
         renamed = f"{name}@{read.name}"
@@ -827,23 +832,54 @@ def _enter(
         elif held is not None:
             reason = f"agent {renamed} is already served by plugin {held}"
         else:
-            if renamed not in last.agents:
-                log.warning(
-                    "agent %s is already served by plugin %s, so plugin %s serves it "
-                    "as %s",
-                    name,
-                    owner,
-                    read.name,
-                    renamed,
-                )
-            agents.append(replace(file, item=served_as(file.item, renamed, file.meta)))
-            files.append(AgentFile(renamed, file.path, renamed=True))
+            clashes[file.path] = owner
+            named.append((file, AgentFile(renamed, file.path, renamed=True)))
             continue
-        if (file.path, reason) not in last.skipped:
+        _skip_agent(read, last, skipped, file.path, reason)
+
+    entering = read
+    if changed:
+        entering = replace(
+            read,
+            agents=tuple(entry.name for _, entry in named),
+            agent_files=tuple(entry for _, entry in named),
+            skipped=tuple(skipped),
+        )
+    agents: list[_File] = []
+    files: list[AgentFile] = []
+    for file, entry in named:
+        keys: Mapping[str, object] = file.meta
+        if meta is not None:
+            try:
+                keys = _agent_meta(meta, entry.name, entering)
+            except Exception as exc:  # noqa: BLE001 - a server's agent_meta fails one agent, never its plugin (PLUG-73)
+                reason = str(exc) or type(exc).__name__
+                failed = (file.path, f"agent_meta failed: {reason}")
+                if failed not in last.skipped:
+                    log.error(
+                        "plugin %s: agent_meta failed on agent %s, so it is not "
+                        "served: %s",
+                        read.name,
+                        entry.name,
+                        reason,
+                    )
+                skipped.append(failed)
+                changed = True
+                continue
+        if keys:
+            changed = True
+        if entry.renamed and entry.name not in last.agents:
             log.warning(
-                "plugin %s: agent file %s is skipped: %s", read.name, file.path, reason
+                "agent %s is already served by plugin %s, so plugin %s serves it as %s",
+                file.item.name,
+                clashes[file.path],
+                read.name,
+                entry.name,
             )
-        skipped.append((file.path, reason))
+        if entry.renamed or keys:
+            file = replace(file, item=served_as(file.item, entry.name, keys), meta=keys)
+        agents.append(file)
+        files.append(entry)
 
     if not changed:
         if last is read:
@@ -856,9 +892,50 @@ def _enter(
         skipped=tuple(skipped),
     )
     entered = tuple(agents)
-    if plugin == last and entered == served.agents:
-        return served
+    if plugin == last:
+        if entered == served.agents:
+            return served
+        # Only the agents' keys differ: the Plugin a server holds stays the one served.
+        plugin = last
     return replace(served, plugin=plugin, agents=entered)
+
+
+def _skip_agent(
+    read: Plugin, last: Plugin, skipped: list[tuple[str, str]], path: str, reason: str
+) -> None:
+    """Adds the agent file at ``path`` to ``skipped``, warned of when the plugin as
+    last served did not skip it so."""
+    if (path, reason) not in last.skipped:
+        log.warning("plugin %s: agent file %s is skipped: %s", read.name, path, reason)
+    skipped.append((path, reason))
+
+
+def _agent_meta(fn: AgentMeta, name: str, plugin: Plugin) -> Mapping[str, object]:
+    """The keys ``fn`` adds to agent ``name``'s ``_meta``, as their JSON round trip,
+    so the server cannot change them later; empty for None (PLUG-73).
+
+    The layer's own key is dropped, and a result that is not a dict, or does not
+    survive JSON, is dropped whole, each with a warning. A raise is the caller's.
+    """
+    result = fn(name, plugin)
+    if result is None:
+        return MappingProxyType({})
+    about = f"plugin {plugin.name}: agent_meta for agent {name}"
+    if not isinstance(result, Mapping):
+        log.warning(
+            "%s returned %s, not a dict; it is dropped", about, type(result).__name__
+        )
+        return MappingProxyType({})
+    keys = dict(result)
+    if META_KEY in keys:
+        log.warning(
+            "%s returned %s, which is the layer's; it is dropped", about, META_KEY
+        )
+        del keys[META_KEY]
+    if not _survives_json(keys):
+        log.warning("%s is not representable as JSON; it is dropped", about)
+        return MappingProxyType({})
+    return MappingProxyType(json.loads(json.dumps(keys, allow_nan=False)))
 
 
 class _Renderer(skills.EntryOnlySkillProvider):
@@ -1129,7 +1206,7 @@ class PluginSet:
             if owner is not None:
                 what = key if key.startswith("skill://") else key.replace(":", " ", 1)
                 raise PluginError(f"{what} is already served by plugin {owner}")
-        entered = _enter(served, self._owners, None)
+        entered = _enter(served, self._owners, self._plugins._agent_meta)
         self._owners.update(_owned(entered))
         self._served.append(entered)
         return entered
@@ -1158,6 +1235,7 @@ class Plugins:
         self._view: Callable[[], View] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
         self._reader: CommandReader = read_command
+        self._agent_meta: AgentMeta | None = None
         self._memo = _Memo(OrderedDict(), {})
         self.add_loader(LocalLoader())
         self._replaceable = {"file"}
@@ -1222,6 +1300,13 @@ class Plugins:
         """Makes ``fn`` the reader of every plugin read from now on (PLUG-62). A
         plugin read already keeps the reader it was read with, so no build changes."""
         self._reader = fn
+
+    def set_agent_meta(self, fn: AgentMeta) -> None:
+        """Makes ``fn`` the ``agent_meta`` of every plugin entering a set from now on
+        (PLUG-73), in place of any earlier one. It runs on set entry, never in a
+        build, so the plugins served keep their keys, and no build changes, until
+        they next enter a set."""
+        self._agent_meta = fn
 
     def _chain(self, key: _Key) -> tuple[Rewriter, ...]:
         """The rewriters a build for ``key`` runs, in order: the one place the order

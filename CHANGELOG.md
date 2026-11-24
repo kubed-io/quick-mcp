@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.command_reader(fn)` reads a server's own command dialects as prompts.
 - Same-named agents from two plugins are both served, the later as `name@plugin`.
 - `Plugin.agent_files` gives each agent's file and whether it was renamed.
+- `mcp.agent_meta(fn)` adds a server's own `_meta` to `agents/get`.
 
 ### Changed
 

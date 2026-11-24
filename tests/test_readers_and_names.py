@@ -15,7 +15,7 @@ from plugin_server import DEMO, ENTRY, agent_md, command_md, listed, served, wri
 from skill_server import request
 
 from kubed.mcp import QuickMCP
-from kubed.mcp.agents import parse_agent, served_as
+from kubed.mcp.agents import META_KEY, parse_agent, served_as
 from kubed.mcp.plugins import AgentFile, PluginError
 from kubed.mcp.prompts import read_command
 from kubed.mcp.protocol import MCPError
@@ -198,19 +198,32 @@ async def test_a_failed_build_read_fails_only_that_prompt(caplog, result, reason
     assert caplog.text.rstrip().endswith(reason)
 
 
-async def test_a_build_given_the_plugin_as_served():
+async def test_a_build_given_the_plugin_as_served(tmp_path):
+    # beta is served with review@beta, read with review: a build must give its reader
+    # the plugin as its set serves it, not as read.
     seen = []
     mcp = QuickMCP("t")
 
     @mcp.command_reader
     def reader(text, path, name, plugin):
-        seen.append(plugin)
+        if "Done it." in text:
+            seen.append((name, plugin.agents))
         return read_command(text, path, name, plugin)
 
-    plugin = mcp.add_plugin(DEMO)
-    mcp.add_rewriter(lambda site, text: text.replace("Greet {{", "Hail {{"))
-    await listed(mcp)
-    assert seen[-1] is plugin
+    for name in ("alpha", "beta"):
+        mcp.add_plugin(
+            write(
+                tmp_path / name,
+                {
+                    ".claude-plugin/plugin.json": json.dumps({"name": name}),
+                    "agents/review.md": agent_md("review"),
+                    f"commands/{name}-cmd.md": command_md(),
+                },
+            )
+        )
+    mcp.add_rewriter(lambda site, text: text.replace("Do it.", "Done it."))
+    assert (await listed(mcp))[0] == ["alpha-cmd", "beta-cmd"]
+    assert ("beta-cmd", ("review@beta",)) in seen
 
 
 async def test_no_rewriter_reuses_the_first_prompt():
@@ -460,3 +473,258 @@ def test_served_as_leaves_the_agent_given_untouched():
     assert renamed.detail["_meta"]["io.example/x"] == {"a": 1}
     assert (json.dumps(agent.card), json.dumps(agent.detail)) == (card, detail)
     assert served_as(agent, "review", {}) is agent
+
+
+# ---- agent_meta (PLUG-73) ----------------------------------------------------------
+
+
+async def kit_helper(mcp):
+    """The definition and the card of the demo's agent, served under ``kit``."""
+    async with Client(mcp.server) as client:
+        detail = await request(client, "agents/get", name="kit_helper")
+        (card,) = (await request(client, "agents/list"))["agents"]
+    return detail, card
+
+
+async def plain_kit_helper():
+    """``kit_helper`` as a server with no ``agent_meta`` serves it: the ``_meta`` the
+    layer and FastMCP give, and the card."""
+    plain = QuickMCP("t")
+    plain.add_plugin(DEMO, namespace="kit")
+    return await kit_helper(plain)
+
+
+async def test_agent_meta_adds_keys_beside_the_layers():  # kb#83
+    layers, plain_card = await plain_kit_helper()
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        return {"io.kubed.mcp-kb/agent": {"library": plugin.namespace, "name": name}}
+
+    mcp.add_plugin(DEMO, namespace="kit")
+    detail, card = await kit_helper(mcp)
+    assert detail["_meta"]["io.kubed.mcp-kb/agent"] == {
+        "library": "kit",
+        "name": "kit_helper",
+    }
+    assert "frontmatter" in detail["_meta"][META_KEY]
+    assert detail["_meta"][META_KEY] == layers["_meta"][META_KEY]
+    assert set(detail["_meta"]) == {*layers["_meta"], "io.kubed.mcp-kb/agent"}
+    assert set(card) == {"name", "description", "capabilities"}
+    assert card == plain_card
+
+
+def test_agent_meta_returns_fn():
+    mcp = QuickMCP("t")
+
+    def fn(name, plugin):
+        return None
+
+    assert mcp.agent_meta(fn) is fn
+
+
+def test_agent_meta_gets_the_served_name(tmp_path):
+    calls = []
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        calls.append((name, plugin.name))
+
+    for root, namespace in alpha_beta(tmp_path):
+        mcp.add_plugin(root, namespace=namespace)
+    assert calls[-1] == ("review@beta", "beta")
+
+
+def test_agent_meta_is_given_the_plugin_as_it_enters(tmp_path):
+    seen = []
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        seen.append((plugin.agents, plugin.agent_files))
+
+    for root, namespace in alpha_beta(tmp_path):
+        mcp.add_plugin(root, namespace=namespace)
+    assert seen[-1] == (
+        ("review@beta",),
+        (AgentFile("review@beta", "agents/review.md", True),),
+    )
+
+
+async def test_a_later_agent_meta_replaces_the_first():
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: {"first": 1})
+    mcp.agent_meta(lambda name, plugin: {"second": 2})
+    mcp.add_plugin(DEMO, namespace="kit")
+    detail, _ = await kit_helper(mcp)
+    layers, _ = await plain_kit_helper()
+    assert set(detail["_meta"]) == {*layers["_meta"], "second"}
+
+
+async def test_the_layers_key_wins(caplog):
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: {META_KEY: {"x": 1}, "k": 1})
+    mcp.add_plugin(DEMO, namespace="kit")
+    detail, _ = await kit_helper(mcp)
+    assert "frontmatter" in detail["_meta"][META_KEY] and detail["_meta"]["k"] == 1
+    assert "x" not in detail["_meta"][META_KEY]
+    assert (
+        "plugin demo: agent_meta for agent kit_helper returned io.kubed/agent, which "
+        "is the layer's; it is dropped"
+    ) in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("result", "warning"),
+    [
+        (["k"], "returned list, not a dict; it is dropped"),
+        ("k", "returned str, not a dict; it is dropped"),
+        ({"k": {1, 2}}, "is not representable as JSON; it is dropped"),
+        ({"k": float("nan")}, "is not representable as JSON; it is dropped"),
+    ],
+)
+async def test_a_result_that_is_not_a_json_dict_is_dropped(
+    result, warning, caplog
+):  # Review Focus 4
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: result)
+    mcp.add_plugin(DEMO, namespace="kit")
+    detail, _ = await kit_helper(mcp)
+    layers, _ = await plain_kit_helper()
+    assert detail["_meta"] == layers["_meta"]  # the layer's, and FastMCP's serverInfo
+    assert "it is dropped" in caplog.text
+    assert f"plugin demo: agent_meta for agent kit_helper {warning}" in caplog.text
+
+
+async def test_a_raising_agent_meta_leaves_that_agent_unserved(tmp_path, caplog):
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        if name == "a":
+            raise RuntimeError("boom")
+
+    root = write(
+        tmp_path / "p", {"agents/a.md": agent_md("a"), "agents/b.md": agent_md("b")}
+    )
+    plugin = mcp.add_plugin(root)
+    assert plugin.agents == ("b",)
+    assert plugin.agent_files == (AgentFile("b", "agents/b.md", False),)
+    assert ("agents/a.md", "agent_meta failed: boom") in plugin.skipped
+    assert (await listed(mcp))[1] == ["b"]
+    assert (
+        "plugin p: agent_meta failed on agent a, so it is not served: boom"
+        in caplog.text
+    )
+
+
+def test_a_raise_without_a_message_gives_its_type(tmp_path):
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        raise ValueError
+
+    plugin = mcp.add_plugin(DEMO)
+    assert plugin.agents == ()
+    assert ("agents/helper.md", "agent_meta failed: ValueError") in plugin.skipped
+
+
+def test_a_raising_agent_claims_no_name(tmp_path):
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        if plugin.name == "alpha":
+            raise RuntimeError("boom")
+
+    for root, namespace in alpha_beta(tmp_path):
+        mcp.add_plugin(root, namespace=namespace)
+    assert mcp.plugins[0].agents == ()
+    assert mcp.plugins[1].agents == ("review",)
+
+
+def test_a_raise_on_re_entry_is_logged_once(tmp_path, caplog):
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        raise RuntimeError("boom")
+
+    mcp.add_plugin(DEMO)
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    failed = [r for r in caplog.records if "agent_meta failed on" in r.getMessage()]
+    assert len(failed) == 1
+    assert (
+        mcp.plugins[0].skipped.count(("agents/helper.md", "agent_meta failed: boom"))
+        == 1
+    )
+
+
+async def test_agent_meta_stores_a_copy():
+    given = {"k": {"v": 1}}
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: given)
+    mcp.add_plugin(DEMO, namespace="kit")
+    given["k"]["v"] = 2
+    detail, _ = await kit_helper(mcp)
+    assert detail["_meta"]["k"] == {"v": 1}
+
+
+def test_a_plugin_with_agent_meta_stays_the_one_served(tmp_path):
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: {"k": name})
+    demo = mcp.add_plugin(DEMO)
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    assert mcp.plugins[0] is demo
+    assert mcp.plugin_set().keep(demo) is demo
+
+
+async def test_agent_meta_returning_none_serves_the_objects_as_read():
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: None)
+    mcp.add_plugin(DEMO)
+    # Internal on purpose: no copies is selenium-flow's byte parity.
+    read = mcp._plugins.current[0]
+    assert read.plugin is read.read
+    assert read.agents is read.read_agents
+    built = (await mcp._plugins.pinned()).build
+    assert built.agents[0] is read.read_agents[0].item
+
+
+async def test_a_rewritten_build_keeps_the_agents_meta():
+    mcp = QuickMCP("t")
+    mcp.agent_meta(lambda name, plugin: {"io.kubed.mcp-kb/agent": {"name": name}})
+    mcp.add_plugin(DEMO, namespace="kit")
+    mcp.add_rewriter(lambda site, text: text.replace("first.", "before all."))
+    detail, _ = await kit_helper(mcp)
+    assert detail["instructions"].endswith("before all.")
+    assert detail["_meta"]["io.kubed.mcp-kb/agent"] == {"name": "kit_helper"}
+    assert "frontmatter" in detail["_meta"][META_KEY]
+
+
+def test_a_rename_that_agent_meta_fails_is_not_announced(tmp_path, caplog):
+    mcp = QuickMCP("t")
+
+    @mcp.agent_meta
+    def meta(name, plugin):
+        if name == "review@beta":
+            raise RuntimeError("boom")
+
+    for root, namespace in alpha_beta(tmp_path):
+        mcp.add_plugin(root, namespace=namespace)
+    assert mcp.plugins[1].agents == ()
+    assert "serves it as review@beta" not in caplog.text
+
+
+async def test_an_agent_meta_set_later_keeps_the_plugin_held(tmp_path):
+    mcp = QuickMCP("t")
+    demo = mcp.add_plugin(DEMO, namespace="kit")
+    mcp.agent_meta(lambda name, plugin: {"io.kubed.mcp-kb/agent": {"name": name}})
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    assert mcp.plugins[0] is demo
+    assert mcp.plugin_set().keep(demo) is demo
+    detail, _ = await kit_helper(mcp)
+    assert detail["_meta"]["io.kubed.mcp-kb/agent"] == {"name": "kit_helper"}

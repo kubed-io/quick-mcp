@@ -28,6 +28,7 @@ from .container import (
 )
 from .gateway import _TakeThePrefix
 from .plugins import (
+    AgentMeta,
     CommandReader,
     Plugin,
     PluginLoader,
@@ -247,6 +248,25 @@ class QuickMCP:
         command. The default reader is ``kubed.mcp.prompts.read_command``.
         """
         self._plugins.set_command_reader(fn)
+        return fn
+
+    def agent_meta(self, fn: AgentMeta) -> AgentMeta:
+        """Adds ``fn``'s keys to each agent's ``agents/get`` ``_meta``, beside the
+        layer's ``io.kubed/agent``, and returns ``fn``, so it works as a decorator
+        (PLUG-73). A second call replaces the first.
+
+        ``fn(name, plugin)`` runs once per agent when its plugin enters a set, after
+        the agent's name is decided (PLUG-64), with that name and the ``Plugin`` as it
+        enters, and never on a read; so it runs again on every set entry, each
+        ``add_plugin`` included, and must be pure. It returns a dict, or None for
+        nothing to add, and its JSON round trip is what is served. A returned
+        ``io.kubed/agent`` key is dropped with a warning, as is a result that is not a
+        dict or does not survive a trip through JSON. An ``fn`` that raises leaves
+        that agent unserved in that set, logged at error and in the plugin's
+        ``skipped`` as ``agent_meta failed: <reason>``. The ``agents/list`` card is
+        unchanged.
+        """
+        self._plugins.set_agent_meta(fn)
         return fn
 
     def add_loader(self, loader: PluginLoader) -> None:
