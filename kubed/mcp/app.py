@@ -26,6 +26,7 @@ from .container import (
     Recipe,
     _Call,
 )
+from .gateway import _TakeThePrefix
 from .plugins import Plugin, PluginLoader, Plugins, PluginSet, Site, View, _PinScope
 
 T = TypeVar("T")
@@ -125,6 +126,9 @@ class QuickMCP:
         self._plugins = Plugins(self.server)
         # Right inside _CallScope, outside everything that reads plugins.
         self.server.middleware.insert(1, _PinScope(self._plugins))
+        # Inside the pin, so the prefix it takes off is the one the pinned build
+        # writes; outside NameTheIndex and every provider, so none sees a prefix.
+        self.server.middleware.insert(2, _TakeThePrefix())
 
     def websocket_route(
         self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
