@@ -69,12 +69,11 @@ from .agents import (
     SETTINGS,
     Agent,
     AgentsExtension,
-    _survives_json,
     parse_agent,
     served_as,
 )
 from .agents import usable_name as _usable
-from .prompts import read_command
+from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -776,19 +775,32 @@ def _material(
     served: _Served, file: _File, item: Prompt | Agent, text: str
 ) -> _Material:
     """``file`` as a build serves it, ``item`` its prompt or agent as built and
-    ``text`` what it reads as: the one place its resource, and so its row, is made."""
+    ``text`` what it reads as: the one place its resource, and so its row, is made.
+
+    The resource's ``_meta`` is what registers it (PLUG-69, PLUG-70): a prompt's
+    ``io.kubed/prompt``, or everything ``agents/get`` gives as an agent's ``_meta``,
+    its served name added to ``io.kubed/agent``. The row is that alone:
+    ``to_mcp_resource(_meta=...)`` leaves out the ``fastmcp`` key FastMCP's
+    ``get_meta`` always adds, and the tests that compare a row's whole ``_meta`` guard
+    that override.
+    """
     if isinstance(item, Agent):
         description = _text(item.card.get("description"))
+        meta = copy.deepcopy(item.detail["_meta"])
+        meta[META_KEY] = {"name": item.name, **meta[META_KEY]}
     else:
         description = item.description
+        meta = index_meta(item, text)
     resource = TextResource(
         uri=file.uri,
         name=item.name,
         description=description,
         mime_type="text/markdown",
         text=text,
+        meta=meta,
     )
-    return _Material(served, file, text, resource, skills._wire(resource))
+    row = skills._wire(resource.to_mcp_resource(_meta=resource.meta))
+    return _Material(served, file, text, resource, row)
 
 
 def _as_served(file: _File, text: str | None) -> str:

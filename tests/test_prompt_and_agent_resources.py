@@ -7,6 +7,7 @@ import logging
 
 import pytest
 from fastmcp import Client
+from fastmcp.prompts import Prompt
 from gateway_server import kit, over_http
 from mcp_types import INVALID_PARAMS
 from plugin_server import (
@@ -22,7 +23,9 @@ from plugin_server import (
 from skill_server import read_directory, read_json, request
 
 from kubed.mcp import QuickMCP
+from kubed.mcp.agents import META_KEY as AGENT_KEY
 from kubed.mcp.plugins import PluginError, View
+from kubed.mcp.prompts import META_KEY as PROMPT_KEY
 from kubed.mcp.protocol import MCPError
 
 pytestmark = pytest.mark.unit
@@ -793,3 +796,187 @@ async def test_the_extensions_are_unchanged():  # PLUG-71
         "tools",
         "ttlMs",
     ]
+
+
+# Rows that register (PLUG-69, PLUG-70)
+
+
+SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
+
+def by_name(rows: list[dict]) -> dict[str, dict]:
+    """Each prompt row's ``io.kubed/prompt``, by the name it registers."""
+    return {r["_meta"][PROMPT_KEY]["name"]: r["_meta"][PROMPT_KEY] for r in rows}
+
+
+async def test_the_root_index_alone_registers_both_commands(tmp_path):
+    async with Client(flow(tmp_path).server) as client:
+        rows = await read_json(client, "prompts://selenium-flow/_index.json")
+        listed = {
+            p.name: [
+                a.model_dump(mode="json", by_alias=True, exclude_none=True)
+                for a in p.arguments or []
+            ]
+            for p in await client.list_prompts()
+        }
+    assert [set(r["_meta"]) for r in rows] == [{PROMPT_KEY}, {PROMPT_KEY}]
+    found = by_name(rows)
+    assert set(found) == {"build_flow", "repair_flow"}
+    build, repair = found["build_flow"], found["repair_flow"]
+    assert build["arguments"] == listed["build_flow"]
+    assert build["arguments"] == [{"name": "site", "required": True}]
+    assert build["argument-hint"] == "<site>"
+    assert "disable-model-invocation" not in build
+    assert repair["arguments"] == listed["repair_flow"]
+    assert repair["disable-model-invocation"] is True
+    assert "user-invocable" not in repair and "argument-hint" not in repair
+
+
+async def test_a_prompt_files_row_maps_its_address_to_its_name(tmp_path):
+    root = kit_with(tmp_path, "p", {"commands/x.prompt.md": command_md("X.")})
+    async with Client(served((root, "kit")).server) as client:
+        rows = await read_json(client, "prompts://kit/_index.json")
+    (row,) = rows
+    assert row["uri"] == "prompts://kit/x.prompt.md"
+    assert row["_meta"] == {PROMPT_KEY: {"name": "kit_x", "arguments": []}}
+
+
+async def test_a_nested_prompts_row_carries_its_meta(tmp_path):
+    root = kit_with(tmp_path, "p", {"commands/db/migrate.md": command_md("Migrate.")})
+    async with Client(served((root, "kit")).server) as client:
+        index = await read_json(client, "prompts://kit/db/_index.json")
+        rows = await rows_of(client, "prompts://kit/db")
+    assert index == rows
+    assert [r["_meta"][PROMPT_KEY]["name"] for r in rows] == ["kit_db_migrate"]
+
+
+def read_by(tmp_path, text: str) -> QuickMCP:
+    """A server under ``kit`` whose reader makes a plain prompt of every command, its
+    one command ``commands/x.md`` holding ``text``."""
+    mcp = QuickMCP("t")
+    mcp.command_reader(
+        lambda text, path, name, plugin: Prompt.from_function(lambda: "x", name=name)
+    )
+    mcp.add_plugin(write(tmp_path / "p", {"commands/x.md": text}), namespace="kit")
+    return mcp
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Just a body.\n",
+        "---\n- a list\n---\nBody.\n",
+        "---\nargument-hint\n---\nBody.\n",
+        "---\n: [\n---\nBody.\n",
+    ],
+    ids=["no-header", "a-list", "a-string", "bad-yaml"],
+)
+async def test_a_readers_prompt_without_a_header_registers_too(tmp_path, text):
+    # Review Focus 5
+    async with Client(read_by(tmp_path, text).server) as client:
+        (row,) = await read_json(client, "prompts://kit/_index.json")
+    assert row["_meta"] == {PROMPT_KEY: {"name": "kit_x", "arguments": []}}
+
+
+async def test_a_readers_prompt_has_its_files_invocation_keys(tmp_path):
+    text = (
+        "---\nuser-invocable: false\nargument-hint: 2024-01-01\n"
+        "disable-model-invocation: [a, 1]\nother: kept off\n---\nBody.\n"
+    )
+    async with Client(read_by(tmp_path, text).server) as client:
+        (row,) = await read_json(client, "prompts://kit/_index.json")
+    # A YAML date does not survive JSON, so argument-hint is left out.
+    assert row["_meta"] == {
+        PROMPT_KEY: {
+            "name": "kit_x",
+            "arguments": [],
+            "disable-model-invocation": ["a", 1],
+            "user-invocable": False,
+        }
+    }
+
+
+async def test_an_agents_row_is_what_agents_get_gives(tmp_path):
+    mcp = QuickMCP("selenium-flow")
+    mcp.agent_meta(
+        lambda name, plugin: {"io.kubed.mcp-kb/agent": {"library": plugin.namespace}}
+    )
+    mcp.add_plugin(write(tmp_path / "flow", FLOW))
+    async with Client(mcp.server) as client:
+        rows = await read_json(client, "agents://selenium-flow/_index.json")
+        listed = await rows_of(client, "agents://selenium-flow")
+        got = await request(client, "agents/get", name="explorer")
+    (row,) = rows
+    assert listed == rows
+    # The SDK stamps every result with its server's info: that is no agent's key.
+    meta = {k: v for k, v in got["_meta"].items() if k != SERVER_INFO}
+    assert meta["io.kubed.mcp-kb/agent"] == {"library": "selenium-flow"}
+    assert row["_meta"] == {**meta, AGENT_KEY: {"name": "explorer", **meta[AGENT_KEY]}}
+    assert list(row["_meta"][AGENT_KEY]) == ["name", "frontmatter", "skills"]
+
+
+async def test_a_renamed_agents_row_has_its_served_name(tmp_path):
+    async with Client(served(*alpha_beta(tmp_path)).server) as client:
+        rows = await read_json(client, "agents://t/_index.json")
+    assert [(r["uri"], r["_meta"][AGENT_KEY]["name"]) for r in rows] == [
+        ("agents://t/review.md", "review"),
+        ("agents://t/review@beta.md", "review@beta"),
+    ]
+
+
+async def test_a_rewritten_files_row_registers_its_rewritten_text(tmp_path):
+    mcp = flow(tmp_path)
+    mcp.add_rewriter(
+        lambda site, text: text.replace("argument-hint: <site>", "user-invocable: no")
+    )
+    async with Client(mcp.server) as client:
+        rows = await read_json(client, "prompts://selenium-flow/_index.json")
+    build = by_name(rows)["build_flow"]
+    assert build["user-invocable"] is False
+    assert "argument-hint" not in build
+
+
+async def test_the_rows_text_is_prefixed_and_their_fields_are_not(tmp_path):
+    # Review Focus 4
+    async with over_http(kit(tmp_path), header="kb+") as client:
+        index = await request(
+            client, "resources/read", uri="kb+agents://lib/_index.json"
+        )
+        rows = await read_directory(client, uri="kb+agents://lib")
+    text = index["contents"][0]["text"]
+    (indexed,) = json.loads(text)
+    assert indexed["_meta"][AGENT_KEY]["skills"] == {
+        "guide": "kb+skill://lib/guide/SKILL.md"
+    }
+    (row,) = rows["resources"]
+    assert row["uri"] == "agents://lib/scout.md"
+    assert row["_meta"][AGENT_KEY]["name"] == "lib_scout"
+    assert row["_meta"][AGENT_KEY]["skills"] == {"guide": "skill://lib/guide/SKILL.md"}
+
+
+async def test_a_prompts_row_behind_a_prefix_is_unprefixed(tmp_path):
+    async with over_http(kit(tmp_path), header="kb+") as client:
+        prompts = await read_directory(client, uri="kb+prompts://lib")
+    (ask,) = prompts["resources"]
+    assert ask["uri"] == "prompts://lib/ask.md"
+    assert ask["_meta"] == {
+        PROMPT_KEY: {
+            "name": "lib_ask",
+            "arguments": [{"name": "topic", "required": True}],
+        }
+    }
+
+
+@pytest.mark.parametrize("rewritten", [False, True], ids=["as-read", "rewritten"])
+async def test_a_files_read_carries_its_rows_meta(tmp_path, rewritten):
+    # The read and the row are one resource, so their _meta is one.
+    mcp = flow(tmp_path)
+    if rewritten:
+        mcp.add_rewriter(lambda site, text: text.replace("Build", "Make"))
+    async with Client(mcp.server) as client:
+        for scheme in ("prompts", "agents"):
+            index = await read_json(client, f"{scheme}://selenium-flow/_index.json")
+            for row in index:
+                read = await request(client, "resources/read", uri=row["uri"])
+                (content,) = read["contents"]
+                assert content["_meta"] == row["_meta"]
