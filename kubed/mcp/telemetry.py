@@ -83,8 +83,8 @@ class _Signals:
         try:
             if self._profiles is not None and self._profiles.shutdown() is False:
                 log.warning("Profiles did not stop cleanly")
-        except Exception:  # TEL-6: telemetry never stops a server
-            log.exception("Profiles did not stop cleanly")
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("Profiles did not stop cleanly: %s", type(error).__name__)
         finally:
             _running = None
 
@@ -107,8 +107,10 @@ def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
             return None
         _running = _Signals(profiles)
         return _running
-    except Exception:  # TEL-6: telemetry never stops a server
-        log.exception("Telemetry did not start; serving without it")
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "Telemetry did not start; serving without it: %s", type(error).__name__
+        )
         return None
 
 
@@ -144,15 +146,20 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
     except ModuleNotFoundError as error:
         if error.name != "pyroscope":
             # Some other module is missing: a failed start, not a missing package.
-            log.exception("Profiles did not start; serving without them")
+            log.error(
+                "Profiles did not start; serving without them: %s",
+                type(error).__name__,
+            )
             return None
         log.warning(
             "Profiles are on, but pyroscope-io is not installed: "
             "install kubed-mcp[telemetry]"
         )
         return None
-    except Exception:  # TEL-6: a profiler that fails never stops a server
-        log.exception("Profiles did not start; serving without them")
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "Profiles did not start; serving without them: %s", type(error).__name__
+        )
         return None
     if started is False:
         # Not ours to stop: another caller's agent already runs in this process.

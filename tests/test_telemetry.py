@@ -82,6 +82,15 @@ def served(name: str, telemetry: object, **options) -> QuickMCP:
     return mcp
 
 
+def assert_safe(records: list[logging.LogRecord], secret: str) -> None:
+    """No record carries a traceback, and none shows ``secret``."""
+    formatter = logging.Formatter("%(message)s")
+    for record in records:
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert secret not in formatter.format(record)
+
+
 def test_settings_default_to_every_signal_off() -> None:
     settings = TelemetrySettings()
     assert settings.profiles is None
@@ -232,7 +241,7 @@ async def test_a_profiler_that_fails_to_start_is_logged_and_the_server_serves(
     secret = "https://user:s3cret@pyroscope.example.com"
 
     def refuse(**kwargs):
-        raise RuntimeError("agent refused")
+        raise RuntimeError("agent refused at https://user:s3cret@pyroscope.example.com")
 
     monkeypatch.setattr(sys.modules["pyroscope"], "configure", refuse)
     async with Client(
@@ -242,6 +251,8 @@ async def test_a_profiler_that_fails_to_start_is_logged_and_the_server_serves(
     errors = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
     assert [r.levelno for r in errors] == [logging.ERROR]
     assert "s3cret" not in errors[0].getMessage()
+    assert "RuntimeError" in errors[0].getMessage()
+    assert_safe(caplog.records, "s3cret")
     assert "profiles stopped" not in EVENTS
 
 
@@ -249,7 +260,7 @@ async def test_a_profiler_that_fails_to_stop_still_closes_the_container(
     pyroscope, monkeypatch, caplog
 ) -> None:
     def refuse() -> None:
-        raise RuntimeError("agent stuck")
+        raise RuntimeError("agent stuck at https://user:s3cret@pyroscope.example.com")
 
     monkeypatch.setattr(sys.modules["pyroscope"], "shutdown", refuse)
     async with Client(
@@ -257,9 +268,10 @@ async def test_a_profiler_that_fails_to_stop_still_closes_the_container(
     ) as client:
         await client.call_tool("ping", {})
     assert EVENTS[-1] == "monitor stopped"
-    assert [r.levelno for r in caplog.records if r.name == "kubed.mcp.telemetry"] == [
-        logging.ERROR
-    ]
+    records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
+    assert [r.levelno for r in records] == [logging.ERROR]
+    assert "RuntimeError" in records[0].getMessage()
+    assert_safe(caplog.records, "s3cret")
     # The slot is free, so a later start can run its own profiles.
     assert kubed.mcp.telemetry._running is None
 
@@ -342,7 +354,9 @@ async def test_a_module_missing_inside_configure_is_a_failed_start_not_a_missing
 ) -> None:
     def refuse(**kwargs):
         raise ModuleNotFoundError(
-            "No module named 'something_else'", name="something_else"
+            "No module named 'something_else' at "
+            "https://user:s3cret@pyroscope.example.com",
+            name="something_else",
         )
 
     monkeypatch.setattr(sys.modules["pyroscope"], "configure", refuse)
@@ -352,16 +366,21 @@ async def test_a_module_missing_inside_configure_is_a_failed_start_not_a_missing
         assert (await client.call_tool("ping", {})).data == "pong"
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
     assert [r.levelno for r in records] == [logging.ERROR]
+    assert "ModuleNotFoundError" in records[0].getMessage()
+    assert_safe(caplog.records, "s3cret")
 
 
 async def test_a_section_missing_an_attribute_is_a_logged_error_and_the_server_serves(
     pyroscope, caplog
 ) -> None:
-    mcp = served("partial", argparse.Namespace(profiles=ADDRESS))
+    secret = "https://user:s3cret@pyroscope.example.com"
+    mcp = served("partial", argparse.Namespace(profiles=secret))
     async with Client(mcp.server) as client:
         assert (await client.call_tool("ping", {})).data == "pong"
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
     assert [r.levelno for r in records] == [logging.ERROR]
+    assert "AttributeError" in records[0].getMessage()
+    assert_safe(caplog.records, "s3cret")
     assert "profiles stopped" not in EVENTS
 
 
