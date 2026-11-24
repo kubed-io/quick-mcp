@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.plugin_set()` and `mcp.serve(set)` swap a whole set of plugins at once, counted by `mcp.generation`.
 - `mcp.plugin_view(fn)` serves each request only the plugins its view admits.
 - `mcp.add_rewriter(fn)` rewrites the text a server serves, with digests that match.
+- `to_mcp_form` rewrites `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_SKILL_DIR}` and `<plugin>:<skill>` as `skill://` addresses.
 
 ## [0.1.2] - 2026-11-23
 

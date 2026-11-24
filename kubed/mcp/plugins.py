@@ -51,7 +51,16 @@ from fastmcp.server.providers import Provider
 from fastmcp.utilities.versions import VersionSpec
 
 from . import skills
-from ._rewrite import Kind, RewriteFailed, Rewriter, Site, name_of, run, text_of
+from ._rewrite import (
+    Kind,
+    RewriteFailed,
+    Rewriter,
+    Site,
+    name_of,
+    run,
+    text_of,
+    to_mcp_form,
+)
 from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
 from .agents import usable_name as _usable
 from .prompts import FilePrompt, parse_prompt
@@ -67,6 +76,7 @@ __all__ = [
     "Site",
     "View",
     "read_plugin",
+    "to_mcp_form",
 ]
 
 log = logging.getLogger(__name__)

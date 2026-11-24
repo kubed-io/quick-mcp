@@ -10,9 +10,11 @@ item it was rewriting (PLUG-59).
 from __future__ import annotations
 
 import mimetypes
+import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import unquote
 
 # FastMCP registers text/markdown for .md here: a file is text when it is served so.
 import fastmcp.skills.provider  # noqa: F401
@@ -87,4 +89,53 @@ def run(rewriters: Sequence[Rewriter], site: Site, text: str) -> str:
             reason = f"returned {type(result).__name__}, not str"
             raise RewriteFailed(name_of(rewriter), reason)
         text = result
+    return text
+
+
+# A qualified name, ``<plugin>:<skill>``, after kb's ``catalogue/names.py``: not inside
+# a path, a URL, a placeholder or a longer word, and not a file (``kit:writing.md``).
+_QUALIFIED = re.compile(
+    r"(?<![\w./:@+~%{$#-])(?P<slash>/)?(?P<plugin>[\w-]+(?:\.[\w-]+)*):(?P<skill>[\w-]+)"
+    r"(?![\w:/~%+@-])(?!\.[\w.~%+@-])"
+)
+# What may not follow a folder in a path, so ``writing`` does not match ``writing.md``.
+_BOUNDARY = r"(?![\w~%+@-])(?!\.[\w.~%+@-])"
+_ROOT = "${CLAUDE_PLUGIN_ROOT}"
+_SKILL_DIR = "${CLAUDE_SKILL_DIR}"
+_ENTRY = "/SKILL.md"
+
+
+def _qualified(site: Site, match: re.Match[str]) -> str:
+    if match["slash"]:
+        return match[0]  # a command: stays as written
+    for plugin in site.admitted:
+        if plugin.name != match["plugin"]:
+            continue
+        for uri in plugin.skills:
+            folder = uri[: -len(_ENTRY)] if uri.endswith(_ENTRY) else None
+            if (
+                folder is not None
+                and unquote(folder.rsplit("/", 1)[-1]) == match["skill"]
+            ):
+                return uri
+    return match[0]
+
+
+def to_mcp_form(site: Site, text: str) -> str:
+    """``text`` with a plugin's local forms written as the addresses it is served at
+    (PLUG-60): a qualified name of an admitted plugin's skill, ``${CLAUDE_PLUGIN_ROOT}``
+    at or below a skill folder, and ``${CLAUDE_SKILL_DIR}`` inside a skill. What names
+    nothing served stays as written."""
+    text = _QUALIFIED.sub(lambda match: _qualified(site, match), text)
+    folders = sorted((key for key in site.skills if key), key=len, reverse=True)
+    if folders:
+        alternation = "|".join(re.escape(key) for key in folders)
+        pattern = re.compile(re.escape(_ROOT) + "/(" + alternation + ")" + _BOUNDARY)
+        text = pattern.sub(lambda match: site.skills[match[1]], text)
+    if "" in site.skills:
+        text = re.sub(re.escape(_ROOT) + "(?=/)", lambda _: site.skills[""], text)
+    if site.kind == "skill":
+        own = [key for key in site.skills if not key or site.path.startswith(key + "/")]
+        if own:
+            text = text.replace(_SKILL_DIR, site.skills[max(own, key=len)])
     return text

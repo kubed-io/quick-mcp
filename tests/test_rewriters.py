@@ -7,13 +7,15 @@ import hashlib
 import json
 import logging
 import shutil
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
 from plugin_server import DEMO, ENTRY, GUIDE, copy, listed, served
 from skill_server import read_bytes, request
 
-from kubed.mcp.plugins import View
+from kubed.mcp.plugins import Components, Plugin, Site, View, to_mcp_form
 from kubed.mcp.protocol import MCPError
 
 pytestmark = pytest.mark.unit
@@ -294,3 +296,104 @@ async def test_the_chain_has_an_end_that_runs_last(monkeypatch):  # #28's seam (
     assert (
         "gw+skill://demo-guide/references/GUIDE.md" in entry and "early+" not in entry
     )
+
+
+KIT = Plugin(
+    name="kit",
+    description="A kit.",
+    version="1",
+    root=Path("/kit"),
+    components=Components(),
+    namespace="kit",
+    skills=("skill://kit/writing/SKILL.md", "skill://kit/writing-tools/SKILL.md"),
+)
+FOLDERS = {
+    "skills/writing": "skill://kit/writing",
+    "skills/writing-tools": "skill://kit/writing-tools",
+}
+
+
+def site(kind="skill", path="skills/writing/SKILL.md", admitted=(KIT,), skills=FOLDERS):
+    return Site(
+        KIT, "kit", kind, path, "skill://kit/writing/SKILL.md", None, admitted, skills
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "${CLAUDE_PLUGIN_ROOT}/skills/writing/refs/a.md",
+            "skill://kit/writing/refs/a.md",
+        ),
+        (
+            "${CLAUDE_PLUGIN_ROOT}/skills/writing-tools/x.md",
+            "skill://kit/writing-tools/x.md",
+        ),
+        ("${CLAUDE_PLUGIN_ROOT}/skills/writing", "skill://kit/writing"),
+        ("${CLAUDE_SKILL_DIR}/refs/a.md", "skill://kit/writing/refs/a.md"),
+        ("Use kit:writing.", "Use skill://kit/writing/SKILL.md."),
+        ("(kit:writing)", "(skill://kit/writing/SKILL.md)"),
+        ("`kit:writing-tools`", "`skill://kit/writing-tools/SKILL.md`"),
+    ],
+)
+def test_local_forms_become_addresses(text, expected):
+    assert to_mcp_form(site(), text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "${CLAUDE_PLUGIN_ROOT}",
+        "${CLAUDE_PLUGIN_ROOT}/skills/writing.md",
+        "${CLAUDE_PLUGIN_ROOT}/commands/x.md",
+        "/kit:writing",
+        "https://kit:writing",
+        "a/kit:writing",
+        "kit:writing.md",
+        "kit:writing/x",
+        "kit:writing:x",
+        "${input:topic}",
+        "#tool:x",
+        "kit:missing",
+        "other:writing",
+    ],
+)
+def test_what_names_nothing_served_stays_as_written(text):
+    assert to_mcp_form(site(), text) == text
+
+
+def test_the_skill_dir_is_only_a_skills():
+    command = site(kind="command", path="commands/x.md")
+    assert to_mcp_form(command, "${CLAUDE_SKILL_DIR}/a") == "${CLAUDE_SKILL_DIR}/a"
+
+
+def test_a_name_resolves_only_among_the_admitted_the_first_winning():
+    other = replace(KIT, namespace="kit2", skills=("skill://kit2/writing/SKILL.md",))
+    assert to_mcp_form(site(admitted=()), "kit:writing") == "kit:writing"
+    both = site(admitted=(other, KIT))
+    assert to_mcp_form(both, "kit:writing") == "skill://kit2/writing/SKILL.md"
+
+
+def test_a_skill_at_the_root_takes_every_path():
+    solo = site(path="SKILL.md", skills={"": "skill://kit/solo"})
+    assert (
+        to_mcp_form(solo, "${CLAUDE_PLUGIN_ROOT}/refs/a.md")
+        == "skill://kit/solo/refs/a.md"
+    )
+
+
+async def test_a_server_serves_its_plugin_in_mcp_form(tmp_path):
+    root = copy(
+        tmp_path,
+        files={
+            "commands/read.md": "---\ndescription: R.\n---\n"
+            "Read ${CLAUDE_PLUGIN_ROOT}/skills/demo-guide/references/GUIDE.md"
+            " and demo:demo-guide.\n"
+        },
+    )
+    mcp = served((root, None))
+    mcp.add_rewriter(to_mcp_form)
+    async with Client(mcp.server) as client:
+        rendered = await client.get_prompt("read")
+    assert rendered.messages[0].content.text == f"Read {GUIDE} and {ENTRY}.\n"
