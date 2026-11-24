@@ -62,12 +62,20 @@ from ._rewrite import (
     text_of,
     to_mcp_form,
 )
-from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
+from .agents import (
+    EXTENSION_ID,
+    SETTINGS,
+    Agent,
+    AgentsExtension,
+    parse_agent,
+    served_as,
+)
 from .agents import usable_name as _usable
 from .prompts import read_command
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
+    "AgentFile",
     "CommandReader",
     "Components",
     "LocalLoader",
@@ -97,6 +105,10 @@ class PluginError(ValueError):
 # What reads a command file (PLUG-62): ``fn(text, path, name, plugin)`` gives the
 # ``Prompt`` to serve under ``name``, or the reason the command is not served.
 CommandReader = Callable[[str, str, str, "Plugin"], Prompt | str]
+
+# What adds a server's own keys to an agent's ``_meta`` (PLUG-73): ``fn(name, plugin)``
+# with the agent's name in its set and the plugin as it enters the set.
+AgentMeta = Callable[[str, "Plugin"], "Mapping[str, object] | None"]
 
 
 def _read_command(
@@ -175,13 +187,26 @@ class Components:
 
 
 @dataclass(frozen=True)
+class AgentFile:
+    """One agent a plugin serves in its set (PLUG-74): ``name`` the served name,
+    ``path`` its file's from the plugin root, ``/``-separated, and ``renamed`` True when
+    it is served as ``<name>@<plugin>`` (PLUG-64)."""
+
+    name: str
+    path: str
+    renamed: bool = False
+
+
+@dataclass(frozen=True)
 class Plugin:
     """A plugin: its metadata, where it was read from, and what it serves.
 
     ``namespace`` is the one it is served under. ``skills`` are the ``skill://`` URIs of
-    the ``SKILL.md`` of each skill served, ``prompts`` and ``agents`` the names served.
-    ``skipped`` is each skill folder, command file and agent file not served, as its
-    path from the root and the reason, in the order read.
+    the ``SKILL.md`` of each skill served, ``prompts`` the names served and ``agents``
+    the names served in its set (PLUG-64). ``skipped`` is each skill folder, command
+    file and agent file not served, as its path from the root and the reason, in the
+    order read, then the agents its set skips. ``agent_files`` is each agent served,
+    with its file, in path order.
     """
 
     name: str
@@ -195,6 +220,7 @@ class Plugin:
     prompts: tuple[str, ...] = ()
     agents: tuple[str, ...] = ()
     skipped: tuple[tuple[str, str], ...] = ()
+    agent_files: tuple[AgentFile, ...] = ()
 
 
 def _inside(path: Path, base: Path) -> Path | None:
@@ -484,7 +510,9 @@ class _File:
 
     ``path`` is root-relative, ``uri`` the ``prompts://`` or ``agents://`` address a
     rewriter is shown, ``data`` the raw bytes and ``text`` them as ``read_text``
-    gives them. ``stem`` and ``folders`` are what ``parse_agent`` names it by.
+    gives them. ``stem`` and ``folders`` are what ``parse_agent`` names it by, and
+    ``read_name`` an agent's name as parsed, which its set may serve otherwise
+    (PLUG-64); ``meta`` the keys its set adds to an agent's ``_meta`` (PLUG-73).
     """
 
     path: str
@@ -494,6 +522,8 @@ class _File:
     item: Prompt | Agent
     stem: str
     folders: tuple[str, ...]
+    read_name: str = ""
+    meta: Mapping[str, object] = MappingProxyType({})
 
 
 def _decoded(data: bytes) -> str:
@@ -546,6 +576,8 @@ class _Served:
     ``skill_dirs`` maps a catalogue key to the skill's root-relative folder (``""``
     for the root). ``by_name`` and ``prefix`` are what its agents were parsed with,
     ``reader`` what its commands were read with, and what a build reads them with.
+    ``plugin`` and ``agents`` are as its set serves them (``_enter``); ``read`` and
+    ``read_agents`` as read, before any set.
     """
 
     plugin: Plugin
@@ -556,6 +588,8 @@ class _Served:
     by_name: Mapping[str, str]
     prefix: str
     reader: CommandReader
+    read: Plugin
+    read_agents: tuple[_File, ...]
 
 
 class _Skills(skills.EntryOnlySkillProvider):
@@ -756,6 +790,77 @@ def _owned(served: _Served) -> dict[str, str]:
     }
 
 
+def _enter(
+    served: _Served, owners: Mapping[str, str], meta: AgentMeta | None
+) -> _Served:
+    """``served`` as it enters a set whose ``owners`` are given (PLUG-64).
+
+    Built from the plugin and agents as read, never as an earlier set served them, so
+    each entry is decided afresh. Names come first: an agent keeps its read name when
+    the set has none of it, else is served as ``<name>@<plugin>``, else is skipped,
+    taken or not usable. ``meta`` is for each agent's own ``_meta`` keys after that,
+    on the plugin so named (PLUG-73), and is not run yet. A rename's or a skip's
+    warning is logged only when the plugin as last served did not have it, so
+    re-entering does not warn again. With nothing
+    renamed or skipped this is the ``_Served`` read; with the outcome of the last
+    entry, ``served`` itself, so a ``Plugin`` a server holds stays the one served.
+    """
+    del meta  # PLUG-73 is not served yet
+    read = served.read
+    last = served.plugin
+    agents: list[_File] = []
+    files: list[AgentFile] = []
+    skipped = list(read.skipped)
+    changed = False
+    for file in served.read_agents:
+        name = file.item.name
+        owner = owners.get(f"agent:{name}")
+        if owner is None:
+            agents.append(file)
+            files.append(AgentFile(name, file.path))
+            continue
+        changed = True
+        renamed = f"{name}@{read.name}"
+        held = owners.get(f"agent:{renamed}")
+        if not _usable(read.name):
+            reason = f"agent name {renamed!r} is not a usable name"
+        elif held is not None:
+            reason = f"agent {renamed} is already served by plugin {held}"
+        else:
+            if renamed not in last.agents:
+                log.warning(
+                    "agent %s is already served by plugin %s, so plugin %s serves it "
+                    "as %s",
+                    name,
+                    owner,
+                    read.name,
+                    renamed,
+                )
+            agents.append(replace(file, item=served_as(file.item, renamed, file.meta)))
+            files.append(AgentFile(renamed, file.path, renamed=True))
+            continue
+        if (file.path, reason) not in last.skipped:
+            log.warning(
+                "plugin %s: agent file %s is skipped: %s", read.name, file.path, reason
+            )
+        skipped.append((file.path, reason))
+
+    if not changed:
+        if last is read:
+            return served
+        return replace(served, plugin=read, agents=served.read_agents)
+    plugin = replace(
+        read,
+        agents=tuple(file.item.name for file in agents),
+        agent_files=tuple(files),
+        skipped=tuple(skipped),
+    )
+    entered = tuple(agents)
+    if plugin == last and entered == served.agents:
+        return served
+    return replace(served, plugin=plugin, agents=entered)
+
+
 class _Renderer(skills.EntryOnlySkillProvider):
     """One skill of a rewritten build, alone: what its indexes are rendered from.
 
@@ -913,8 +1018,9 @@ class _Rewrite:
         return prompt
 
     def agent(self, served: _Served, file: _File) -> Agent | None:
-        """An agent, rewritten: the one read when its text is unchanged, else
-        re-parsed, failed when it no longer parses or is named otherwise."""
+        """An agent, rewritten: the one served when its text is unchanged, else
+        re-parsed and served under the name its set gave it (PLUG-64), failed when it
+        no longer parses or is named otherwise than it was read."""
         item = file.item
         what = f"agent {item.name}"
         site = self._site(served, "agent", file.path, file.uri)
@@ -929,11 +1035,11 @@ class _Rewrite:
         if isinstance(agent, str):
             self._failed(served, None, file.path, what, agent)
             return None
-        if agent.name != item.name:
-            reason = f"its name is now {agent.name!r}, not {item.name!r}"
+        if agent.name != file.read_name:
+            reason = f"its name is now {agent.name!r}, not {file.read_name!r}"
             self._failed(served, None, file.path, what, reason)
             return None
-        return agent
+        return served_as(agent, item.name, file.meta)
 
     async def indexes(
         self, served: _Served, key: str, renderer: _Renderer
@@ -965,9 +1071,11 @@ class PluginSet:
     ``add`` reads and checks a plugin as ``add_plugin`` does and ``keep`` carries one
     the server serves now, unread. A clash is checked against the plugins in this set
     alone, so a set that leaves a plugin out may add another that serves the same
-    thing. A refused plugin raises and leaves the set unchanged. Nothing here is
-    served until ``mcp.serve(set)``; the set is then a snapshot, and adding to it
-    afterwards changes nothing served.
+    thing. A skill URI or a prompt name served already refuses the plugin; an agent
+    name is renamed or skipped instead, decided as the plugin enters the set
+    (PLUG-64), so each returns the plugin as it entered. A refused plugin raises and
+    leaves the set unchanged. Nothing here is served until ``mcp.serve(set)``; the
+    set is then a snapshot, and adding to it afterwards changes nothing served.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -990,13 +1098,12 @@ class PluginSet:
         """Reads and checks the plugin at ``address`` as ``add_plugin`` does (PLUG-2,
         PLUG-3) and adds it to the set. A refused plugin raises its ``PluginError``."""
         served = self._plugins._load(address, namespace, manifest, self._owners)
-        self._carry(served)
-        return served.plugin
+        return self._carry(served).plugin
 
     def keep(self, plugin: Plugin) -> Plugin:
         """Carries a plugin the server serves now into the set, without reading it
-        again. A plugin not served now is a ``ValueError``; one that clashes with the
-        set is a ``PluginError``."""
+        again, and returns it as it entered (PLUG-64). A plugin not served now is a
+        ``ValueError``; one that clashes with the set is a ``PluginError``."""
         for served in self._plugins.current:
             if served.plugin is plugin:
                 break
@@ -1006,21 +1113,26 @@ class PluginSet:
                 "this server serves"
             )
         try:
-            self._carry(served)
+            entered = self._carry(served)
         except PluginError as exc:
             raise PluginError(f"plugin {plugin.address} is not served: {exc}") from None
-        return plugin
+        return entered.plugin
 
-    def _carry(self, served: _Served) -> None:
-        """Adds ``served`` to the set, refused whole when any of it is owned already."""
-        owned = _owned(served)
-        for key, _ in owned.items():
+    def _carry(self, served: _Served) -> _Served:
+        """Adds ``served`` to the set as it enters it, and returns that: refused whole
+        when a skill or a prompt of it is owned already, its agents named by the set
+        (PLUG-64)."""
+        for key in _owned(served):
+            if key.startswith("agent:"):
+                continue
             owner = self._owners.get(key)
             if owner is not None:
                 what = key if key.startswith("skill://") else key.replace(":", " ", 1)
                 raise PluginError(f"{what} is already served by plugin {owner}")
-        self._owners.update(owned)
-        self._served.append(served)
+        entered = _enter(served, self._owners, None)
+        self._owners.update(_owned(entered))
+        self._served.append(entered)
+        return entered
 
 
 class Plugins:
@@ -1338,16 +1450,20 @@ class Plugins:
             prompts=tuple(file.item.name for file in read.prompts),
             agents=tuple(file.item.name for file in read.agents),
             skipped=tuple(read.skipped),
+            agent_files=tuple(AgentFile(f.item.name, f.path) for f in read.agents),
         )
+        agents = tuple(read.agents)
         return _Served(
             plugin=plugin,
             catalogue=dict(read.catalogue),
             skill_dirs=dict(read.skill_dirs),
             prompts=tuple(read.prompts),
-            agents=tuple(read.agents),
+            agents=agents,
             by_name=dict(read.by_name),
             prefix=read.prefix,
             reader=reader,
+            read=plugin,
+            read_agents=agents,
         )
 
     def _claim(
@@ -1494,7 +1610,7 @@ class Plugins:
                 seen,
                 path,
                 skip,
-                owners,
+                {},  # across plugins, the set names agents (PLUG-64)
             ):
                 agents.append(
                     _File(
@@ -1505,6 +1621,7 @@ class Plugins:
                         item=agent,
                         stem=path.stem,
                         folders=tuple(segments),
+                        read_name=agent.name,
                     )
                 )
         return _Read(

@@ -158,6 +158,23 @@ def parse_agent(
     return Agent(name=name, card=card, detail=detail)
 
 
+def served_as(agent: Agent, name: str, meta: Mapping[str, object]) -> Agent:
+    """``agent`` served under ``name``, ``meta``'s keys added to its ``_meta``.
+
+    The card's ``name`` and the definition's ``agent`` are ``name``. The result's dicts
+    are copies, so ``agent``'s are untouched; ``agent`` itself when ``name`` is its own
+    and ``meta`` is empty.
+    """
+    if name == agent.name and not meta:
+        return agent
+    card = copy.deepcopy(agent.card)
+    detail = copy.deepcopy(agent.detail)
+    card["name"] = name
+    detail["agent"] = name
+    detail.setdefault("_meta", {}).update(copy.deepcopy(dict(meta)))
+    return Agent(name=name, card=card, detail=detail)
+
+
 def complete(**fields: object) -> dict:
     """An extension result in the envelope the Skills extension's results share."""
     return {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", **fields}

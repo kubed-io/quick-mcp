@@ -29,7 +29,13 @@ from skill_server import request
 
 from kubed.mcp import QuickMCP
 from kubed.mcp.agents import EXTENSION_ID, META_KEY
-from kubed.mcp.plugins import LocalLoader, Plugin, PluginError, read_plugin
+from kubed.mcp.plugins import (
+    AgentFile,
+    LocalLoader,
+    Plugin,
+    PluginError,
+    read_plugin,
+)
 from kubed.mcp.protocol import MCPError
 from kubed.mcp.skills import EntryOnlySkillProvider
 
@@ -573,6 +579,7 @@ def test_the_registry_is_the_plugins_served():
             skills=(ENTRY,),
             prompts=("greet",),
             agents=("helper",),
+            agent_files=(AgentFile("helper", "agents/helper.md"),),
         ),
     )
 

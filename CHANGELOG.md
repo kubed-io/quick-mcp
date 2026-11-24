@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A server behind a multiplexing gateway takes its `X-MCP-Resource-Prefix` (or `?prefix=`) off the addresses clients send and writes it into the text it serves.
 - `kubed.mcp.gateway.prefix()` and `prefixed(text, prefix)` prefix a server's own text the same way.
 - `mcp.command_reader(fn)` reads a server's own command dialects as prompts.
+- Same-named agents from two plugins are both served, the later as `name@plugin`.
+- `Plugin.agent_files` gives each agent's file and whether it was renamed.
 
 ### Changed
 

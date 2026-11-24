@@ -1,18 +1,24 @@
-"""Readers and names: how a plugin's commands are read (PLUG-62) and its prompts and
-agents named (PLUG-63)."""
+"""Readers and names: how a plugin's commands are read (PLUG-62), its prompts and agents
+named (PLUG-63), and a clashing agent renamed when its plugin enters a set (PLUG-64,
+PLUG-65, PLUG-74)."""
 
 from __future__ import annotations
+
+import json
 
 import pytest
 from fastmcp import Client
 from fastmcp.prompts import Message, Prompt, PromptResult
 from gateway_server import KIT_TREE, over_http
 from mcp_types import ImageContent
-from plugin_server import DEMO, ENTRY, command_md, listed, served, write
+from plugin_server import DEMO, ENTRY, agent_md, command_md, listed, served, write
+from skill_server import request
 
 from kubed.mcp import QuickMCP
-from kubed.mcp.plugins import PluginError
+from kubed.mcp.agents import parse_agent, served_as
+from kubed.mcp.plugins import AgentFile, PluginError
 from kubed.mcp.prompts import read_command
+from kubed.mcp.protocol import MCPError
 
 pytestmark = pytest.mark.unit
 
@@ -311,3 +317,146 @@ async def test_a_readers_render_override_is_served_behind_a_prefix(tmp_path):
     async with over_http(mcp, header="kb+") as client:
         said = (await client.get_prompt("lib_ask", {})).messages[0].content.text
     assert said == "see kb+skill://lib/guide/SKILL.md"
+
+
+# ---- agents renamed on set entry (PLUG-64, PLUG-65, PLUG-74) -----------------------
+
+
+def alpha_beta(tmp_path, *more):
+    """Plugins alpha and beta, named by manifest, each with agents/review.md, both
+    under the server's name; then ``more``, more (root, namespace) pairs."""
+    return [
+        (
+            write(
+                tmp_path / name,
+                {
+                    ".claude-plugin/plugin.json": json.dumps({"name": name}),
+                    "agents/review.md": agent_md("review"),
+                },
+            ),
+            None,
+        )
+        for name in ("alpha", "beta")
+    ] + list(more)
+
+
+async def test_a_second_plugins_agent_is_served_renamed(tmp_path, caplog):
+    mcp = served(*alpha_beta(tmp_path))
+    assert (await listed(mcp))[1] == ["review", "review@beta"]
+    assert mcp.plugins[1].agents == ("review@beta",)
+    assert mcp.plugins[1].agent_files == (
+        AgentFile("review@beta", "agents/review.md", True),
+    )
+    assert mcp.plugins[0].agent_files == (
+        AgentFile("review", "agents/review.md", False),
+    )
+    async with Client(mcp.server) as client:
+        detail = await request(client, "agents/get", name="review@beta")
+    assert detail["agent"] == "review@beta"
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    warned = [r for r in caplog.records if "serves it as review@beta" in r.getMessage()]
+    assert [r.getMessage() for r in warned] == [
+        "agent review is already served by plugin alpha, so plugin beta serves it as "
+        "review@beta"
+    ]
+
+
+def test_a_renamed_plugin_stays_the_one_served(tmp_path):
+    mcp = served(*alpha_beta(tmp_path))
+    beta = mcp.plugins[1]
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    assert mcp.plugins[1] is beta  # beta re-entered as it was, so keep() still finds it
+    staging = mcp.plugin_set()
+    staging.keep(mcp.plugins[0])
+    assert staging.keep(beta) is beta
+
+
+async def test_a_kept_plugin_gets_its_plain_name_back(tmp_path):
+    mcp = served(*alpha_beta(tmp_path))
+    staging = mcp.plugin_set()
+    kept = staging.keep(mcp.plugins[1])
+    mcp.serve(staging)
+    assert kept.agents == ("review",)
+    assert kept.agent_files == (AgentFile("review", "agents/review.md", False),)
+    assert mcp.plugins == (kept,)
+    assert (await listed(mcp))[1] == ["review"]
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError) as caught:
+            await request(client, "agents/get", name="review@beta")
+        assert (await request(client, "agents/get", name="review"))["agent"] == (
+            "review"
+        )
+    assert caught.value.error.message == "Agent not found"
+
+
+async def test_a_third_clash_skips_just_that_agent(tmp_path, caplog):
+    mcp = served(*alpha_beta(tmp_path))
+    again = write(
+        tmp_path / "again",
+        {
+            ".claude-plugin/plugin.json": json.dumps({"name": "beta"}),
+            "agents/review.md": agent_md("review"),
+            "agents/other.md": agent_md("other"),
+        },
+    )
+    third = mcp.add_plugin(again)
+    assert third.agents == ("other",)
+    assert third.agent_files == (AgentFile("other", "agents/other.md", False),)
+    reason = "agent review@beta is already served by plugin beta"
+    assert ("agents/review.md", reason) in third.skipped
+    assert f"plugin beta: agent file agents/review.md is skipped: {reason}" in (
+        caplog.text
+    )
+    assert (await listed(mcp))[1] == ["other", "review", "review@beta"]
+
+
+def test_a_rename_needs_a_usable_plugin_name(tmp_path):  # Review Focus 3
+    mcp = served(*alpha_beta(tmp_path)[:1])
+    late = mcp.add_plugin(
+        write(
+            tmp_path / "my plugin",
+            {"agents/review.md": agent_md("review"), "commands/x.md": command_md()},
+        )
+    )
+    assert late.name == "my plugin"
+    assert late.agents == () and late.prompts == ("x",)
+    assert late.agent_files == ()
+    assert (
+        "agents/review.md",
+        "agent name 'review@my plugin' is not a usable name",
+    ) in late.skipped
+
+
+def test_a_skip_is_warned_of_once(tmp_path, caplog):
+    mcp = served(*alpha_beta(tmp_path)[:1])
+    mcp.add_plugin(
+        write(tmp_path / "my plugin", {"agents/review.md": agent_md("review")})
+    )
+    mcp.add_plugin(write(tmp_path / "gamma", {"commands/x.md": command_md()}))
+    skips = [r for r in caplog.records if "is not a usable name" in r.getMessage()]
+    assert len(skips) == 1
+
+
+async def test_a_rewritten_build_serves_the_renamed_agent(tmp_path):  # Review Focus 2
+    mcp = served(*alpha_beta(tmp_path))
+    mcp.add_rewriter(lambda site, text: text.replace("Go.", "Went."))
+    assert (await listed(mcp))[1] == ["review", "review@beta"]
+    async with Client(mcp.server) as client:
+        detail = await request(client, "agents/get", name="review@beta")
+    assert detail["agent"] == "review@beta"
+    assert detail["instructions"] == "Went."
+
+
+def test_a_read_plugin_names_each_agent_file():
+    plugin = served((DEMO, None)).plugins[0]
+    assert plugin.agent_files == (AgentFile("helper", "agents/helper.md", False),)
+
+
+def test_served_as_leaves_the_agent_given_untouched():
+    agent = parse_agent(agent_md("review"))
+    card, detail = json.dumps(agent.card), json.dumps(agent.detail)
+    renamed = served_as(agent, "review@beta", {"io.example/x": {"a": 1}})
+    assert renamed.name == renamed.card["name"] == renamed.detail["agent"]
+    assert renamed.detail["_meta"]["io.example/x"] == {"a": 1}
+    assert (json.dumps(agent.card), json.dumps(agent.detail)) == (card, detail)
+    assert served_as(agent, "review", {}) is agent
