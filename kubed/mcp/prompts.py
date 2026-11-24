@@ -84,7 +84,16 @@ def load_prompt(path: Path, name: str | None = None) -> FilePrompt:
     does not parse, and ``OSError`` or ``UnicodeDecodeError`` on a file that cannot be
     read.
     """
-    split = split_frontmatter(path.read_text(encoding="utf-8"))
+    return parse_prompt(path.read_text(encoding="utf-8"), name or path.stem)
+
+
+def parse_prompt(text: str, name: str) -> FilePrompt:
+    """A command file's ``text`` as a prompt named ``name``.
+
+    Raises ``ValueError`` on anything malformed and ``yaml.YAMLError`` on a header that
+    does not parse.
+    """
+    split = split_frontmatter(text)
     if split is None:
         raise ValueError("no YAML frontmatter")
     meta, body = split
@@ -120,7 +129,7 @@ def load_prompt(path: Path, name: str | None = None) -> FilePrompt:
         raise ValueError(f"placeholders with no argument: {', '.join(undeclared)}")
 
     return FilePrompt(
-        name=name or path.stem,
+        name=name,
         description=" ".join(str(meta.get("description", "")).split()) or None,
         arguments=arguments,
         template=body,

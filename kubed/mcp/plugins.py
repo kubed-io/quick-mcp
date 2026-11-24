@@ -15,6 +15,8 @@ prompts (``kubed.mcp.prompts``) and agents through the agents extension
 (``kubed.mcp.agents``). A server has one provider of each kind, whatever its plugins,
 and each reads what its request is pinned to: the plugins served when the request
 began that its view admits (``mcp.plugin_view``), built once per build key and reused.
+A build runs the server's rewriters (``mcp.add_rewriter``) over the text it serves, from
+what was read and never from the disk.
 The layout and names are Claude Code's: a skill is one folder below ``skills/``, while
 commands and agents are files at any depth, each folder adding a name segment, Claude
 Code's ``:`` written ``_`` (``commands/db/migrate.md`` is ``db_migrate``). A plugin
@@ -42,14 +44,17 @@ import anyio
 import yaml
 from fastmcp import FastMCP
 from fastmcp.prompts import Prompt
-from fastmcp.resources import TextResource
+from fastmcp.resources import Resource, TextResource
+from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
+from fastmcp.utilities.versions import VersionSpec
 
 from . import skills
+from ._rewrite import Kind, RewriteFailed, Rewriter, Site, name_of, run, text_of
 from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
 from .agents import usable_name as _usable
-from .prompts import FilePrompt, load_prompt
+from .prompts import FilePrompt, parse_prompt
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -59,6 +64,7 @@ __all__ = [
     "PluginError",
     "PluginLoader",
     "PluginSet",
+    "Site",
     "View",
     "read_plugin",
 ]
@@ -432,13 +438,51 @@ def _namespace(namespace: str | None, server: str) -> str:
     return trimmed
 
 
+@dataclass(frozen=True)
+class _File:
+    """One command or agent file, as read: kept so a build can re-parse it from
+    memory.
+
+    ``path`` is root-relative, ``uri`` the ``prompts://`` or ``agents://`` address a
+    rewriter is shown, ``data`` the raw bytes and ``text`` them as ``read_text``
+    gives them. ``stem`` and ``folders`` are what ``parse_agent`` names it by.
+    """
+
+    path: str
+    uri: str
+    data: bytes
+    text: str
+    item: FilePrompt | Agent
+    stem: str
+    folders: tuple[str, ...]
+
+
+def _decoded(data: bytes) -> str:
+    """``data`` as ``read_text`` gives it: UTF-8, its newlines translated."""
+    return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _file_uri(scheme: str, namespace: str, folders: Iterable[str], name: str) -> str:
+    """The address of a command or agent file: its path below its folder, under the
+    namespace."""
+    return f"{scheme}://{quote('/'.join((namespace, *folders, name)), safe='/')}"
+
+
+def _joined(*parts: str) -> str:
+    """Root-relative path segments joined, the root ``""`` left out."""
+    return "/".join(part for part in parts if part)
+
+
 @dataclass
 class _Read:
     """A plugin's kinds, read and checked, before anything is served."""
 
     catalogue: dict[str, skills.Skill]
-    prompts: list[FilePrompt]
-    agents: list[Agent]
+    skill_dirs: dict[str, str]
+    prompts: list[_File]
+    agents: list[_File]
+    by_name: dict[str, str]
+    prefix: str
     skipped: list[tuple[str, str]]
 
 
@@ -458,12 +502,19 @@ class _Skip:
 
 @dataclass(frozen=True)
 class _Served:
-    """One plugin as served: the plugin, and what it serves of each kind."""
+    """One plugin as served: the plugin, and what it serves of each kind.
+
+    ``skill_dirs`` maps a catalogue key to the skill's root-relative folder (``""``
+    for the root). ``by_name`` and ``prefix`` are what its agents were parsed with.
+    """
 
     plugin: Plugin
     catalogue: Mapping[str, skills.Skill]
-    prompts: tuple[FilePrompt, ...]
-    agents: tuple[Agent, ...]
+    skill_dirs: Mapping[str, str]
+    prompts: tuple[_File, ...]
+    agents: tuple[_File, ...]
+    by_name: Mapping[str, str]
+    prefix: str
 
 
 class _Skills(skills.EntryOnlySkillProvider):
@@ -479,6 +530,17 @@ class _Skills(skills.EntryOnlySkillProvider):
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
+
+    async def _get_resource(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> Resource | None:
+        # A rewritten build holds its indexes, rendered and rewritten when it was
+        # made: one it does not hold is missing, never rendered here unrewritten.
+        if uri.startswith("skill://") and skills._is_index(uri):
+            build = (await self._plugins.pinned()).build
+            if build.rewritten:
+                return build.indexes.get(uri)
+        return await super()._get_resource(uri, version)
 
 
 class _Prompts(Provider):
@@ -652,6 +714,160 @@ def _owned(served: _Served) -> dict[str, str]:
     }
 
 
+class _Rewrite:
+    """One build's rewriting: ``chain`` run over what each admitted plugin serves.
+
+    Each method gives what is served in place of one item, or None when the item
+    fails (PLUG-59): it is logged at error and left out of the build.
+    """
+
+    def __init__(
+        self, chain: tuple[Rewriter, ...], view: Hashable, admitted: tuple[Plugin, ...]
+    ) -> None:
+        self._chain = chain
+        self._view = view
+        self._admitted = admitted
+        self._skills: dict[int, Mapping[str, str]] = {}  # one per plugin per build
+
+    def _site(self, served: _Served, kind: Kind, path: str, uri: str) -> Site:
+        folders = self._skills.get(id(served))
+        if folders is None:
+            folders = self._skills[id(served)] = MappingProxyType(
+                {served.skill_dirs[k]: skills._root(k) for k in served.catalogue}
+            )
+        return Site(
+            plugin=served.plugin,
+            namespace=served.plugin.namespace,
+            kind=kind,
+            path=path,
+            uri=uri,
+            view=self._view,
+            admitted=self._admitted,
+            skills=folders,
+        )
+
+    def _failed(
+        self, served: _Served, by: str | None, path: str, what: str, reason: str
+    ) -> None:
+        """Logs an item left out. ``by`` is the rewriter that failed it, None for a
+        re-parse or a rename, which every rewriter in the chain may have caused."""
+        log.error(
+            "plugin %s: %s failed on %s, so %s is not served for view %r: %s",
+            served.plugin.name,
+            by or ", ".join(name_of(rewriter) for rewriter in self._chain),
+            path,
+            what,
+            self._view,
+            reason,
+        )
+
+    def _run(self, served: _Served, site: Site, text: str, what: str) -> str | None:
+        try:
+            return run(self._chain, site, text)
+        except RewriteFailed as exc:
+            self._failed(served, exc.rewriter, site.path, what, exc.reason)
+            return None
+
+    def skill(
+        self, served: _Served, key: str, skill: skills.Skill
+    ) -> skills.Skill | None:
+        """The skill at ``key``, its text files rewritten: the one read when none
+        changes, else rebuilt, failed when FastMCP refuses it or its name changes."""
+        folder = served.skill_dirs[key]
+        what = skills._file_uri(key, skills.ENTRY)
+        files: dict[str, str | bytes] = dict(skill.files)
+        changed = False
+        for file, data in skill.files.items():
+            text = text_of(file, data)
+            if text is None:
+                continue  # served as it is (PLUG-58)
+            path = _joined(folder, file)
+            site = self._site(served, "skill", path, skills._file_uri(key, file))
+            new = self._run(served, site, text, what)
+            if new is None:
+                return None
+            if new != text:
+                files[file] = new
+                changed = True
+        if not changed:
+            return skill
+        entry = _joined(folder, skills.ENTRY)
+        try:
+            built = skills.Skill.from_files(files)
+        except ValueError as exc:
+            self._failed(served, None, entry, what, skills._reason(exc))
+            return None
+        if built.name != skill.name:
+            reason = f"its name is now {built.name!r}, not {skill.name!r}"
+            self._failed(served, None, entry, what, reason)
+            return None
+        return built
+
+    def prompt(self, served: _Served, file: _File) -> FilePrompt | None:
+        """A command, rewritten: the one read when its text is unchanged, else
+        re-parsed under its name."""
+        item = file.item
+        what = f"prompt {item.name}"
+        site = self._site(served, "command", file.path, file.uri)
+        new = self._run(served, site, file.text, what)
+        if new is None:
+            return None
+        if new == file.text:
+            return item
+        try:
+            return parse_prompt(new, item.name)
+        except (ValueError, yaml.YAMLError) as exc:
+            self._failed(served, None, file.path, what, str(exc))
+            return None
+
+    def agent(self, served: _Served, file: _File) -> Agent | None:
+        """An agent, rewritten: the one read when its text is unchanged, else
+        re-parsed, failed when it no longer parses or is named otherwise."""
+        item = file.item
+        what = f"agent {item.name}"
+        site = self._site(served, "agent", file.path, file.uri)
+        new = self._run(served, site, file.text, what)
+        if new is None:
+            return None
+        if new == file.text:
+            return item
+        agent = parse_agent(
+            new, served.by_name, served.prefix, stem=file.stem, folders=file.folders
+        )
+        if isinstance(agent, str):
+            self._failed(served, None, file.path, what, agent)
+            return None
+        if agent.name != item.name:
+            reason = f"its name is now {agent.name!r}, not {item.name!r}"
+            self._failed(served, None, file.path, what, reason)
+            return None
+        return agent
+
+    async def indexes(
+        self,
+        served: _Served,
+        key: str,
+        skill: skills.Skill,
+        renderer: skills.EntryOnlySkillProvider,
+    ) -> dict[str, TextResource | None]:
+        """Each folder's ``_index.md`` and ``_index.json`` of the skill at ``key``,
+        rendered by ``renderer`` and rewritten; None for one that failed."""
+        found: dict[str, TextResource | None] = {}
+        for rel in sorted(skills._folders_of(skill.files)):
+            path = _joined(served.skill_dirs[key], rel)
+            for name in (skills.INDEX_MD, skills.INDEX_JSON):
+                uri = f"{skills._folder_uri(key, rel)}/{name}"
+                resource = await skills._index_resource(renderer, uri)
+                if not isinstance(resource, TextResource):
+                    continue
+                site = self._site(served, "index", path, uri)
+                new = self._run(served, site, resource.text, uri)
+                found[uri] = (
+                    None if new is None else resource.model_copy(update={"text": new})
+                )
+        return found
+
+
 class PluginSet:
     """A set of plugins built apart from what is served, then served whole (PLUG-50).
 
@@ -735,6 +951,7 @@ class Plugins:
         self._agents: _Agents | None = None
         self._state = _State(0, ())
         self._view: Callable[[], View] | None = None
+        self._rewriters: tuple[Rewriter, ...] = ()
         self._memo = _Memo(OrderedDict(), {})
         self.add_loader(LocalLoader())
 
@@ -787,6 +1004,16 @@ class Plugins:
         """Makes ``fn`` the view, called once per request (PLUG-53)."""
         self._view = fn
         self._memo = _Memo(OrderedDict(), {})  # last: no build of the old view is kept
+
+    def add_rewriter(self, fn: Rewriter) -> None:
+        """Adds ``fn`` to the end of the rewriters, run by every build (PLUG-56)."""
+        self._rewriters = (*self._rewriters, fn)
+        self._memo = _Memo(OrderedDict(), {})  # last: no build without it is kept
+
+    def _chain(self, key: _Key) -> tuple[Rewriter, ...]:
+        """The rewriters a build for ``key`` runs, in order: the one place the order
+        is decided. Empty means no rewriting, and no copies."""
+        return self._rewriters
 
     def _key(self, state: _State, view: View) -> _Key:
         """The build key of ``view`` over ``state``: the one place a key is made."""
@@ -861,17 +1088,55 @@ class Plugins:
 
     async def _make(self, state: _State, view: View, key: _Key) -> _Build:
         """A build of what ``view`` admits of ``state``, from what was read: it never
-        reads the disk."""
+        reads the disk. With no rewriter it serves the objects read; with any, the
+        rewritten text, and each skill folder's indexes, rendered now."""
+        chain = self._chain(key)
         admitted = tuple(s for s in state.current if view.admits(s.plugin))
+        plugins = tuple(s.plugin for s in admitted)
+        if not chain:
+            return _Build(
+                admitted=plugins,
+                catalogue=MappingProxyType(
+                    {k: skill for s in admitted for k, skill in s.catalogue.items()}
+                ),
+                prompts=tuple(f.item for s in admitted for f in s.prompts),
+                agents=tuple(f.item for s in admitted for f in s.agents),
+                rewritten=False,
+                indexes=MappingProxyType({}),
+            )
+        rewrite = _Rewrite(chain, view.key, plugins)
+        catalogue: dict[str, skills.Skill] = {}
+        prompts: list[FilePrompt] = []
+        agents: list[Agent] = []
+        for served in admitted:
+            for k, skill in served.catalogue.items():
+                if (built := rewrite.skill(served, k, skill)) is not None:
+                    catalogue[k] = built
+            for file in served.prompts:
+                if (prompt := rewrite.prompt(served, file)) is not None:
+                    prompts.append(prompt)
+            for file in served.agents:
+                if (agent := rewrite.agent(served, file)) is not None:
+                    agents.append(agent)
+        # A throwaway renderer over the build: FastMCP keys what it loads per request
+        # by its id, so the build keeps it alive while a request may still see it.
+        renderer = skills.EntryOnlySkillProvider(catalogue)
+        indexes: dict[str, TextResource | None] = {}
+        async with Context(fastmcp=self._server):
+            for served in admitted:
+                for k in served.catalogue:
+                    if k in catalogue:
+                        indexes |= await rewrite.indexes(
+                            served, k, catalogue[k], renderer
+                        )
         return _Build(
-            admitted=tuple(s.plugin for s in admitted),
-            catalogue=MappingProxyType(
-                {path: skill for s in admitted for path, skill in s.catalogue.items()}
-            ),
-            prompts=tuple(prompt for s in admitted for prompt in s.prompts),
-            agents=tuple(agent for s in admitted for agent in s.agents),
-            rewritten=False,
-            indexes=MappingProxyType({}),
+            admitted=plugins,
+            catalogue=MappingProxyType(catalogue),
+            prompts=tuple(prompts),
+            agents=tuple(agents),
+            rewritten=True,
+            indexes=MappingProxyType(indexes),
+            _renderer=renderer,
         )
 
     def add(
@@ -921,12 +1186,18 @@ class Plugins:
                 f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
                 for key in read.catalogue
             ),
-            prompts=tuple(prompt.name for prompt in read.prompts),
-            agents=tuple(agent.name for agent in read.agents),
+            prompts=tuple(file.item.name for file in read.prompts),
+            agents=tuple(file.item.name for file in read.agents),
             skipped=tuple(read.skipped),
         )
         return _Served(
-            plugin, dict(read.catalogue), tuple(read.prompts), tuple(read.agents)
+            plugin=plugin,
+            catalogue=dict(read.catalogue),
+            skill_dirs=dict(read.skill_dirs),
+            prompts=tuple(read.prompts),
+            agents=tuple(read.agents),
+            by_name=dict(read.by_name),
+            prefix=read.prefix,
         )
 
     def _claim(
@@ -970,6 +1241,7 @@ class Plugins:
         skip = _Skip(base)
 
         catalogue: dict[str, skills.Skill] = {}
+        skill_dirs: dict[str, str] = {}
         by_name: dict[str, str] = {}
         folders: set[Path] = set()
         nested: list[Path] = []
@@ -989,6 +1261,8 @@ class Plugins:
                     skip(location, skill)
                     continue
                 catalogue[key] = skill
+                folder = location.relative_to(base).as_posix()
+                skill_dirs[key] = "" if folder == "." else folder
                 by_name.setdefault(skill.name, uri)
         # A skills folder read as well, the root say, may hold one found as nested.
         for entry in nested:
@@ -1002,9 +1276,9 @@ class Plugins:
         # namespace other than its own is a prefix.
         own = prefix == self._server.name
         named = "" if own else prefix.replace("/", "_") + "_"
-        prompts: list[FilePrompt] = []
-        for path, segments in _md_files(base, "commands", parts.commands, notes):
-            segments = (*segments, path.stem)
+        prompts: list[_File] = []
+        for path, folders_in in _md_files(base, "commands", parts.commands, notes):
+            segments = (*folders_in, path.stem)
             name = named + "_".join(segments)
             if not all(_usable(part) for part in (*segments, name)):
                 reason = f"prompt name {name!r} is not a usable name"
@@ -1012,7 +1286,9 @@ class Plugins:
                 skip(path, reason)
                 continue
             try:
-                prompt = load_prompt(path, name=name)
+                data = path.read_bytes()
+                text = _decoded(data)
+                prompt = parse_prompt(text, name)
             except (OSError, ValueError, yaml.YAMLError) as exc:
                 log.warning("prompt %s is skipped: %s", path, exc)
                 skip(path, str(exc))
@@ -1026,12 +1302,23 @@ class Plugins:
                 skip,
                 owners,
             ):
-                prompts.append(prompt)
+                prompts.append(
+                    _File(
+                        path=skip.relative(path),
+                        uri=_file_uri("prompts", prefix, folders_in, path.name),
+                        data=data,
+                        text=text,
+                        item=prompt,
+                        stem=path.stem,
+                        folders=tuple(folders_in),
+                    )
+                )
 
-        agents: list[Agent] = []
+        agents: list[_File] = []
         for path, segments in _md_files(base, "agents", parts.agents, notes):
             try:
-                text = path.read_text(encoding="utf-8")
+                data = path.read_bytes()
+                text = _decoded(data)
             except (OSError, UnicodeDecodeError) as exc:
                 log.warning("agent file %s is skipped: %s", path, exc)
                 skip(path, str(exc))
@@ -1049,8 +1336,20 @@ class Plugins:
                 skip,
                 owners,
             ):
-                agents.append(agent)
-        return _Read(catalogue, prompts, agents, skip.skipped)
+                agents.append(
+                    _File(
+                        path=skip.relative(path),
+                        uri=_file_uri("agents", prefix, segments, path.name),
+                        data=data,
+                        text=text,
+                        item=agent,
+                        stem=path.stem,
+                        folders=tuple(segments),
+                    )
+                )
+        return _Read(
+            catalogue, skill_dirs, prompts, agents, by_name, named, skip.skipped
+        )
 
     def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the

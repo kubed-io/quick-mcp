@@ -26,7 +26,7 @@ from .container import (
     Recipe,
     _Call,
 )
-from .plugins import Plugin, PluginLoader, Plugins, PluginSet, View, _PinScope
+from .plugins import Plugin, PluginLoader, Plugins, PluginSet, Site, View, _PinScope
 
 T = TypeVar("T")
 
@@ -198,6 +198,21 @@ class QuickMCP:
         """
         self._plugins.set_view(fn)
         return fn
+
+    def add_rewriter(self, fn: Callable[[Site, str], str]) -> None:
+        """Adds ``fn`` to the server's rewriters, run in the order added (PLUG-56).
+
+        ``fn(site, text)`` returns the text to serve in place of ``text``: each text
+        file a plugin serves, a skill's, a command's or an agent's, and each skill
+        folder's ``_index.md`` and ``_index.json``. ``site`` says where the file is and
+        who it is served to (``Site``). It runs when a build is made, once per
+        generation and view key, never on a read, so a skill's digests match what is
+        served. A rewriter that raises, returns anything but a ``str``, or leaves a
+        file that no longer reads as what it was under its name fails that item for
+        that view alone, logged at error (PLUG-59). It takes effect from the next
+        request.
+        """
+        self._plugins.add_rewriter(fn)
 
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.

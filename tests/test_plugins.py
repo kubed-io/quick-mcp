@@ -35,8 +35,6 @@ from kubed.mcp.skills import EntryOnlySkillProvider
 
 pytestmark = pytest.mark.unit
 
-GUIDE = "skill://t/demo-guide/references/GUIDE.md"
-
 
 async def skill_uris(mcp: QuickMCP) -> list[str]:
     async with Client(mcp.server) as client:

@@ -13,6 +13,7 @@ from kubed.mcp import QuickMCP
 DEMO = Path(__file__).parent / "plugins" / "demo"
 # A plugin added with no namespace serves under the server's name, "t" here.
 ENTRY = "skill://t/demo-guide/SKILL.md"
+GUIDE = "skill://t/demo-guide/references/GUIDE.md"
 
 
 def write(root: Path, files: dict[str, str]) -> Path:

@@ -7,7 +7,6 @@ names and checks it against the digest, so the strongest tests here do that over
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
@@ -24,6 +23,7 @@ from skill_server import (
     MANIFEST_URI,
     demo,
     make_skill,
+    read_bytes,
     request,
     served,
 )
@@ -316,11 +316,6 @@ async def test_a_dash_run_inside_a_value_is_not_the_header_end(tmp_path):
     async with Client(served(tmp_path, {}, front=front).server) as client:
         entry = (await request(client, "skills/list"))["skills"][0]
     assert entry["frontmatter"]["description"] == "before --- after"
-
-
-def read_bytes(content) -> bytes:
-    text = getattr(content, "text", None)
-    return text.encode() if text is not None else base64.b64decode(content.blob)
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
