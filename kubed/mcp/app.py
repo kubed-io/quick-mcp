@@ -27,6 +27,7 @@ from .container import (
     _Call,
 )
 from .plugins import Plugin, PluginLoader, Plugins
+from .telemetry import Telemetry, _start_signals
 
 T = TypeVar("T")
 
@@ -64,11 +65,18 @@ class _CallScope(Middleware):
 def _with_teardown(
     container: Container,
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[Any]] | None,
+    *,
+    name: str,
+    telemetry: Telemetry | None,
 ) -> Callable[[FastMCP], AbstractAsyncContextManager[Any]]:
-    """The server's lifespan, with the container torn down after it ends."""
+    """The server's lifespan, with telemetry started before it and stopped after it.
+
+    The container is torn down last, after telemetry has stopped.
+    """
 
     @asynccontextmanager
     async def run(server: FastMCP) -> AsyncIterator[Any]:
+        signals = _start_signals(name, telemetry)
         try:
             if lifespan is None:
                 yield {}
@@ -76,6 +84,8 @@ def _with_teardown(
                 async with lifespan(server) as state:
                     yield state
         finally:
+            if signals is not None:
+                signals.stop()
             await container.aclose()
 
     return run
@@ -103,7 +113,14 @@ class QuickMCP:
         self._config = config
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
-            name, lifespan=_with_teardown(self._container, lifespan), **fastmcp_options
+            name,
+            lifespan=_with_teardown(
+                self._container,
+                lifespan,
+                name=name,
+                telemetry=getattr(config, "telemetry", None),
+            ),
+            **fastmcp_options,
         )
         # Outermost, so every middleware and handler inside it shares one call's slot.
         self.server.middleware.insert(0, _CallScope(self._container))
