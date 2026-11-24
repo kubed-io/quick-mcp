@@ -607,6 +607,39 @@ async def test_one_provider_of_each_kind_serves_the_plugins_as_served(tmp_path):
     assert [p.name for p in mcp.plugins] == ["demo"]
 
 
+async def test_what_a_plugin_does_not_serve_is_skipped_with_the_reason(tmp_path):
+    root = write(
+        tmp_path / "p",
+        {
+            ".claude-plugin/plugin.json": '{"name": "p", "skills": ["./extra"]}',
+            "skills/good/SKILL.md": skill("good"),
+            "skills/wrong/SKILL.md": skill("other"),
+            "extra/good/SKILL.md": skill("good"),
+            "commands/typo.md": "---\ndescription: T.\n---\nHi {{ who }}.\n",
+            "commands/a:b/c.md": command_md(),
+            "agents/review/security.md": agent_md("security"),
+            "agents/review_security.md": agent_md(None),
+            "agents/vague.md": "---\nname: vague\n---\nGo.\n",
+        },
+    )
+    mcp = QuickMCP("t")
+    plugin = mcp.add_plugin(root)
+    assert plugin.skipped == (
+        ("skills/wrong", "Skill folder 'wrong' must match its SKILL.md name 'other'"),
+        ("extra/good", "skill://t/good/SKILL.md is already served by skills/good"),
+        ("commands/a:b/c.md", "prompt name 'a:b_c' is not a usable name"),
+        ("commands/typo.md", "placeholders with no argument: who"),
+        (
+            "agents/review_security.md",
+            "agent review_security is already served by agents/review/security.md",
+        ),
+        ("agents/vague.md", "its description must be a non-empty string"),
+    )
+    assert mcp.plugins[0].skipped == plugin.skipped
+    assert await listed(mcp) == ([], ["review_security"], ["skill://t/good/SKILL.md"])
+    assert served((DEMO, None)).plugins[0].skipped == ()
+
+
 # ---- layout and names, as Claude Code reads them ---------------------------------
 # The fixtures are shaped like Claude Code's own --plugin-dir probes (material
 # delivery F63): agents and commands at any depth, each folder a `_` segment where

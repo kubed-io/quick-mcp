@@ -95,19 +95,25 @@ def load_skill(path: str | os.PathLike[str]) -> Skill | None:
     A folder with no ``SKILL.md`` is no skill: a warning, and None. A skill FastMCP's
     ``Skill.from_directory`` refuses is not served: an error with the reason, and None.
     """
-    path = Path(path)
+    skill = _load_skill(Path(path))
+    return None if isinstance(skill, str) else skill
+
+
+def _load_skill(path: Path) -> Skill | str:
+    """``load_skill``, logging the same, but the reason in place of None."""
     if not (path / ENTRY).is_file():
         log.warning("no SKILL.md at %s", path)
-        return None
+        return f"no {ENTRY}"
     try:
         skill = Skill.from_directory(path)
     except (OSError, ValueError) as exc:
+        reason = _reason(exc)
         log.error(
             "skill at %s is not a valid Agent Skill, so it is not served: %s",
             path,
-            _reason(exc),
+            reason,
         )
-        return None
+        return reason
     return without_reserved(skill)
 
 

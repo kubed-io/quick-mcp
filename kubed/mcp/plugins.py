@@ -126,6 +126,8 @@ class Plugin:
 
     ``namespace`` is the one it is served under. ``skills`` are the ``skill://`` URIs of
     the ``SKILL.md`` of each skill served, ``prompts`` and ``agents`` the names served.
+    ``skipped`` is each skill folder, command file and agent file not served, as its
+    path from the root and the reason, in the order read.
     """
 
     name: str
@@ -138,6 +140,7 @@ class Plugin:
     skills: tuple[str, ...] = ()
     prompts: tuple[str, ...] = ()
     agents: tuple[str, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
 
 
 def _inside(path: Path, base: Path) -> Path | None:
@@ -427,6 +430,21 @@ class _Read:
     catalogue: dict[str, skills.Skill]
     prompts: list[FilePrompt]
     agents: list[Agent]
+    skipped: list[tuple[str, str]]
+
+
+class _Skip:
+    """Records what a plugin does not serve: its path from the root, and why."""
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+        self.skipped: list[tuple[str, str]] = []
+
+    def relative(self, path: Path) -> str:
+        return path.relative_to(self._base).as_posix()
+
+    def __call__(self, path: Path, reason: str) -> None:
+        self.skipped.append((self.relative(path), reason))
 
 
 @dataclass(frozen=True)
@@ -562,24 +580,28 @@ class Plugins:
         key: str,
         plugin: Plugin,
         what: str,
-        seen: dict[str, Path | None],
-        path: Path | None = None,
+        seen: dict[str, Path],
+        path: Path,
+        skip: _Skip,
+        *,
+        files: bool = True,
     ) -> bool:
         """Whether ``key`` is free: refused when served, skipped when this plugin
-        has it already, the warning naming both files when ``path`` is given."""
+        has it already, the warning naming both files when ``files``."""
         owner = self._owners.get(key)
         if owner is not None:
             raise PluginError(f"{what} is already served by plugin {owner}")
         if key in seen:
             first = seen[key]
-            if path is None or first is None:
-                log.warning(
-                    "plugin %s: %s is skipped, served already", plugin.name, what
-                )
-            else:
+            if files:
                 log.warning(
                     "%s is already served by %s; %s is skipped", what, first, path
                 )
+            else:
+                log.warning(
+                    "plugin %s: %s is skipped, served already", plugin.name, what
+                )
+            skip(path, f"{what} is already served by {skip.relative(first)}")
             return False
         seen[key] = path
         return True
@@ -587,7 +609,8 @@ class Plugins:
     def _read(self, plugin: Plugin, prefix: str, notes: list[str]) -> _Read:
         base = plugin.root.resolve()
         parts = plugin.components
-        seen: dict[str, Path | None] = {}
+        seen: dict[str, Path] = {}
+        skip = _Skip(base)
 
         catalogue: dict[str, skills.Skill] = {}
         by_name: dict[str, str] = {}
@@ -600,10 +623,11 @@ class Plugins:
                 folders.add(location)
                 key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
-                if not self._claim(uri, plugin, uri, seen):
+                if not self._claim(uri, plugin, uri, seen, location, skip, files=False):
                     continue
-                skill = skills.load_skill(location)
-                if skill is None:
+                skill = skills._load_skill(location)
+                if isinstance(skill, str):
+                    skip(location, skill)
                     continue
                 catalogue[key] = skill
                 by_name.setdefault(skill.name, uri)
@@ -624,19 +648,23 @@ class Plugins:
             segments = (*segments, path.stem)
             name = named + "_".join(segments)
             if not all(_usable(part) for part in (*segments, name)):
-                log.warning(
-                    "prompt %s is skipped: prompt name %r is not a usable name",
-                    path,
-                    name,
-                )
+                reason = f"prompt name {name!r} is not a usable name"
+                log.warning("prompt %s is skipped: %s", path, reason)
+                skip(path, reason)
                 continue
             try:
                 prompt = load_prompt(path, name=name)
             except (OSError, ValueError, yaml.YAMLError) as exc:
                 log.warning("prompt %s is skipped: %s", path, exc)
+                skip(path, str(exc))
                 continue
             if self._claim(
-                f"prompt:{prompt.name}", plugin, f"prompt {prompt.name}", seen, path
+                f"prompt:{prompt.name}",
+                plugin,
+                f"prompt {prompt.name}",
+                seen,
+                path,
+                skip,
             ):
                 prompts.append(prompt)
 
@@ -646,15 +674,17 @@ class Plugins:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
                 log.warning("agent file %s is skipped: %s", path, exc)
+                skip(path, str(exc))
                 continue
             agent = parse_agent(text, by_name, named, stem=path.stem, folders=segments)
             if isinstance(agent, str):
                 log.warning("agent file %s is skipped: %s", path, agent)
+                skip(path, agent)
             elif self._claim(
-                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen, path
+                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen, path, skip
             ):
                 agents.append(agent)
-        return _Read(catalogue, prompts, agents)
+        return _Read(catalogue, prompts, agents, skip.skipped)
 
     def _serve(self, plugin: Plugin, read: _Read) -> Plugin:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
@@ -679,6 +709,7 @@ class Plugins:
             ),
             prompts=tuple(prompt.name for prompt in read.prompts),
             agents=tuple(agent.name for agent in read.agents),
+            skipped=tuple(read.skipped),
         )
         for key in plugin.skills:
             self._owners[key] = plugin.name
