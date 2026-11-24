@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A `skill://`, `prompts://` or `agents://` address holding an escaped `/` (`%2F`) now fails as a missing one does.
 - `resources/read` resolves `.` and `..` segments in a `skill://`, `prompts://` or `agents://` address.
+- Under a namespace, prompt and agent names are prefixed with its first segment only.
 
 ## [0.1.2] - 2026-11-23
 

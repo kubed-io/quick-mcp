@@ -1356,9 +1356,10 @@ class Plugins:
                 )
 
         # The server is already a scope for prompts and agents: only an explicit
-        # namespace other than its own is a prefix.
+        # namespace other than its own is a prefix, and only its first segment
+        # (PLUG-63).
         own = prefix == self._server.name
-        named = "" if own else prefix.replace("/", "_") + "_"
+        named = "" if own else prefix.split("/")[0] + "_"
         prompts: list[_File] = []
         for path, folders_in in _md_files(base, "commands", parts.commands, notes):
             segments = (*folders_in, path.stem)
