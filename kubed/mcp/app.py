@@ -26,7 +26,7 @@ from .container import (
     Recipe,
     _Call,
 )
-from .plugins import Plugin, PluginLoader, Plugins
+from .plugins import Plugin, PluginLoader, Plugins, PluginSet, Site, View, _PinScope
 
 T = TypeVar("T")
 
@@ -123,6 +123,8 @@ class QuickMCP:
         # QuickMCP.get_tool.
         self.get_tool = self.server.get_tool
         self._plugins = Plugins(self.server)
+        # Right inside _CallScope, outside everything that reads plugins.
+        self.server.middleware.insert(1, _PinScope(self._plugins))
 
     def websocket_route(
         self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
@@ -162,17 +164,68 @@ class QuickMCP:
         """
         return self._plugins.add(address, namespace, manifest)
 
+    def plugin_set(self) -> PluginSet:
+        """A new, empty set of plugins, not served until ``serve(set)`` (PLUG-50).
+
+        ``set.add(address, ...)`` reads a plugin as ``add_plugin`` does, and
+        ``set.keep(plugin)`` carries one served now, unread.
+        """
+        return self._plugins.plugin_set()
+
+    def serve(self, staging: PluginSet) -> None:
+        """Serves ``staging`` whole, in place of what is served, and moves
+        ``generation`` on by one (PLUG-51).
+
+        A plugin left out of the set is no longer served. A set made by another
+        server is refused with a ``ValueError``.
+        """
+        self._plugins.serve(staging)
+
+    @property
+    def generation(self) -> int:
+        """How many sets this server has served: 0 until a set is first served."""
+        return self._plugins.generation
+
+    def plugin_view(self, fn: Callable[[], View]) -> Callable[[], View]:
+        """Sets the server's view, and returns ``fn``, so it works as a decorator
+        (PLUG-53).
+
+        ``fn()`` runs once per MCP request, inside it, so it can read the request
+        (``request_values()``). Its ``View`` says which plugins the request is served:
+        one it does not admit is absent for that request. ``admits`` runs only when a
+        build is made, once per generation and view key, so the key must decide what
+        it admits. A ``fn()`` that raises fails the request with its error.
+        """
+        self._plugins.set_view(fn)
+        return fn
+
+    def add_rewriter(self, fn: Callable[[Site, str], str]) -> None:
+        """Adds ``fn`` to the server's rewriters, run in the order added (PLUG-56).
+
+        ``fn(site, text)`` returns the text to serve in place of ``text``: each text
+        file a plugin serves, a skill's, a command's or an agent's, and each skill
+        folder's ``_index.md`` and ``_index.json``. ``site`` says where the file is and
+        who it is served to (``Site``). It runs when a build is made, once per
+        generation and view key, never on a read, so a skill's digests match what is
+        served. A rewriter that raises, returns anything but a ``str``, or leaves a
+        file that no longer reads as what it was under its name fails that item for
+        that view alone, logged at error (PLUG-59). It takes effect from the next
+        request.
+        """
+        self._plugins.add_rewriter(fn)
+
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.
 
-        ``LocalLoader`` is always registered, for ``file``. A scheme that already has a
-        loader is refused with a ``ValueError``.
+        ``LocalLoader`` is registered for ``file`` until the server adds its own, which
+        replaces it. Any other scheme that already has a loader, or a second loader for
+        ``file``, is refused with a ``ValueError``, and nothing is registered.
         """
         self._plugins.add_loader(loader)
 
     @property
     def plugins(self) -> tuple[Plugin, ...]:
-        """The plugins this server serves, in the order they were added."""
+        """The plugins of the served set, in the order they were added to it."""
         return self._plugins.served
 
     def singleton(

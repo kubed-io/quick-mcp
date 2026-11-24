@@ -267,6 +267,12 @@ async def _index_resource(folders: Folders, uri: str) -> Resource | None:
     children = await folders.children(parent)
     if children is None:
         return None
+    return _index_of(uri, children)
+
+
+def _index_of(uri: str, children: list[dict]) -> TextResource:
+    """The index file at ``uri``, one of ``_INDEXES``, listing ``children``."""
+    parent, _, name = uri.rpartition("/")
     mime_type, render = _INDEXES[name]
     return TextResource(
         uri=uri,
