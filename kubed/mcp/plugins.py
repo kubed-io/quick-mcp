@@ -51,6 +51,7 @@ __all__ = [
     "Plugin",
     "PluginError",
     "PluginLoader",
+    "PluginSet",
     "read_plugin",
 ]
 
@@ -497,25 +498,116 @@ class _Agents(AgentsExtension):
         return type(self)(self._plugins)
 
 
+@dataclass(frozen=True)
+class _State:
+    """What is served: its generation, and the plugins of the set, in order.
+
+    Replaced whole by ``Plugins.serve`` and never changed in place.
+    """
+
+    generation: int
+    current: tuple[_Served, ...]
+
+
+def _owned(served: _Served) -> dict[str, str]:
+    """What ``served`` serves, as the owners map names it: what -> its plugin."""
+    name = served.plugin.name
+    return {
+        **dict.fromkeys(served.plugin.skills, name),
+        **{f"prompt:{prompt}": name for prompt in served.plugin.prompts},
+        **{f"agent:{agent}": name for agent in served.plugin.agents},
+    }
+
+
+class PluginSet:
+    """A set of plugins built apart from what is served, then served whole (PLUG-50).
+
+    ``add`` reads and checks a plugin as ``add_plugin`` does and ``keep`` carries one
+    the server serves now, unread. A clash is checked against the plugins in this set
+    alone, so a set that leaves a plugin out may add another that serves the same
+    thing. A refused plugin raises and leaves the set unchanged. Nothing here is
+    served until ``mcp.serve(set)``; the set is then a snapshot, and adding to it
+    afterwards changes nothing served.
+    """
+
+    def __init__(self, plugins: Plugins) -> None:
+        self._plugins = plugins
+        self._served: list[_Served] = []
+        self._owners: dict[str, str] = {}  # what is in the set -> the plugin serving it
+
+    @property
+    def plugins(self) -> tuple[Plugin, ...]:
+        """The plugins in the set, in the order they were added to it."""
+        return tuple(served.plugin for served in self._served)
+
+    def add(
+        self,
+        address: str | os.PathLike[str],
+        *,
+        namespace: str | None = None,
+        manifest: Mapping[str, object] | None = None,
+    ) -> Plugin:
+        """Reads and checks the plugin at ``address`` as ``add_plugin`` does (PLUG-2,
+        PLUG-3) and adds it to the set. A refused plugin raises its ``PluginError``."""
+        served = self._plugins._load(address, namespace, manifest, self._owners)
+        self._carry(served)
+        return served.plugin
+
+    def keep(self, plugin: Plugin) -> Plugin:
+        """Carries a plugin the server serves now into the set, without reading it
+        again. A plugin not served now is a ``ValueError``; one that clashes with the
+        set is a ``PluginError``."""
+        for served in self._plugins.current:
+            if served.plugin is plugin:
+                break
+        else:
+            raise ValueError(
+                f"plugin {plugin.name} is not served now: keep() carries a plugin "
+                "this server serves"
+            )
+        try:
+            self._carry(served)
+        except PluginError as exc:
+            raise PluginError(f"plugin {plugin.address} is not served: {exc}") from None
+        return plugin
+
+    def _carry(self, served: _Served) -> None:
+        """Adds ``served`` to the set, refused whole when any of it is owned already."""
+        owned = _owned(served)
+        for key, _ in owned.items():
+            owner = self._owners.get(key)
+            if owner is not None:
+                what = key if key.startswith("skill://") else key.replace(":", " ", 1)
+                raise PluginError(f"{what} is already served by plugin {owner}")
+        self._owners.update(owned)
+        self._served.append(served)
+
+
 class Plugins:
     """A server's plugins and loaders: what ``QuickMCP`` delegates to.
 
-    Everything a plugin serves is read and checked against what the server already
-    serves before any of it is served, so a refused plugin leaves no trace. What is
-    served is ``current``, a tuple replaced whole when a plugin is added and never
-    changed in place; the server's one skills provider, prompts provider and agents
-    extension read it.
+    Everything a plugin serves is read and checked against the set it joins before any
+    of it is served, so a refused plugin leaves no trace. What is served is a
+    ``_State``, replaced whole by ``serve`` and never changed in place; the server's
+    one skills provider, prompts provider and agents extension read its ``current``.
     """
 
     def __init__(self, server: FastMCP) -> None:
         self._server = server
         self._loaders: dict[str, PluginLoader] = {}
-        self._owners: dict[str, str] = {}  # what is served -> the plugin serving it
         self._skills: _Skills | None = None
         self._prompts: _Prompts | None = None
         self._agents: _Agents | None = None
-        self.current: tuple[_Served, ...] = ()
+        self._state = _State(0, ())
         self.add_loader(LocalLoader())
+
+    @property
+    def current(self) -> tuple[_Served, ...]:
+        return self._state.current
+
+    @property
+    def generation(self) -> int:
+        return self._state.generation
 
     @property
     def served(self) -> tuple[Plugin, ...]:
@@ -542,12 +634,38 @@ class Plugins:
             )
         return loader
 
+    def plugin_set(self) -> PluginSet:
+        return PluginSet(self)
+
+    def serve(self, staging: PluginSet) -> None:
+        """Makes ``staging`` the served set, in one assignment (PLUG-51)."""
+        if staging._plugins is not self:
+            raise ValueError("this plugin set belongs to another server")
+        served = tuple(staging._served)
+        self._providers(served)
+        self._state = _State(self._state.generation + 1, served)
+
     def add(
         self,
         address: str | os.PathLike[str],
         namespace: str | None = None,
         manifest: Mapping[str, object] | None = None,
     ) -> Plugin:
+        """A new set of the served plugins and the new one, served (PLUG-52)."""
+        staging = self.plugin_set()
+        for served in self.current:
+            staging._carry(served)
+        plugin = staging.add(address, namespace=namespace, manifest=manifest)
+        self.serve(staging)
+        return plugin
+
+    def _load(
+        self,
+        address: str | os.PathLike[str],
+        namespace: str | None,
+        manifest: Mapping[str, object] | None,
+        owners: dict[str, str],
+    ) -> _Served:
         address = os.fspath(address)
         prefix = _namespace(namespace, self._server.name)
         try:
@@ -560,19 +678,26 @@ class Plugins:
                 raise PluginError(str(exc) or type(exc).__name__) from exc
             plugin = read_plugin(root, manifest)
             notes = list(plugin.components.notes)
-            read = self._read(plugin, prefix, notes)
+            read = self._read(plugin, prefix, notes, owners)
         except PluginError as exc:
             raise PluginError(f"plugin {address} is not served: {exc}") from None
         for note in dict.fromkeys(notes):
             log.warning("plugin %s: %s", plugin.name, note)
-        return self._serve(
-            replace(
-                plugin,
-                address=address,
-                namespace=prefix,
-                components=replace(plugin.components, notes=tuple(notes)),
+        plugin = replace(
+            plugin,
+            address=address,
+            namespace=prefix,
+            components=replace(plugin.components, notes=tuple(notes)),
+            skills=tuple(
+                f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
+                for key in read.catalogue
             ),
-            read,
+            prompts=tuple(prompt.name for prompt in read.prompts),
+            agents=tuple(agent.name for agent in read.agents),
+            skipped=tuple(read.skipped),
+        )
+        return _Served(
+            plugin, dict(read.catalogue), tuple(read.prompts), tuple(read.agents)
         )
 
     def _claim(
@@ -583,12 +708,13 @@ class Plugins:
         seen: dict[str, Path],
         path: Path,
         skip: _Skip,
+        owners: dict[str, str],
         *,
         files: bool = True,
     ) -> bool:
         """Whether ``key`` is free: refused when served, skipped when this plugin
         has it already, the warning naming both files when ``files``."""
-        owner = self._owners.get(key)
+        owner = owners.get(key)
         if owner is not None:
             raise PluginError(f"{what} is already served by plugin {owner}")
         if key in seen:
@@ -606,7 +732,9 @@ class Plugins:
         seen[key] = path
         return True
 
-    def _read(self, plugin: Plugin, prefix: str, notes: list[str]) -> _Read:
+    def _read(
+        self, plugin: Plugin, prefix: str, notes: list[str], owners: dict[str, str]
+    ) -> _Read:
         base = plugin.root.resolve()
         parts = plugin.components
         seen: dict[str, Path] = {}
@@ -623,7 +751,9 @@ class Plugins:
                 folders.add(location)
                 key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
-                if not self._claim(uri, plugin, uri, seen, location, skip, files=False):
+                if not self._claim(
+                    uri, plugin, uri, seen, location, skip, owners, files=False
+                ):
                     continue
                 skill = skills._load_skill(location)
                 if isinstance(skill, str):
@@ -665,6 +795,7 @@ class Plugins:
                 seen,
                 path,
                 skip,
+                owners,
             ):
                 prompts.append(prompt)
 
@@ -681,17 +812,25 @@ class Plugins:
                 log.warning("agent file %s is skipped: %s", path, agent)
                 skip(path, agent)
             elif self._claim(
-                f"agent:{agent.name}", plugin, f"agent {agent.name}", seen, path, skip
+                f"agent:{agent.name}",
+                plugin,
+                f"agent {agent.name}",
+                seen,
+                path,
+                skip,
+                owners,
             ):
                 agents.append(agent)
         return _Read(catalogue, prompts, agents, skip.skipped)
 
-    def _serve(self, plugin: Plugin, read: _Read) -> Plugin:
+    def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
         # first plugin the prompts provider and the agents extension (PLUG-27).
-        if read.catalogue and self._skills is None:
+        if self._skills is None and any(each.catalogue for each in served):
             self._skills = _Skills(self)
             skills.serve(self._server, self._skills)
+        if not served:
+            return
         if self._prompts is None:
             self._prompts = _Prompts(self)
             self._server.add_provider(self._prompts)
@@ -701,24 +840,3 @@ class Plugins:
             self._server.add_middleware(
                 AdvertiseLegacyExtensions({EXTENSION_ID: SETTINGS})
             )
-        plugin = replace(
-            plugin,
-            skills=tuple(
-                f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
-                for key in read.catalogue
-            ),
-            prompts=tuple(prompt.name for prompt in read.prompts),
-            agents=tuple(agent.name for agent in read.agents),
-            skipped=tuple(read.skipped),
-        )
-        for key in plugin.skills:
-            self._owners[key] = plugin.name
-        for name in plugin.prompts:
-            self._owners[f"prompt:{name}"] = plugin.name
-        for name in plugin.agents:
-            self._owners[f"agent:{name}"] = plugin.name
-        served = _Served(
-            plugin, dict(read.catalogue), tuple(read.prompts), tuple(read.agents)
-        )
-        self.current = (*self.current, served)
-        return plugin

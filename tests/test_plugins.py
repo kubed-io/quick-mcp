@@ -8,12 +8,23 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
+from plugin_server import (
+    DEMO,
+    ENTRY,
+    Folders,
+    agent_md,
+    command_md,
+    copy,
+    listed,
+    served,
+    skill,
+    write,
+)
 from skill_server import request
 
 from kubed.mcp import QuickMCP
@@ -24,35 +35,7 @@ from kubed.mcp.skills import EntryOnlySkillProvider
 
 pytestmark = pytest.mark.unit
 
-DEMO = Path(__file__).parent / "plugins" / "demo"
-# A plugin added with no namespace serves under the server's name, "t" here.
-ENTRY = "skill://t/demo-guide/SKILL.md"
 GUIDE = "skill://t/demo-guide/references/GUIDE.md"
-
-
-def write(root: Path, files: dict[str, str]) -> Path:
-    for path, body in files.items():
-        (root / path).parent.mkdir(parents=True, exist_ok=True)
-        (root / path).write_text(body, encoding="utf-8")
-    return root
-
-
-def skill(name: str) -> str:
-    return f"---\nname: {name}\ndescription: The {name} skill.\n---\n\n# {name}\n"
-
-
-def copy(tmp_path: Path, name: str = "demo", files: dict | None = None) -> Path:
-    """A copy of the demo plugin, with ``files`` written over it."""
-    root = tmp_path / name
-    shutil.copytree(DEMO, root)
-    return write(root, files or {})
-
-
-def served(*plugins: tuple[Path, str | None], name: str = "t") -> QuickMCP:
-    mcp = QuickMCP(name)
-    for root, namespace in plugins:
-        mcp.add_plugin(root, namespace=namespace)
-    return mcp
 
 
 async def skill_uris(mcp: QuickMCP) -> list[str]:
@@ -285,20 +268,6 @@ def test_a_missing_folder_is_refused(tmp_path):
 def test_an_unknown_scheme_names_add_loader():
     with pytest.raises(PluginError, match=r"git\+https://.*mcp\.add_loader\(\)"):
         QuickMCP("t").add_plugin("git+https://example.com/plugin.git")
-
-
-class Folders:
-    """A loader for ``fixture://<name>``, a folder under a base."""
-
-    schemes = ("fixture",)
-
-    def __init__(self, base: Path) -> None:
-        self.base = base
-        self.asked: list[str] = []
-
-    def materialise(self, address: str) -> Path:
-        self.asked.append(address)
-        return self.base / address.removeprefix("fixture://")
 
 
 async def test_a_custom_loader_is_registered_and_used(tmp_path):
@@ -601,8 +570,9 @@ async def test_one_provider_of_each_kind_serves_the_plugins_as_served(tmp_path):
     )
     # What is served is the served set, read on each call: a set without the second
     # plugin serves none of it.
-    plugins = mcp._plugins
-    plugins.current = plugins.current[:1]
+    staging = mcp.plugin_set()
+    staging.keep(mcp.plugins[0])
+    mcp.serve(staging)
     assert await listed(mcp) == (["greet"], ["helper"], [ENTRY])
     assert [p.name for p in mcp.plugins] == ["demo"]
 
@@ -646,15 +616,6 @@ async def test_what_a_plugin_does_not_serve_is_skipped_with_the_reason(tmp_path)
 # Claude Code writes `:`; skills one level below skills/.
 
 
-def agent_md(name: str | None, description: str = "An agent.") -> str:
-    named = f"name: {name}\n" if name else ""
-    return f"---\n{named}description: {description}\n---\nGo.\n"
-
-
-def command_md(description: str = "A command.") -> str:
-    return f"---\ndescription: {description}\n---\nDo it.\n"
-
-
 PROBE = {
     "agents/flat.md": agent_md("flat"),
     "agents/review/security.md": agent_md("security"),
@@ -670,16 +631,6 @@ PROBE = {
     "skills/group/nested/SKILL.md": skill("nested"),
     "skills/wrong/SKILL.md": skill("other"),
 }
-
-
-async def listed(mcp: QuickMCP) -> tuple[list[str], list[str], list[str]]:
-    """The prompt names, agent names and skill URIs a client is served."""
-    async with Client(mcp.server) as client:
-        prompts = sorted(p.name for p in await client.list_prompts())
-        agents = [a["name"] for a in (await request(client, "agents/list"))["agents"]]
-        resources = await client.list_resources()
-    uris = sorted(str(r.uri) for r in resources if str(r.uri).startswith("skill://"))
-    return prompts, agents, uris
 
 
 async def test_the_probe_plugin_is_named_as_claude_code_names_it(tmp_path, caplog):

@@ -26,7 +26,7 @@ from .container import (
     Recipe,
     _Call,
 )
-from .plugins import Plugin, PluginLoader, Plugins
+from .plugins import Plugin, PluginLoader, Plugins, PluginSet
 
 T = TypeVar("T")
 
@@ -162,6 +162,28 @@ class QuickMCP:
         """
         return self._plugins.add(address, namespace, manifest)
 
+    def plugin_set(self) -> PluginSet:
+        """A new, empty set of plugins, not served until ``serve(set)`` (PLUG-50).
+
+        ``set.add(address, ...)`` reads a plugin as ``add_plugin`` does, and
+        ``set.keep(plugin)`` carries one served now, unread.
+        """
+        return self._plugins.plugin_set()
+
+    def serve(self, staging: PluginSet) -> None:
+        """Serves ``staging`` whole, in place of what is served, and moves
+        ``generation`` on by one (PLUG-51).
+
+        A plugin left out of the set is no longer served. A set made by another
+        server is refused with a ``ValueError``.
+        """
+        self._plugins.serve(staging)
+
+    @property
+    def generation(self) -> int:
+        """How many sets this server has served: 0 until the first plugin."""
+        return self._plugins.generation
+
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.
 
@@ -172,7 +194,7 @@ class QuickMCP:
 
     @property
     def plugins(self) -> tuple[Plugin, ...]:
-        """The plugins this server serves, in the order they were added."""
+        """The plugins of the served set, in the order they were added to it."""
         return self._plugins.served
 
     def singleton(
