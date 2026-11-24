@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.add_rewriter(fn)` rewrites the text a server serves, with digests that match.
 - `to_mcp_form` rewrites `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_SKILL_DIR}` and `<plugin>:<skill>` as `skill://` addresses.
 - A server's own `file` loader replaces the built-in one.
+- A server behind a multiplexing gateway takes its `X-MCP-Resource-Prefix` (or `?prefix=`) off the addresses clients send and writes it into the text it serves.
+- `kubed.mcp.gateway.prefix()` and `prefixed(text, prefix)` prefix a server's own text the same way.
+
+### Changed
+
+- A `skill://`, `prompts://` or `agents://` address holding an escaped `/` (`%2F`) now fails as a missing one does.
+- `resources/read` resolves `.` and `..` segments in a `skill://`, `prompts://` or `agents://` address.
 
 ## [0.1.2] - 2026-11-23
 

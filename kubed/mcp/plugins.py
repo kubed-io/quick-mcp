@@ -51,7 +51,7 @@ from fastmcp.server.providers import Provider
 from fastmcp.skills.provider import SkillCatalogProvider
 from fastmcp.utilities.versions import VersionSpec
 
-from . import skills
+from . import gateway, skills
 from ._rewrite import (
     Kind,
     RewriteFailed,
@@ -619,7 +619,8 @@ def _every(plugin: Plugin) -> bool:
 # The view of a server that sets none: one key, every plugin.
 _EVERY = View(None, _every)
 
-# How many builds are kept, the least recently used dropped first (PLUG-55).
+# How many builds are kept, the least recently used dropped first (PLUG-55), a
+# prefixed one before any with none (GW-6).
 BUILDS = 64
 
 # A build key, made by Plugins._key alone.
@@ -740,6 +741,17 @@ class _Renderer(skills.EntryOnlySkillProvider):
 
     async def load_skills(self) -> dict[str, skills.Skill]:
         return self._catalogue
+
+
+class _Prefixed(FilePrompt):
+    """A command that writes the prefix into what it renders (GW-7): its text is
+    rewritten with the build, but an argument is given at the request, so the
+    rendered text is written again. An address already prefixed is left alone."""
+
+    prefix: str
+
+    async def render(self, arguments: dict | None = None) -> str:
+        return gateway.prefixed(await super().render(arguments), self.prefix)
 
 
 class _Rewrite:
@@ -1043,12 +1055,33 @@ class Plugins:
 
     def _chain(self, key: _Key) -> tuple[Rewriter, ...]:
         """The rewriters a build for ``key`` runs, in order: the one place the order
-        is decided. Empty means no rewriting, and no copies."""
-        return self._rewriters
+        is decided. Empty means no rewriting, and no copies.
 
-    def _key(self, state: _State, view: View) -> _Key:
-        """The build key of ``view`` over ``state``: the one place a key is made."""
-        return (state.generation, view.key)
+        A prefix (GW-5) is written by one last rewriter, after the server's own, so
+        none of them sees the prefix and none can undo it.
+        """
+        prefix = self._prefix_of(key)
+        if prefix is None:
+            return self._rewriters
+
+        def write(site: Site, text: str) -> str:
+            return gateway.prefixed(text, prefix)
+
+        write.__name__ = write.__qualname__ = "gateway prefix (GW-5)"  # PLUG-59's log
+        return (*self._rewriters, write)
+
+    def _key(self, state: _State, view: View, prefix: str | None) -> _Key:
+        """The build key of ``view`` over ``state`` and the request's ``prefix``: the
+        one place a key is made. No prefix is None, so a server behind no gateway
+        keeps the one build it always had (GW-6)."""
+        return (state.generation, view.key, prefix)
+
+    @staticmethod
+    def _prefix_of(key: _Key) -> str | None:
+        """The prefix part of a key ``_key`` made: the one place it is read back."""
+        prefix = key[2]
+        assert prefix is None or isinstance(prefix, str)
+        return prefix
 
     async def pinned(self) -> _Pin:
         """The request's pin, made by its first reader; off a request, a fresh one.
@@ -1082,7 +1115,7 @@ class Plugins:
         memo = self._memo
         state = self._state
         view = self._view() if self._view else _EVERY
-        key = self._key(state, view)
+        key = self._key(state, view, gateway.prefix())
         build = await self._build_for(memo, state, view, key)
         return _Pin(state, view, key, build)
 
@@ -1114,7 +1147,15 @@ class Plugins:
         if memo is self._memo:
             memo.builds[key] = flight.build
             while len(memo.builds) > BUILDS:
-                memo.builds.popitem(last=False)
+                # A prefixed build goes first, so a client naming prefixes never
+                # pushes out a build with none (GW-6).
+                drop = next(
+                    (k for k in memo.builds if self._prefix_of(k) is not None), None
+                )
+                if drop is None:
+                    memo.builds.popitem(last=False)
+                else:
+                    del memo.builds[drop]
         return flight.build
 
     async def _make(self, state: _State, view: View, key: _Key) -> _Build:
@@ -1122,6 +1163,7 @@ class Plugins:
         reads the disk. With no rewriter it serves the objects read; with any, the
         rewritten text, and each skill folder's indexes, rendered now."""
         chain = self._chain(key)
+        prefix = self._prefix_of(key)
         admitted = tuple(s for s in state.current if view.admits(s.plugin))
         plugins = tuple(s.plugin for s in admitted)
         if not chain:
@@ -1145,7 +1187,14 @@ class Plugins:
                     catalogue[k] = built
             for file in served.prompts:
                 if (prompt := rewrite.prompt(served, file)) is not None:
-                    prompts.append(prompt)
+                    prompts.append(
+                        prompt
+                        if prefix is None
+                        else _Prefixed(
+                            **{f: getattr(prompt, f) for f in FilePrompt.model_fields},
+                            prefix=prefix,
+                        )
+                    )
             for file in served.agents:
                 if (agent := rewrite.agent(served, file)) is not None:
                     agents.append(agent)
