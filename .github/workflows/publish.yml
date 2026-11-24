@@ -4,7 +4,8 @@ name: 🧬 Publish Version
 # outward-facing happens until every artifact it refers to exists:
 #
 #   test    → the full 3.11 → 3.14 matrix; gates everything below
-#   version → roll CHANGELOG [Unreleased], commit + tag on main. The ONLY job
+#   version → a final rolls CHANGELOG [Unreleased], commits + tags on main; an rc
+#             only tags its branch head (no commit). The ONLY job
 #             that writes a file or a tag; it emits the tag used downstream.
 #   package → check out that tag and build the sdist + wheel → GHA artifact
 #   pypi    → upload that artifact to PyPI
@@ -68,14 +69,14 @@ jobs:
     needs: test
     runs-on: ubuntu-26.04
     permissions:
-      contents: write   # commit the rolled CHANGELOG and push the tag to main
+      contents: write   # a final: commit the rolled CHANGELOG and tag; an rc: the tag only
       id-token: write   # GCP workload-identity federation, for the App token
     # No release-notes output: GitHub drops a job output that contains a
     # registered secret's substring (`kubed-io` is in every PR link), silently.
     # The notes travel as an artifact instead.
     outputs:
-      tag: ${{ steps.bump.outputs.tag }}
-      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag || steps.preview.outputs.tag }}
+      version: ${{ steps.bump.outputs.version || steps.preview.outputs.version }}
     steps:
 
     # Only a prerelease may push from another ref, a family branch say, so downstream can
@@ -141,19 +142,85 @@ jobs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "Release candidate: $version (after v${last:-none})" >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Bump Version
-      id: bump
+    # version-bump with push false only works the version and the notes out, and writes
+    # nothing. Every run previews first, so the guard sees the version before anything lands.
+    - name: Preview the Version
+      id: preview
       uses: duplocloud/version-bump@main
       with:
         version: ${{ steps.candidate.outputs.version || inputs.action }}
+        push: false
+        token: ${{ steps.app-token.outputs.token }}
+
+    # One rc line per repository (spec 2026-11-24 R-UR20). version-bump reads its last
+    # version from every tag, rcs included, so while one epic's rcs are out nothing else
+    # may release: a patch beside v0.2.0-rc.1 would come out as 0.2.0. A final must be the
+    # next version from the last final tag (R-UR18), and an rc must not start a second line.
+    - name: Guard the Release
+      env:
+        ACTION: ${{ inputs.action }}
+        VERSION: ${{ steps.preview.outputs.version }}
+      run: |
+        last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
+        last=${last:-0.0.0}
+        # rc tags above the last final: an open rc line
+        open=$(git tag -l 'v*-rc.*' | sed 's/^v//' | while read -r t; do
+          base=${t%%-*}
+          [[ "$(printf '%s\n%s\n' "$last" "$base" | sort -V | tail -1)" == "$base" && "$base" != "$last" ]] && echo "$t"
+        done | sort -V)
+        if [[ "$ACTION" == prerelease ]]; then
+          for t in $open; do
+            if [[ "${t%%-*}" != "${VERSION%%-*}" ]] || ! git merge-base --is-ancestor "v$t" HEAD; then
+              echo "::error::Another rc line is open (v$t, not on this branch). One epic at a time may pre-release; this one waits for that line's final."
+              exit 1
+            fi
+          done
+          exit 0
+        fi
+        for t in $open; do
+          if [[ "${t%%-*}" != "$VERSION" ]]; then
+            echo "::error::An rc line is open (v$t), so only its own final, ${t%%-*}, may release now; this $ACTION would release $VERSION."
+            exit 1
+          fi
+        done
+        IFS=. read -r major minor patch <<< "$last"
+        case "$ACTION" in
+          major) want="$((major + 1)).0.0" ;;
+          minor) want="$major.$((minor + 1)).0" ;;
+          *) want="$major.$minor.$((patch + 1))" ;;
+        esac
+        if [[ "$VERSION" != "$want" ]]; then
+          echo "::error::This $ACTION would release $VERSION, but the next $ACTION after v$last is $want. Open rc tags: ${open:-none}. While an rc line is open only its own final may release, at the level its rcs were cut for."
+          exit 1
+        fi
+
+    # Only a final writes through version-bump: it rolls CHANGELOG [Unreleased] and tags.
+    - name: Bump Version
+      id: bump
+      if: inputs.action != 'prerelease'
+      uses: duplocloud/version-bump@main
+      with:
+        version: ${{ inputs.action }}
         push: ${{ inputs.push }}
         token: ${{ steps.app-token.outputs.token }}
+
+    # An rc leaves the changelog alone (R-UR17): no commit, just the tag on this branch's
+    # head, made before the package job checks it out, since setuptools_scm reads its
+    # version from the tag.
+    - name: Tag the Candidate
+      if: inputs.action == 'prerelease' && inputs.push
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        TAG: ${{ steps.preview.outputs.tag }}
+      run: |
+        gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" --jq .ref
+        echo "Tagged $TAG at $GITHUB_SHA, CHANGELOG untouched." >> "$GITHUB_STEP_SUMMARY"
 
     # Empty notes are a hard failure: they ARE the release, and an empty body
     # sails through a green run unnoticed.
     - name: Save the Release Notes
       env:
-        NOTES: ${{ steps.bump.outputs.release-notes }}
+        NOTES: ${{ steps.bump.outputs.release-notes || steps.preview.outputs.release-notes }}
       run: |
         mkdir -p notes
         printf '%s\n' "$NOTES" > notes/release-notes.md
