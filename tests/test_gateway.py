@@ -136,6 +136,28 @@ async def test_a_long_invalid_prefix_is_logged_cut(caplog):
     assert "x" * 65 not in message
 
 
+LONGEST = "k" + "x" * 62 + "+"  # 64 characters, the most GW-3 allows
+TOO_LONG = "k" + "x" * 63 + "+"  # 65, otherwise valid
+
+
+def test_a_prefix_is_at_most_64_characters():
+    assert len(LONGEST) == 64 and len(TOO_LONG) == 65
+    assert prefixed("skill://a", LONGEST) == LONGEST + "skill://a"
+    with pytest.raises(ValueError):
+        prefixed("skill://a", TOO_LONG)
+
+
+async def test_a_longer_prefix_is_none_and_warned(caplog):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.gateway"):
+        async with over_http(server(), header=LONGEST) as client:
+            assert await seen(client) == LONGEST
+        assert not warnings(caplog)
+        async with over_http(server(), header=TOO_LONG) as client:
+            assert await seen(client) is None
+    (record,) = warnings(caplog)
+    assert repr(TOO_LONG[:64]) in record.getMessage()
+
+
 async def test_the_kit_fixture_serves_its_plugin(tmp_path):
     async with Client(kit(tmp_path).server) as client:
         read = await client.read_resource("skill://lib/guide/SKILL.md")

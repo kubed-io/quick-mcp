@@ -28,8 +28,8 @@ HEADER = "x-mcp-resource-prefix"
 QUERY = "prefix"
 SCHEMES = ("skill", "prompts", "agents")
 
-# A letter, then letters, digits, +, - or ., ending in +.
-_VALID = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*\+")
+# A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
+_VALID = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
 # The start of an address of a served scheme, not the tail of a longer word or scheme.
 _ADDRESS = re.compile(r"(?<![A-Za-z0-9+.-])(?=(?:skill|prompts|agents)://)")
 
@@ -45,7 +45,7 @@ def prefixed(text: str, prefix: str | None) -> str:
     if not _VALID.fullmatch(prefix):
         raise ValueError(
             f"{prefix[:64]!r} is not a valid prefix: a prefix is a letter, then "
-            "letters, digits, +, - or ., ending in +"
+            "letters, digits, +, - or ., ending in +, at most 64 characters"
         )
     return _ADDRESS.sub(lambda _: prefix, text)
 
@@ -73,7 +73,7 @@ def prefix() -> str | None:
         log.warning(
             "X-MCP-Resource-Prefix %r is not a valid prefix, so this connection is "
             "served none: a prefix is a letter, then letters, digits, +, - or ., "
-            "ending in +",
+            "ending in +, at most 64 characters",
             value[:64],
         )
     return None

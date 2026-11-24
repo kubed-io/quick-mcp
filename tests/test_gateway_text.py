@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 
 import pytest
-from fastmcp import Context
+from fastmcp import Client, Context
+from fastmcp.utilities.tests import asgi_server
 from gateway_server import kit, over_http
 from skill_server import request
+
+from kubed.mcp.protocol import MCPError
 
 pytestmark = pytest.mark.unit
 
@@ -83,6 +87,7 @@ async def test_digests_agree_under_a_prefix(tmp_path):
         manifest = json.loads(await text_of(client, "skill://lib/guide/_manifest"))
         by_path = {f["path"]: f for f in manifest["files"]}
         assert by_path
+        assert entry["resources"]
         for resource in entry["resources"]:
             data = (await text_of(client, resource["uri"])).encode()
             assert resource["size"] == len(data)
@@ -100,8 +105,9 @@ async def test_with_no_prefix_the_build_is_the_objects_read(tmp_path, header):
     @mcp.tool
     async def key() -> str:
         pin = await mcp._plugins.pinned()
-        same = pin.build.catalogue["lib/guide"] is (
-            mcp._plugins.current[0].catalogue["lib/guide"]
+        same = (
+            pin.build.catalogue["lib/guide"]
+            is (mcp._plugins.current[0].catalogue["lib/guide"])
         )
         return json.dumps([list(pin.key), same])
 
@@ -126,6 +132,40 @@ async def test_prefixed_and_plain_builds_stay_apart(tmp_path):  # GW-6
         (mcp.generation, None, None),
         (mcp.generation, None, "kb+"),
     }
+
+
+async def test_a_client_naming_prefixes_never_pushes_out_the_plain_build(
+    tmp_path, monkeypatch
+):  # GW-6, PLUG-55
+    monkeypatch.setattr("kubed.mcp.plugins.BUILDS", 3)
+    mcp = kit(tmp_path)
+    plain = (mcp.generation, None, None)
+    async with asgi_server(mcp.server) as running:
+        async with Client(running.transport()) as client:
+            await text_of(client, GUIDE)
+        kept = mcp._plugins._memo.builds[plain]
+        for n in range(8):
+            transport = running.transport(headers={"X-MCP-Resource-Prefix": f"p{n}+"})
+            async with Client(transport) as client:
+                assert f"p{n}+skill://lib/guide" in await text_of(client, GUIDE)
+            builds = mcp._plugins._memo.builds
+            assert len(builds) <= 3
+            assert builds.get(plain) is kept
+    assert (mcp.generation, None, "p7+") in builds
+
+
+async def test_the_writer_is_named_in_a_failure_log(tmp_path, caplog):  # PLUG-59
+    mcp = kit(tmp_path)
+
+    def rename(site, text):
+        return text.replace("name: guide", "name: other")
+
+    mcp.add_rewriter(rename)
+    async with over_http(mcp, header="kb+") as client:
+        with pytest.raises(MCPError):
+            await text_of(client, GUIDE)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("rename, gateway prefix (GW-5) failed" in m for m in errors), errors
 
 
 async def test_the_writer_runs_after_the_servers_rewriters(tmp_path):
