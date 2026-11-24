@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
+import importlib.util
+import json
+import subprocess
+import sys
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -134,3 +140,118 @@ def test_types_is_the_sdks_wire_types() -> None:
 
     assert types is mcp_types
     assert types.ElicitResult is mcp_types.ElicitResult
+
+
+# -- importing
+
+# The top-level packages importing kubed.mcp never loads.
+FASTMCP = ("fastmcp", "fastmcp_tasks", "mcp", "mcp_types")
+
+# Printed last by every fresh interpreter: what it loaded, and what dir() misses of __all__.
+REPORT = f"""
+import json, sys
+package = sys.modules["kubed.mcp"]
+print(json.dumps({{
+    "loaded": sorted(m for m in sys.modules if m.split(".")[0] in {FASTMCP!r} or m.startswith("kubed.mcp.")),
+    "missing_from_dir": sorted(set(package.__all__) - set(dir(package))),
+}}))
+"""
+
+
+def _run(code: str) -> list[str]:
+    """``code`` then REPORT, in a new interpreter (``-I``: the installed package, no cwd)."""
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code + "\n" + REPORT],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    return out.stdout.splitlines()
+
+
+def _fresh(code: str) -> dict:
+    return json.loads(_run(code)[-1])
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import kubed.mcp",
+        "from kubed.mcp import TelemetrySettings",
+        "import kubed.mcp.telemetry",
+        "from kubed.mcp import telemetry",
+        "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
+    ],
+)
+def test_importing_kubed_mcp_imports_no_fastmcp(code: str) -> None:
+    assert _fresh(code) == {"loaded": ["kubed.mcp.telemetry"], "missing_from_dir": []}
+
+
+def test_the_first_fastmcp_name_used_imports_it() -> None:
+    lines = _run(
+        """
+import json, sys, kubed.mcp
+before = "fastmcp" in sys.modules
+q = kubed.mcp.QuickMCP
+import kubed.mcp.app
+print(json.dumps({"before": before, "after": "fastmcp" in sys.modules,
+    "same": q is kubed.mcp.app.QuickMCP, "cached": "QuickMCP" in vars(kubed.mcp)}))
+"""
+    )
+    seen = json.loads(lines[-2])
+    assert seen == {"before": False, "after": True, "same": True, "cached": True}
+
+
+def test_an_unknown_name_is_an_attribute_error_as_in_any_module() -> None:
+    import kubed.mcp
+
+    name = "Nope"  # a variable, so ruff's B009 doesn't ask for plain attribute access
+    with pytest.raises(
+        AttributeError, match=r"^module 'kubed\.mcp' has no attribute 'Nope'$"
+    ):
+        getattr(kubed.mcp, name)
+    assert not hasattr(kubed.mcp, name)
+    with pytest.raises(
+        ImportError, match=r"^cannot import name 'Nope' from 'kubed\.mcp'"
+    ):
+        exec("from kubed.mcp import Nope", {})
+
+
+def test_a_submodule_still_imports_from_the_package() -> None:
+    from kubed.mcp import protocol
+
+    assert protocol is importlib.import_module("kubed.mcp.protocol")
+
+
+def test_telemetry_imports_only_pydantic_and_the_standard_library() -> None:
+    spec = importlib.util.find_spec("kubed.mcp.telemetry")
+    assert spec is not None and spec.origin is not None
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+
+    tops: set[str] = set()
+    relative: list[str] = []
+
+    def walk(body: list[ast.stmt]) -> None:
+        for node in body:
+            if isinstance(node, ast.Import):
+                tops.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    relative.append(node.module or "")
+                else:
+                    tops.add((node.module or "").split(".")[0])
+            elif isinstance(node, ast.If):
+                guard = node.test
+                is_type_checking = (
+                    isinstance(guard, ast.Name) and guard.id == "TYPE_CHECKING"
+                ) or (
+                    isinstance(guard, ast.Attribute) and guard.attr == "TYPE_CHECKING"
+                )
+                if not is_type_checking:
+                    walk(node.body)
+                walk(node.orelse)
+
+    walk(tree.body)
+    assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"}
+    assert relative == []
