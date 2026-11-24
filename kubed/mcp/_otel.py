@@ -17,7 +17,10 @@ from contextlib import contextmanager
 from types import ModuleType
 from urllib.parse import quote
 
-# The SDK by name: without it a missing install is the one warning, not a failed start.
+# The distro and the SDK by name: without them a missing install is the one warning,
+# not a failed start, nor an initialize() that silently configures nothing.
+import opentelemetry.distro
+import opentelemetry.sdk._logs as _sdk_logs
 import opentelemetry.sdk.trace
 from opentelemetry import _logs, metrics, trace
 from opentelemetry.context import Context
@@ -26,7 +29,6 @@ from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from opentelemetry.instrumentation.logging.handler import (
     LoggingHandler as _InstrumentationHandler,
 )
-from opentelemetry.sdk._logs import LoggingHandler as _SdkHandler
 
 from .telemetry import Telemetry
 
@@ -44,14 +46,18 @@ _TRACEBACK_LOGGERS = (
 )
 
 # What sends records over OTLP: the logging instrumentor's handler, or the SDK's own.
-_OTEL_HANDLERS = (_InstrumentationHandler, _SdkHandler)
+# The SDK's is deprecated and goes in a later 1.x, so it's looked up, not imported.
+_SdkHandler = getattr(_sdk_logs, "LoggingHandler", None)
+_OTEL_HANDLERS = tuple(
+    handler for handler in (_InstrumentationHandler, _SdkHandler) if handler is not None
+)
 
 
 def _resource_attributes(existing: str, tags: Mapping[str, str]) -> str:
     """``existing``, with the pod's keys and then ``tags`` added where it has none.
 
     The SDK splits on "," and then "=", strips keys and unquotes values, so a value is
-    quoted and a key that holds either character is left off.
+    quoted and a key that holds either character, or is blank, is left off.
     """
     added: dict[str, str] = {}
     for key, variable in (
@@ -61,7 +67,7 @@ def _resource_attributes(existing: str, tags: Mapping[str, str]) -> str:
         if value := os.environ.get(variable):
             added[key] = value
     for key, value in tags.items():
-        if "," in key or "=" in key:
+        if "," in key or "=" in key or not key.strip():
             log.warning(
                 "Tag left off traces: "
                 "a resource attribute key can't hold ',' or '=': %r",

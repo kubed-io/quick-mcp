@@ -545,7 +545,14 @@ def test_resource_attributes_merge_and_encode(monkeypatch) -> None:
 def test_a_tag_key_the_sdk_would_split_is_left_off(monkeypatch, caplog) -> None:
     from kubed.mcp._otel import _resource_attributes
 
-    tags = {"a,team=x": "1", "b=c": "2", " team ": "3", " tier ": "4"}
+    tags = {
+        "a,team=x": "1",
+        "b=c": "2",
+        " team ": "3",
+        " tier ": "4",
+        "": "5",
+        "  ": "6",
+    }
     merged = _resource_attributes("team=preset", tags)
     # A key with spaces is the stripped key: it loses to one already there.
     assert merged == "team=preset,tier=4"
@@ -556,7 +563,7 @@ def test_a_tag_key_the_sdk_would_split_is_left_off(monkeypatch, caplog) -> None:
             "Tag left off traces: a resource attribute key can't hold ',' or '=': "
             + repr(key),
         )
-        for key in ("a,team=x", "b=c")
+        for key in ("a,team=x", "b=c", "", "  ")
     ]
 
 
@@ -713,6 +720,37 @@ async def test_otel_missing_is_one_warning_and_the_server_serves(
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
     assert [r.levelno for r in records] == [logging.WARNING]
     assert "kubed-mcp[telemetry]" in records[0].getMessage()
+
+
+async def test_distro_missing_is_one_warning_and_the_server_serves(
+    monkeypatch, caplog
+) -> None:
+    import opentelemetry.instrumentation.auto_instrumentation as auto
+
+    # Uninstalled, initialize() falls back to a distro that configures nothing.
+    calls: list[dict] = []
+    monkeypatch.setattr(auto, "initialize", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setitem(sys.modules, "opentelemetry.distro", None)
+    monkeypatch.delitem(sys.modules, "kubed.mcp._otel", raising=False)
+    monkeypatch.delattr(kubed.mcp, "_otel", raising=False)
+    async with Client(served("bare", TelemetrySettings(otel=True)).server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+    records = [r for r in caplog.records if r.name.startswith("kubed.mcp")]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert "kubed-mcp[telemetry]" in records[0].getMessage()
+    assert calls == []
+
+
+def test_the_sdk_handler_gone_still_imports(monkeypatch) -> None:
+    import opentelemetry.sdk._logs
+    from opentelemetry.instrumentation.logging.handler import LoggingHandler
+
+    # Deprecated in the SDK, and the extra allows any opentelemetry-sdk<2.
+    monkeypatch.delattr(opentelemetry.sdk._logs, "LoggingHandler")
+    monkeypatch.delitem(sys.modules, "kubed.mcp._otel", raising=False)
+    monkeypatch.delattr(kubed.mcp, "_otel", raising=False)
+    otel = importlib.import_module("kubed.mcp._otel")
+    assert (LoggingHandler,) == otel._OTEL_HANDLERS
 
 
 async def test_otel_after_the_owner_stopped_is_one_warning(monkeypatch, caplog) -> None:
