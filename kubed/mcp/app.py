@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol, TypeVar
 
@@ -141,7 +141,11 @@ class QuickMCP:
         )
 
     def add_plugin(
-        self, address: str | os.PathLike[str], *, namespace: str | None = None
+        self,
+        address: str | os.PathLike[str],
+        *,
+        namespace: str | None = None,
+        manifest: Mapping[str, object] | None = None,
     ) -> Plugin:
         """Serves the plugin at ``address``: its skills, its commands and its agents.
 
@@ -152,8 +156,11 @@ class QuickMCP:
         a ``ValueError``: there is no root. Plugins under one namespace merge. A plugin
         that does not load, or that would serve something already served, is refused
         with a ``PluginError`` naming the reason, and nothing of it is served.
+
+        ``manifest`` is the plugin's marketplace entry, merged with its ``plugin.json``
+        as Claude Code merges them (``read_plugin``).
         """
-        return self._plugins.add(address, namespace)
+        return self._plugins.add(address, namespace, manifest)
 
     def add_loader(self, loader: PluginLoader) -> None:
         """Registers ``loader`` for the address schemes it names.

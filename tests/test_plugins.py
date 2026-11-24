@@ -144,6 +144,129 @@ def test_a_manifest_symlinked_out_of_the_root_is_not_read(tmp_path):
     assert read_plugin(root).name == "linked"
 
 
+# ---- the marketplace entry ---------------------------------------------------------
+# Merged as Claude Code merges an entry with plugin.json (its marketplace reference,
+# "How an entry combines with plugin.json" and "Strict mode").
+
+IGNORED_AGENTS = 'Default agents/ folder is ignored because the manifest sets "agents"'
+
+
+async def test_an_entry_beside_plugin_json_adds_its_components(tmp_path):
+    root = copy(
+        tmp_path,
+        files={
+            "extra/more/SKILL.md": skill("more"),
+            "team/lead.md": agent_md("lead"),
+        },
+    )
+    entry = {
+        "name": "kit",
+        "source": "./",
+        "description": "From the entry.",
+        "version": "9.9.9",
+        "skills": ["./extra"],
+        "agents": "./team/lead.md",
+    }
+    mcp = QuickMCP("t")
+    plugin = mcp.add_plugin(root, manifest=entry)
+    # The entry's name and description are shown; plugin.json's version wins.
+    assert (plugin.name, plugin.description, plugin.version) == (
+        "kit",
+        "From the entry.",
+        "1.2.3",
+    )
+    assert plugin.components.skills == ("skills", "extra")
+    assert plugin.components.agents == ("team/lead.md",)
+    assert plugin.components.notes == (IGNORED_AGENTS,)
+    assert await listed(mcp) == (
+        ["greet"],
+        ["lead"],
+        [ENTRY, "skill://t/more/SKILL.md"],
+    )
+
+
+def test_an_entrys_paths_follow_plugin_json_s(tmp_path):
+    root = copy(
+        tmp_path,
+        files={
+            ".claude-plugin/plugin.json": json.dumps(
+                {"name": "demo", "commands": ["./commands/greet.md"]}
+            ),
+            "more/wave.md": command_md(),
+        },
+    )
+    plugin = read_plugin(root, manifest={"commands": ["./more/wave.md"]})
+    assert plugin.components.commands == ("commands/greet.md", "more/wave.md")
+
+
+async def test_with_no_plugin_json_the_entry_is_the_manifest(tmp_path):
+    root = write(
+        tmp_path / "bare",
+        {
+            "skills/x/SKILL.md": skill("x"),
+            "agents/helper.md": agent_md("helper"),
+            "cmds/only.md": command_md(),
+            "commands/hidden.md": command_md(),
+        },
+    )
+    # Whatever strict says.
+    entry = {"name": "e", "strict": False, "version": "2.0.0", "commands": "./cmds/"}
+    mcp = QuickMCP("t")
+    plugin = mcp.add_plugin(root, manifest=entry)
+    assert (plugin.name, plugin.description, plugin.version) == ("e", None, "2.0.0")
+    assert plugin.components.commands == ("cmds",)
+    assert plugin.components.notes == (
+        'Default commands/ folder is ignored because the manifest sets "commands"',
+    )
+    assert await listed(mcp) == (["only"], ["helper"], ["skill://t/x/SKILL.md"])
+
+
+@pytest.mark.parametrize("field", ["skills", "commands", "agents", "hooks"])
+def test_strict_false_naming_a_component_beside_plugin_json_refuses(tmp_path, field):
+    root = copy(tmp_path)
+    mcp = QuickMCP("t")
+    entry = {"name": "demo", "strict": False, field: "./x"}
+    with pytest.raises(PluginError, match="conflicting manifests") as refused:
+        mcp.add_plugin(root, manifest=entry)
+    assert str(root) in str(refused.value)
+    assert mcp.plugins == ()
+
+
+def test_strict_false_naming_no_component_is_plugin_json_alone(tmp_path):
+    root = copy(tmp_path)
+    entry = {"name": "demo", "strict": False, "description": "Listed."}
+    plugin = read_plugin(root, manifest=entry)
+    assert plugin.components == read_plugin(root).components
+    assert plugin.description == "Listed."
+
+
+def test_an_entrys_paths_are_published_content(tmp_path):
+    root = copy(tmp_path, files={"extra/more/SKILL.md": skill("more")})
+    entry = {"skills": ["../outside", "extra", "/etc"], "agents": ["./notes.txt"]}
+    plugin = read_plugin(root, manifest=entry)
+    assert plugin.components.skills == ("skills", "extra")
+    assert plugin.components.agents == ()
+    assert plugin.components.notes == (
+        "skills path '../outside' leaves the plugin root",
+        "skills path 'extra' does not start with ./",
+        "skills path '/etc' leaves the plugin root",
+        "agents entry 'notes.txt' is not a .md file",
+        IGNORED_AGENTS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        (["./"], "the marketplace entry must be a JSON object"),
+        ({"agents": 3}, "agents must be a string or a list of strings"),
+    ],
+)
+def test_a_broken_entry_refuses_the_plugin(tmp_path, entry, reason):
+    with pytest.raises(PluginError, match=reason):
+        QuickMCP("t").add_plugin(copy(tmp_path), manifest=entry)
+
+
 # ---- loaders -----------------------------------------------------------------------
 
 

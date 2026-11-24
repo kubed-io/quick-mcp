@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `add_plugin(…, manifest=entry)` and `read_plugin(root, manifest=…)` merge a marketplace entry with `plugin.json` as Claude Code does.
+
 ## [0.1.2] - 2026-11-23
 
 ### Added

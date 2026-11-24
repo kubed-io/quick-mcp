@@ -58,6 +58,8 @@ log = logging.getLogger(__name__)
 
 MANIFEST_FILES = (".claude-plugin/plugin.json", "plugin.json")
 KINDS = ("skills", "commands", "agents")
+# The fields beside a plugin.json that strict: false refuses, as Claude Code does.
+COMPONENT_FIELDS = (*KINDS, "hooks", "outputStyles", "themes")
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
 
 
@@ -164,6 +166,11 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _first(*values: object) -> str | None:
+    """The first of ``values`` that is a string."""
+    return next((value for value in values if isinstance(value, str)), None)
+
+
 def _strings(value: object, field: str) -> tuple[str, ...] | None:
     """A field that may be written as one string or as a list of them."""
     if value is None:
@@ -193,7 +200,7 @@ def _relative(text: str, field: str, notes: list[str]) -> str:
     return relative
 
 
-def _declared(data: dict, field: str, notes: list[str]) -> tuple[str, ...] | None:
+def _declared(data: Mapping, field: str, notes: list[str]) -> tuple[str, ...] | None:
     """The paths a manifest declares for one kind, or None when it declares none."""
     value = data.get(field)
     if field == "commands" and isinstance(value, dict):
@@ -212,6 +219,21 @@ def _declared(data: dict, field: str, notes: list[str]) -> tuple[str, ...] | Non
     return paths
 
 
+def _merged(
+    sources: Iterable[Mapping], field: str, notes: list[str]
+) -> tuple[str, ...] | None:
+    """The paths each source declares for one kind, appended in order, or None when
+    none declares any."""
+    declared = [
+        paths
+        for source in sources
+        if (paths := _declared(source, field, notes)) is not None
+    ]
+    if not declared:
+        return None
+    return tuple(dict.fromkeys(path for paths in declared for path in paths))
+
+
 def _ignores(kind: str, declared: tuple[str, ...]) -> bool:
     """Whether paths ``declared`` for ``kind`` leave its default folder unread.
 
@@ -222,7 +244,9 @@ def _ignores(kind: str, declared: tuple[str, ...]) -> bool:
     )
 
 
-def read_plugin(root: str | os.PathLike[str]) -> Plugin:
+def read_plugin(
+    root: str | os.PathLike[str], manifest: Mapping[str, object] | None = None
+) -> Plugin:
     """The plugin in folder ``root``, from its manifest and the conventions.
 
     The manifest is the first of ``MANIFEST_FILES`` that is a regular file inside the
@@ -232,11 +256,20 @@ def read_plugin(root: str | os.PathLike[str]) -> Plugin:
     folder, noted when it is there. A manifest that is not a JSON object, or a
     component field that is not a string or a list of strings, is refused with
     ``PluginError``.
+
+    ``manifest`` is the plugin's marketplace entry, merged as Claude Code merges it.
+    With no ``plugin.json`` it is the manifest, whatever ``strict`` says. Beside one,
+    its component paths are appended to the file's, read and checked the same way, and
+    with ``strict: false`` an entry naming any component refuses the plugin. Its
+    ``name`` and ``description`` win over the file's, the file's ``version`` over its.
     """
     root = Path(root)
     if not root.is_dir():
         raise PluginError(f"{root} is not a folder")
+    if manifest is not None and not isinstance(manifest, Mapping):
+        raise PluginError("the marketplace entry must be a JSON object")
     base = root.resolve()
+    sources: list[Mapping] = []  # plugin.json, then the entry
     data: dict = {}
     for name in MANIFEST_FILES:
         path = _readable(base, name)
@@ -250,12 +283,23 @@ def read_plugin(root: str | os.PathLike[str]) -> Plugin:
             raise PluginError(f"{name} is nested too deeply to read") from None
         if not isinstance(data, dict):
             raise PluginError(f"{name} must be a JSON object")
+        sources.append(data)
         break
+    entry: dict = {}
+    if manifest is not None:
+        entry = dict(manifest)
+        named = any(entry.get(field) is not None for field in COMPONENT_FIELDS)
+        if sources and entry.get("strict") is False and named:
+            raise PluginError(
+                "conflicting manifests: both plugin.json and the marketplace entry "
+                "specify components, and the entry is strict: false"
+            )
+        sources.append(entry)
 
     notes: list[str] = []
     found: dict[str, tuple[str, ...]] = {}
     for kind in KINDS:
-        declared = _declared(data, kind, notes)
+        declared = _merged(sources, kind, notes)
         default = (base / kind).is_dir() and _inside(base / kind, base) is not None
         if declared is None:
             found[kind] = (kind,) if default else ()
@@ -268,11 +312,12 @@ def read_plugin(root: str | os.PathLike[str]) -> Plugin:
                     f"Default {kind}/ folder is ignored because the manifest sets "
                     f'"{kind}"'
                 )
-    name = _text(data.get("name"))
+    # Claude Code shows the entry's name and description; plugin.json's version wins.
+    names = (_text(entry.get("name")), _text(data.get("name")))
     return Plugin(
-        name=name if _usable(name) else root.name,
-        description=_text(data.get("description")),
-        version=_text(data.get("version")),
+        name=next((name for name in names if _usable(name)), root.name),
+        description=_first(entry.get("description"), data.get("description")),
+        version=_first(data.get("version"), entry.get("version")),
         root=root,
         components=Components(**found, notes=tuple(notes)),
     )
@@ -480,7 +525,10 @@ class Plugins:
         return loader
 
     def add(
-        self, address: str | os.PathLike[str], namespace: str | None = None
+        self,
+        address: str | os.PathLike[str],
+        namespace: str | None = None,
+        manifest: Mapping[str, object] | None = None,
     ) -> Plugin:
         address = os.fspath(address)
         prefix = _namespace(namespace, self._server.name)
@@ -492,7 +540,7 @@ class Plugins:
                 raise
             except (OSError, ValueError) as exc:
                 raise PluginError(str(exc) or type(exc).__name__) from exc
-            plugin = read_plugin(root)
+            plugin = read_plugin(root, manifest)
             notes = list(plugin.components.notes)
             read = self._read(plugin, prefix, notes)
         except PluginError as exc:
