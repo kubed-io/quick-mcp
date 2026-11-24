@@ -7,6 +7,8 @@ not in pytest's. The tests read what this writes: spans on stdout, log lines on 
 - ``off``: servers with telemetry off, then the modules they loaded.
 - ``bare``: a traced server in a process that configured no logging, and root as it saw it.
 - ``bare-configured``: the same, with an SDK already configured, as opentelemetry-instrument does.
+- ``prometheus``: the call metrics and a server's own counter, scraped from the exporter's port.
+- ``own_meter``: a meter provider of the process's own and no tracer provider, read after the stop.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ HEAVY = (
     "opentelemetry.instrumentation",
     "pyroscope.otel",
     "kubed.mcp._otel",
+    "fastmcp.server.middleware.usage",
 )
 
 
@@ -119,6 +122,88 @@ async def bare_configured() -> None:
     await bare()
 
 
+async def prometheus() -> None:
+    """The call metrics and a server's own counter, scraped from the exporter's port."""
+    import os
+    import urllib.request
+
+    from opentelemetry import metrics
+
+    config = argparse.Namespace(
+        transport="http",
+        host="0.0.0.0",
+        port=8000,
+        telemetry=TelemetrySettings(otel=True),
+    )
+    mcp = QuickMCP("prom", config=config)
+
+    @mcp.tool
+    def ping() -> str:
+        metrics.get_meter("tests").create_counter("tests.own.calls").add(1)
+        return "pong"
+
+    url = f"http://localhost:{os.environ['OTEL_EXPORTER_PROMETHEUS_PORT']}/metrics"
+    async with Client(mcp.server) as client:
+        await client.call_tool("ping", {})
+        # The child inherits the environment, and a proxy must never see the scrape.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=10) as response:
+            body = response.read().decode()
+    for line in body.splitlines():
+        if line.startswith(
+            ("mcp_server_operation_duration_seconds_count", "tests_own_calls_total")
+        ):
+            print(line)
+
+
+async def own_meter() -> None:
+    """A meter provider set before the server, and no tracer provider: it outlives the stop."""
+    import opentelemetry.sdk.trace
+    from opentelemetry import metrics, trace
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricsData
+
+    class Reader(InMemoryMetricReader):
+        """As an exporting reader does: once its provider shuts it down, it reads nothing.
+
+        The in-memory reader's own shutdown does nothing, so it would read on regardless.
+        """
+
+        closed = False
+
+        def shutdown(self, timeout_millis: float = 30_000, **kwargs) -> None:
+            self.closed = True
+
+        def get_metrics_data(self) -> MetricsData | None:
+            return None if self.closed else super().get_metrics_data()
+
+    reader = Reader()
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+    await serve(server("metered", TelemetrySettings(otel=True)), "ping")
+    # After the lifespan: a provider shut down would leave the reader nothing to collect.
+    points = 0
+    data = reader.get_metrics_data()
+    for resource in data.resource_metrics if data is not None else ():
+        for scope in resource.scope_metrics:
+            for metric in scope.metrics:
+                if metric.name != "mcp.server.operation.duration":
+                    continue
+                for point in metric.data.data_points:
+                    if point.attributes.get("gen_ai.tool.name") == "ping":
+                        points += point.count
+    result = {
+        "kept": metrics.get_meter_provider() is provider,
+        "points": points,
+        "tracer_is_sdk": isinstance(
+            trace.get_tracer_provider(), opentelemetry.sdk.trace.TracerProvider
+        ),
+    }
+    # The last line on stdout: the console exporter writes the spans there too.
+    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.flush()
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if not mode.startswith("bare"):
@@ -128,5 +213,7 @@ if __name__ == "__main__":
         "off": off,
         "bare": bare,
         "bare-configured": bare_configured,
+        "prometheus": prometheus,
+        "own_meter": own_meter,
     }
     asyncio.run(modes[mode]())

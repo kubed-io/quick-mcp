@@ -39,12 +39,14 @@ tasks = [
 # pyroscope-io's floor is the first release with memory profiling (mem_enabled), 1.2.0.
 # The OpenTelemetry floors are the versions tested. The exporter is the HTTP one alone:
 # opentelemetry-distro[otlp] would pull in gRPC. _otel imports the SDK directly, so it
-# is named, not left to the distro.
+# is named, not left to the distro. The Prometheus exporter is what
+# OTEL_METRICS_EXPORTER=prometheus loads.
 telemetry = [
   "pyroscope-io>=1.2,<2",
   "opentelemetry-distro>=0.66b2,<1",
   "opentelemetry-sdk>=1.45.2,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.45.2,<2",
+  "opentelemetry-exporter-prometheus>=0.66b2,<1",
   "opentelemetry-instrumentation-logging>=0.66b2,<1",
   "pyroscope-otel>=1.1,<2",
 ]

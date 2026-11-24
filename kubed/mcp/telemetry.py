@@ -10,9 +10,12 @@ import logging
 import os
 from collections.abc import Mapping
 from types import ModuleType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from fastmcp.server.middleware import Middleware
 
 log = logging.getLogger(__name__)
 
@@ -205,3 +208,22 @@ def _start_otel(
         )
         return None
     return _otel.start(name, settings, profiles)
+
+
+def _call_metrics(settings: Telemetry | None) -> Middleware | None:
+    """FastMCP's call metrics when ``settings.otel``, imported only then. Never raises.
+
+    A section with no ``otel`` is off here: the lifespan logs that section's error.
+    """
+    try:
+        if settings is None or not getattr(settings, "otel", False):
+            return None
+        from fastmcp.server.middleware.usage import UsageMiddleware
+
+        return UsageMiddleware(user_id="omit")
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "Call metrics did not start; serving without them: %s",
+            type(error).__name__,
+        )
+        return None

@@ -27,7 +27,7 @@ from .container import (
     _Call,
 )
 from .plugins import Plugin, PluginLoader, Plugins
-from .telemetry import Telemetry, _start_signals
+from .telemetry import Telemetry, _call_metrics, _start_signals
 
 T = TypeVar("T")
 
@@ -111,6 +111,7 @@ class QuickMCP:
     ):
         self._container = Container()
         self._config = config
+        telemetry = getattr(config, "telemetry", None)
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
             name,
@@ -118,12 +119,16 @@ class QuickMCP:
                 self._container,
                 lifespan,
                 name=name,
-                telemetry=getattr(config, "telemetry", None),
+                telemetry=telemetry,
             ),
             **fastmcp_options,
         )
-        # Outermost, so every middleware and handler inside it shares one call's slot.
+        # _CallScope is outermost but for the call metrics, so every other middleware
+        # and handler shares one call's slot. The metrics go first, to record what the
+        # client received, the slot's teardown included (APP-6, TEL-16).
         self.server.middleware.insert(0, _CallScope(self._container))
+        if (metrics := _call_metrics(telemetry)) is not None:
+            self.server.middleware.insert(0, metrics)
         SERVING[self.server] = self._container
         if config is not None:
             self._container.values[type(config)] = config
