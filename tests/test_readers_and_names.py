@@ -5,6 +5,7 @@ PLUG-65, PLUG-74)."""
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from fastmcp import Client
@@ -330,6 +331,68 @@ async def test_a_readers_render_override_is_served_behind_a_prefix(tmp_path):
     async with over_http(mcp, header="kb+") as client:
         said = (await client.get_prompt("lib_ask", {})).messages[0].content.text
     assert said == "see kb+skill://lib/guide/SKILL.md"
+
+
+# ---- prompt files, x.prompt.md (PLUG-22, PLUG-62) ---------------------------------
+
+
+async def test_a_prompt_files_name_drops_its_file_type(tmp_path):
+    root = write(
+        tmp_path / "p",
+        {"commands/x.prompt.md": command_md(), "commands/db/x.prompt.md": command_md()},
+    )
+    assert (await listed(served((root, "kit"))))[0] == ["kit_db_x", "kit_x"]
+
+
+def test_only_one_trailing_prompt_is_dropped(tmp_path):
+    root = write(tmp_path / "p", {"commands/x.prompt.prompt.md": command_md()})
+    assert served((root, "kit")).plugins[0].prompts == ("kit_x.prompt",)
+
+
+async def test_a_command_and_a_prompt_file_of_one_name_clash(tmp_path, caplog):
+    root = write(
+        tmp_path / "p",
+        {
+            "commands/x.md": command_md("Plain."),
+            "commands/x.prompt.md": command_md("Copilot."),
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        mcp = served((root, "kit"))
+    plugin = mcp.plugins[0]
+    assert plugin.prompts == ("kit_x",)
+    assert plugin.skipped == (
+        ("commands/x.prompt.md", "prompt kit_x is already served by commands/x.md"),
+    )
+    async with Client(mcp.server) as client:
+        prompts = await client.list_prompts()
+    assert [(p.name, p.description) for p in prompts] == [("kit_x", "Plain.")]
+    base = root.resolve()
+    assert (
+        f"prompt kit_x is already served by {base / 'commands/x.md'}; "
+        f"{base / 'commands/x.prompt.md'} is skipped"
+    ) in caplog.text
+
+
+async def test_a_listed_prompt_file_outside_commands_has_no_folder_segment(tmp_path):
+    root = write(tmp_path / "p", {"prompts/deep/x.prompt.md": command_md()})
+    mcp = QuickMCP("t")
+    mcp.add_plugin(
+        root, namespace="kit", manifest={"commands": ["./prompts/deep/x.prompt.md"]}
+    )
+    assert (await listed(mcp))[0] == ["kit_x"]
+
+
+def test_a_prompt_file_with_no_name_is_skipped(tmp_path):
+    root = write(tmp_path / "p", {"prompts/.prompt.md": command_md()})
+    mcp = QuickMCP("t")
+    plugin = mcp.add_plugin(
+        root, namespace="kit", manifest={"commands": ["./prompts/.prompt.md"]}
+    )
+    assert plugin.prompts == ()
+    assert plugin.skipped == (
+        ("prompts/.prompt.md", "prompt name 'kit_' is not a usable name"),
+    )
 
 
 # ---- agents renamed on set entry (PLUG-64, PLUG-65, PLUG-74) -----------------------

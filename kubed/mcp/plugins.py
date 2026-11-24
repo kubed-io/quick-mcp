@@ -1635,7 +1635,8 @@ class Plugins:
         named = "" if own else prefix.split("/")[0] + "_"
         prompts: list[_File] = []
         for path, folders_in in _md_files(base, "commands", parts.commands, notes):
-            segments = (*folders_in, path.stem)
+            # Copilot's .prompt.md is the file type: x.prompt.md is x (PLUG-62).
+            segments = (*folders_in, path.stem.removesuffix(".prompt"))
             name = named + "_".join(segments)
             if not all(_usable(part) for part in (*segments, name)):
                 reason = f"prompt name {name!r} is not a usable name"
