@@ -7,6 +7,7 @@ not in pytest's. The tests read what this writes: spans on stdout, log lines on 
 - ``off``: servers with telemetry off, then the modules they loaded.
 - ``bare``: a traced server in a process that configured no logging, and root as it saw it.
 - ``bare-configured``: the same, with an SDK already configured, as opentelemetry-instrument does.
+- ``prometheus``: the call metrics and a server's own counter, scraped from the exporter's port.
 - ``own_meter``: a meter provider of the process's own and no tracer provider, read after the stop.
 """
 
@@ -144,7 +145,9 @@ async def prometheus() -> None:
     url = f"http://localhost:{os.environ['OTEL_EXPORTER_PROMETHEUS_PORT']}/metrics"
     async with Client(mcp.server) as client:
         await client.call_tool("ping", {})
-        with urllib.request.urlopen(url, timeout=10) as response:
+        # The child inherits the environment, and a proxy must never see the scrape.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=10) as response:
             body = response.read().decode()
     for line in body.splitlines():
         if line.startswith(

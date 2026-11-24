@@ -1654,7 +1654,7 @@ async def test_a_teardown_error_is_recorded_on_the_call(metered) -> None:
     async with Client(mcp.server) as client:
         # The teardown fails outside the tool, so the client gets a protocol error.
         with pytest.raises(MCPError):
-            await client.call_tool("leaks", {}, raise_on_error=False)
+            await client.call_tool("leaks", {})
     (point,) = duration_points(metered, "torn-down")
     # UsageMiddleware names an error that isn't FastMCP's by its class
     assert (point.attributes["gen_ai.tool.name"], point.attributes["error.type"]) == (
@@ -1681,6 +1681,7 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
         middleware=[Given()],
     )
     mcp.add_middleware(Added())
+    assert isinstance(mcp.server.middleware[0], UsageMiddleware)
     assert _middleware(mcp) == [
         UsageMiddleware,
         _CallScope,
