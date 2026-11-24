@@ -74,12 +74,21 @@ class TelemetrySettings(BaseModel):
 class _Signals:
     """What a start began, so the same call can stop it."""
 
-    def __init__(self, profiles: ModuleType | None) -> None:
+    def __init__(self, profiles: ModuleType | None, otel: object | None = None) -> None:
         self._profiles = profiles
+        self._otel = otel
 
     def stop(self) -> None:
-        """Stop what this start began. Never raises; frees the process's slot."""
+        """Stop what this start began. Never raises; frees the process's slot.
+
+        OpenTelemetry stops first, so no span still tags a thread once profiles stop.
+        """
         global _running
+        try:
+            if self._otel is not None:
+                self._otel.stop()
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
         try:
             if self._profiles is not None and self._profiles.shutdown() is False:
                 log.warning("Profiles did not stop cleanly")
@@ -103,9 +112,10 @@ def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
         if _running is not None or settings is None:
             return None
         profiles = _start_profiles(name, settings)
-        if profiles is None:
+        otel = _start_otel(name, settings, profiles)
+        if profiles is None and otel is None:
             return None
-        _running = _Signals(profiles)
+        _running = _Signals(profiles, otel)
         return _running
     except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
         log.error(
@@ -166,3 +176,32 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
         log.error("Profiles did not start: a profiler already runs in this process")
         return None
     return pyroscope
+
+
+def _start_otel(
+    name: str, settings: Telemetry, profiles: ModuleType | None
+) -> object | None:
+    """Start OpenTelemetry when ``settings.otel``, imported only then. Never raises."""
+    try:
+        if not settings.otel:
+            return None
+        from . import _otel
+    except ModuleNotFoundError as error:
+        if not (error.name or "").startswith("opentelemetry"):
+            # Some other module is missing: a failed start, not a missing package.
+            log.error(
+                "OpenTelemetry did not start; serving without it: %s",
+                type(error).__name__,
+            )
+            return None
+        log.warning(
+            "OpenTelemetry is on, but its packages are not installed: "
+            "install kubed-mcp[telemetry]"
+        )
+        return None
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "OpenTelemetry did not start; serving without it: %s", type(error).__name__
+        )
+        return None
+    return _otel.start(name, settings, profiles)

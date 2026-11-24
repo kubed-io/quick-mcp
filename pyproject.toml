@@ -37,8 +37,16 @@ tasks = [
 ]
 # Telemetry (the telemetry area of the spec), installed by servers' images only.
 # pyroscope-io's floor is the first release with memory profiling (mem_enabled), 1.2.0.
+# The OpenTelemetry floors are the versions tested. The exporter is the HTTP one alone:
+# opentelemetry-distro[otlp] would pull in gRPC. _otel imports the SDK directly, so it
+# is named, not left to the distro.
 telemetry = [
   "pyroscope-io>=1.2,<2",
+  "opentelemetry-distro>=0.66b2,<1",
+  "opentelemetry-sdk>=1.45.2,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.45.2,<2",
+  "opentelemetry-instrumentation-logging>=0.66b2,<1",
+  "pyroscope-otel>=1.1,<2",
 ]
 build = [
   "setuptools_scm",
@@ -89,6 +97,7 @@ testpaths = ["tests"]
 markers = [
   "unit: mark a test as a unit test",
   "integration: mark a test as an integration test",
+  "real_initialize: let the test run OpenTelemetry's real initialize() in-process",
 ]
 
 [tool.ruff]
