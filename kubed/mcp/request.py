@@ -6,6 +6,7 @@ server reads its own settings out of what it returns.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 
 from fastmcp.server.dependencies import get_context, get_http_headers, get_http_request
@@ -14,6 +15,35 @@ from starlette.requests import Request
 Values = dict[str, list[str]]
 
 __all__ = ["Values", "get_context", "get_http_request", "request_values"]
+
+# What each connection has already been told, by name, keyed by session id. The session
+# object is no key: FastMCP builds a new one per HTTP request. The map is bounded, the
+# oldest connection forgotten first, so a server that lives for years does not grow it.
+_TOLD_MAX = 1024
+_told: OrderedDict[str, set[str]] = OrderedDict()
+
+
+def _first_time(name: str) -> bool:
+    """True the first time the current connection asks for ``name``, then False.
+
+    It is how a warning is made once per connection and not once per request. With
+    no context or no session to key on, it is always True. On a protocol era where every
+    request is its own connection, so is every request.
+    """
+    try:
+        key = get_context().session_id
+    except RuntimeError:  # no context, or no session established yet
+        return True
+    if not key:
+        return True
+    names = _told.setdefault(key, set())
+    _told.move_to_end(key)
+    while len(_told) > _TOLD_MAX:
+        _told.popitem(last=False)
+    if name in names:
+        return False
+    names.add(name)
+    return True
 
 
 def request_values(
