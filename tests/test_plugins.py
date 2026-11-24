@@ -20,6 +20,7 @@ from kubed.mcp import QuickMCP
 from kubed.mcp.agents import EXTENSION_ID, META_KEY
 from kubed.mcp.plugins import LocalLoader, Plugin, PluginError, read_plugin
 from kubed.mcp.protocol import MCPError
+from kubed.mcp.skills import EntryOnlySkillProvider
 
 pytestmark = pytest.mark.unit
 
@@ -453,6 +454,34 @@ def test_the_registry_is_the_plugins_served():
             agents=("helper",),
         ),
     )
+
+
+async def test_one_provider_of_each_kind_serves_the_plugins_as_served(tmp_path):
+    other = write(
+        tmp_path / "other",
+        {
+            "skills/other-guide/SKILL.md": skill("other-guide"),
+            "commands/wave.md": command_md(),
+            "agents/scout.md": agent_md("scout"),
+        },
+    )
+    mcp = served((DEMO, None), (other, None))
+    providers = [
+        p for p in mcp.server.providers if isinstance(p, EntryOnlySkillProvider)
+    ]
+    assert len(providers) == 1
+    assert await mcp.server.local_provider.list_prompts() == []
+    assert await listed(mcp) == (
+        ["greet", "wave"],
+        ["helper", "scout"],
+        [ENTRY, "skill://t/other-guide/SKILL.md"],
+    )
+    # What is served is the served set, read on each call: a set without the second
+    # plugin serves none of it.
+    plugins = mcp._plugins
+    plugins.current = plugins.current[:1]
+    assert await listed(mcp) == (["greet"], ["helper"], [ENTRY])
+    assert [p.name for p in mcp.plugins] == ["demo"]
 
 
 # ---- layout and names, as Claude Code reads them ---------------------------------

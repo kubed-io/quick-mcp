@@ -171,7 +171,8 @@ class AgentsExtension(ServerExtension):
     """``agents/list`` and ``agents/get`` over a list of agents, in name order.
 
     The list is read on every request, so agents added to it after the extension is
-    registered are served too.
+    registered are served too. A subclass serves agents from elsewhere by overriding
+    ``_served()``.
     """
 
     identifier = EXTENSION_ID
@@ -194,8 +195,12 @@ class AgentsExtension(ServerExtension):
         twin.agents = self.agents
         return twin
 
+    def _served(self) -> Sequence[Agent]:
+        """The agents this request is served, read once per call."""
+        return self.agents
+
     def _sorted(self) -> list[Agent]:
-        return sorted(self.agents, key=lambda agent: agent.name)
+        return sorted(self._served(), key=lambda agent: agent.name)
 
     async def list_agents(self, ctx: Any, params: PaginatedRequestParams) -> dict:
         if params.cursor is not None:
@@ -204,7 +209,7 @@ class AgentsExtension(ServerExtension):
         return complete(agents=[copy.deepcopy(a.card) for a in self._sorted()])
 
     async def get_agent(self, ctx: Any, params: GetAgentParams) -> dict:
-        for agent in self.agents:
+        for agent in self._served():
             if agent.name == params.name:
                 return complete(**copy.deepcopy(agent.detail))
         raise MCPError(

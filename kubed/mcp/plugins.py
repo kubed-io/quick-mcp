@@ -12,13 +12,14 @@ warning naming it.
 
 Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
 prompts (``kubed.mcp.prompts``) and agents through the agents extension
-(``kubed.mcp.agents``). The layout and names are Claude Code's: a skill is one folder
-below ``skills/``, while commands and agents are files at any depth, each folder adding
-a name segment, Claude Code's ``:`` written ``_`` (``commands/db/migrate.md`` is
-``db_migrate``). A plugin added with no namespace is the server's own, its
-skills under ``skill://<server name>/``; there is no root, and an empty namespace is
-refused. Plugins added under one namespace merge, and a second thing at one address is
-refused.
+(``kubed.mcp.agents``). A server has one provider of each kind, whatever its plugins,
+and each reads the plugins served once per call. The layout and names are Claude
+Code's: a skill is one folder below ``skills/``, while commands and agents are files at
+any depth, each folder adding a name segment, Claude Code's ``:`` written ``_``
+(``commands/db/migrate.md`` is ``db_migrate``). A plugin added with no namespace is the
+server's own, its skills under ``skill://<server name>/``; there is no root, and an
+empty namespace is refused. Plugins added under one namespace merge, and a second thing
+at one address is refused.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
@@ -35,6 +36,8 @@ from urllib.parse import quote, unquote, urlparse
 
 import yaml
 from fastmcp import FastMCP
+from fastmcp.prompts import Prompt
+from fastmcp.server.providers import Provider
 
 from . import skills
 from .agents import EXTENSION_ID, SETTINGS, Agent, AgentsExtension, parse_agent
@@ -381,20 +384,79 @@ class _Read:
     agents: list[Agent]
 
 
+@dataclass(frozen=True)
+class _Served:
+    """One plugin as served: the plugin, and what it serves of each kind."""
+
+    plugin: Plugin
+    catalogue: Mapping[str, skills.Skill]
+    prompts: tuple[FilePrompt, ...]
+    agents: tuple[Agent, ...]
+
+
+class _Skills(skills.EntryOnlySkillProvider):
+    """The server's one skills provider: every plugin's skills, in the order added."""
+
+    def __init__(self, plugins: Plugins) -> None:
+        super().__init__()
+        self._plugins = plugins
+
+    async def load_skills(self) -> dict[str, skills.Skill]:
+        return {
+            key: skill
+            for served in self._plugins.current
+            for key, skill in served.catalogue.items()
+        }
+
+
+class _Prompts(Provider):
+    """The server's one prompts provider: every plugin's commands."""
+
+    def __init__(self, plugins: Plugins) -> None:
+        super().__init__()
+        self._plugins = plugins
+
+    async def _list_prompts(self) -> list[Prompt]:
+        return [prompt for served in self._plugins.current for prompt in served.prompts]
+
+
+class _Agents(AgentsExtension):
+    """The server's one agents extension: every plugin's agents."""
+
+    def __init__(self, plugins: Plugins) -> None:
+        super().__init__()
+        self._plugins = plugins
+
+    def _served(self) -> list[Agent]:
+        return [agent for served in self._plugins.current for agent in served.agents]
+
+    def clone(self) -> _Agents:
+        return type(self)(self._plugins)
+
+
 class Plugins:
     """A server's plugins and loaders: what ``QuickMCP`` delegates to.
 
     Everything a plugin serves is read and checked against what the server already
-    serves before any of it is served, so a refused plugin leaves no trace.
+    serves before any of it is served, so a refused plugin leaves no trace. What is
+    served is ``current``, a tuple replaced whole when a plugin is added and never
+    changed in place; the server's one skills provider, prompts provider and agents
+    extension read it.
     """
 
     def __init__(self, server: FastMCP) -> None:
         self._server = server
         self._loaders: dict[str, PluginLoader] = {}
         self._owners: dict[str, str] = {}  # what is served -> the plugin serving it
-        self._extension: AgentsExtension | None = None
-        self.served: list[Plugin] = []
+        self._skills: _Skills | None = None
+        self._prompts: _Prompts | None = None
+        self._agents: _Agents | None = None
+        self.current: tuple[_Served, ...] = ()
         self.add_loader(LocalLoader())
+
+    @property
+    def served(self) -> tuple[Plugin, ...]:
+        return tuple(served.plugin for served in self.current)
 
     def add_loader(self, loader: PluginLoader) -> None:
         schemes = tuple(scheme.lower() for scheme in loader.schemes)
@@ -547,17 +609,20 @@ class Plugins:
         return _Read(catalogue, prompts, agents)
 
     def _serve(self, plugin: Plugin, read: _Read) -> Plugin:
-        if read.catalogue:
-            skills.serve(self._server, read.catalogue)
-        for prompt in read.prompts:
-            self._server.add_prompt(prompt)
-        if self._extension is None:
-            self._extension = AgentsExtension()
-            self._server.add_extension(self._extension)
+        # The first plugin with a skill brings the Skills extension (PLUG-20), the
+        # first plugin the prompts provider and the agents extension (PLUG-27).
+        if read.catalogue and self._skills is None:
+            self._skills = _Skills(self)
+            skills.serve(self._server, self._skills)
+        if self._prompts is None:
+            self._prompts = _Prompts(self)
+            self._server.add_provider(self._prompts)
+        if self._agents is None:
+            self._agents = _Agents(self)
+            self._server.add_extension(self._agents)
             self._server.add_middleware(
                 AdvertiseLegacyExtensions({EXTENSION_ID: SETTINGS})
             )
-        self._extension.agents.extend(read.agents)
         plugin = replace(
             plugin,
             skills=tuple(
@@ -573,5 +638,8 @@ class Plugins:
             self._owners[f"prompt:{name}"] = plugin.name
         for name in plugin.agents:
             self._owners[f"agent:{name}"] = plugin.name
-        self.served.append(plugin)
+        served = _Served(
+            plugin, dict(read.catalogue), tuple(read.prompts), tuple(read.agents)
+        )
+        self.current = (*self.current, served)
         return plugin

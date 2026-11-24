@@ -166,7 +166,7 @@ class QuickMCP:
     @property
     def plugins(self) -> tuple[Plugin, ...]:
         """The plugins this server serves, in the order they were added."""
-        return tuple(self._plugins.served)
+        return self._plugins.served
 
     def singleton(
         self,
