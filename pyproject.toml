@@ -35,6 +35,11 @@ dependencies = [
 tasks = [
   "fastmcp[tasks]>=4.2,<5",
 ]
+# Telemetry (the telemetry area of the spec), installed by servers' images only.
+# pyroscope-io's floor is the first release with memory profiling (mem_enabled), 1.2.0.
+telemetry = [
+  "pyroscope-io>=1.2,<2",
+]
 build = [
   "setuptools_scm",
   "build",

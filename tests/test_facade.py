@@ -85,7 +85,14 @@ SOURCES = {
 
 # Names this package defines rather than re-exports.
 OWN = {
-    "kubed.mcp": {"Inject", "QuickMCP", "Serving", "lookup"},
+    "kubed.mcp": {
+        "Inject",
+        "QuickMCP",
+        "Serving",
+        "Telemetry",
+        "TelemetrySettings",
+        "lookup",
+    },
     "kubed.mcp.protocol": {"AdvertiseLegacyExtensions", "types"},
     "kubed.mcp.auth": set(),
     "kubed.mcp.request": {"Values", "request_values"},

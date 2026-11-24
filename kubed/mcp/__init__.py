@@ -36,6 +36,7 @@ from mcp_types import TextContent
 
 from .app import QuickMCP, Serving
 from .inject import Inject, lookup
+from .telemetry import Telemetry, TelemetrySettings
 
 __version__ = version("kubed-mcp")
 
@@ -57,6 +58,8 @@ __all__ = [
     "ResourceResult",
     "ResourceTemplate",
     "Serving",
+    "Telemetry",
+    "TelemetrySettings",
     "TextContent",
     "TextResource",
     "ToolError",
