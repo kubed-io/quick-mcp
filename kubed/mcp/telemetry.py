@@ -1,4 +1,4 @@
-"""What a server reports about itself: profiles now, OpenTelemetry later.
+"""What a server reports about itself: profiles, and OpenTelemetry.
 
 Every signal is off until the server's config turns it on, and nothing a signal needs is
 imported until then. The ``telemetry`` extra installs what the signals use.
@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from types import ModuleType
 from typing import Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
 
@@ -40,15 +40,35 @@ class TelemetrySettings(BaseModel):
 
     ``profiles`` is the address of the Pyroscope server. Setting it turns profiles
     on; there is no separate enabled flag. ``profile_cpu`` and ``profile_memory``
-    choose which profiles are sent. ``otel`` is for OpenTelemetry, which a later
-    release reads: nothing reads it yet. ``tags`` are labels added to every profile.
+    choose which profiles are sent. ``otel`` turns OpenTelemetry on, configured by
+    the standard ``OTEL_*`` variables. ``tags`` are labels added to every profile
+    and resource attributes on every trace and metric. An unknown key is an error,
+    so a typo stops the boot; a server's own section may subclass it to add keys.
     """
 
-    profiles: str | None = None
-    profile_cpu: bool = True
-    profile_memory: bool = True
-    otel: bool = False
-    tags: dict[str, str] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
+
+    profiles: str | None = Field(
+        default=None,
+        description="Pyroscope server address; setting it turns profiles on.",
+    )
+    profile_cpu: bool = Field(
+        default=True, description="Sample CPU while profiles are on."
+    )
+    profile_memory: bool = Field(
+        default=True, description="Sample allocations while profiles are on."
+    )
+    otel: bool = Field(
+        default=False,
+        description="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+    )
+    tags: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Labels on every profile, and resource attributes on every trace "
+            "and metric."
+        ),
+    )
 
 
 class _Signals:

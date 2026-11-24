@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 from fastmcp import Client, FastMCP
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import kubed.mcp.telemetry
 from kubed.mcp import Inject, QuickMCP, TelemetrySettings
@@ -106,6 +106,27 @@ def test_settings_embed_as_a_configs_telemetry_section() -> None:
     assert config.telemetry.profiles == "http://pyroscope.example.com:4040"
     assert config.telemetry.tags == {"team": "a"}
     assert Section().telemetry.tags is not Section().telemetry.tags
+
+
+def test_every_setting_is_described_in_one_short_sentence() -> None:
+    for name, field in TelemetrySettings.model_fields.items():
+        assert field.description, name
+        assert len(field.description) <= 100, name
+        assert field.description.endswith("."), name
+
+
+def test_a_typo_in_the_section_stops_the_boot() -> None:
+    with pytest.raises(ValidationError, match="profile_cpus"):
+        TelemetrySettings.model_validate({"profile_cpus": False})
+
+
+def test_a_server_can_subclass_the_section() -> None:
+    class Section(TelemetrySettings):
+        exporter_port: int = 9464
+
+    assert Section(exporter_port=1).exporter_port == 1
+    with pytest.raises(ValidationError):
+        Section.model_validate({"tag": {}})
 
 
 async def test_profiles_start_before_the_lifespan_and_stop_before_the_container(
