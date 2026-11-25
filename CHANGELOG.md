@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `X-MCP-Listed` (or `?listed=`) chooses which of skills, prompts and agents `resources/list` shows, and a config's `delivery` sets the default.
 - `X-MCP-Resources: off` (or `?resources=off`) lists read-only `list_resources` and `read_resource` tools for clients that cannot read resources.
 - `mcp.binary_pointer(fn)` tells `read_resource` where a binary's link is listed.
+- `X-MCP-Via: extension` or `local` (or `?via=`) stops listing what a client's hook or local install already has, while every read still answers.
 
 ### Changed
 

@@ -50,7 +50,7 @@ from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool
-from fastmcp.utilities.versions import VersionSpec
+from fastmcp.utilities.versions import VersionSpec, version_sort_key
 from mcp_types import TextContent
 
 from . import gateway, skills
@@ -633,6 +633,13 @@ class _Skills(skills.EntryOnlySkillProvider):
             return []
         return await super()._list_resources()
 
+    async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
+        # skills/list asks this, and skills/get its own _get_skill_entry, so under
+        # local the plugins' skills are unlisted and still answer (DLV-9, DLV-10).
+        if _resolved().via == "local":
+            return []
+        return await super()._list_skill_entries(context)
+
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
 
@@ -656,7 +663,23 @@ class _Prompts(Provider):
         self._plugins = plugins
 
     async def _list_prompts(self) -> list[Prompt]:
+        # Listed under mcp alone; prompts/get finds every one (DLV-9, DLV-10).
+        if _resolved().via != "mcp":
+            return []
         return list((await self._plugins.pinned()).build.prompts)
+
+    async def _get_prompt(
+        self, name: str, version: VersionSpec | None = None
+    ) -> Prompt | None:
+        # Every prompt of the pinned build, listed or not, matched as FastMCP's
+        # Provider._get_prompt matches a listed one.
+        prompts = (await self._plugins.pinned()).build.prompts
+        matching = [p for p in prompts if p.name == name]
+        if version:
+            matching = [p for p in matching if version.matches(p.version)]
+        if not matching:
+            return None
+        return max(matching, key=version_sort_key)
 
     async def get_tasks(self) -> list:
         # FastMCP lists every component when a server starts, to find the ones that
@@ -805,6 +828,12 @@ class _Agents(AgentsExtension):
 
     async def _agents(self) -> tuple[Agent, ...]:
         return (await self._plugins.pinned()).build.agents
+
+    async def _listed(self) -> Sequence[Agent]:
+        # Unlisted under local; agents/get still finds each (DLV-9, DLV-10).
+        if _resolved().via == "local":
+            return ()
+        return await self._agents()
 
     def clone(self) -> _Agents:
         return type(self)(self._plugins)

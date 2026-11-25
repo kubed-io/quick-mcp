@@ -3,8 +3,9 @@
 Each input is a header or a query parameter. It is resolved on its own by walking its
 levels in order, and the first value the input takes answers. A value it does not take
 is ignored with one warning, and the next level answers. With none, the built-in default
-does. ``_ResolveScope`` makes the walk once per request, and ``_resolved()`` is what
-the rest of the package reads.
+does. ``Via`` is walked first, and ``Listed`` only as far as the level that answered it,
+its preset answering past that (DLV-9). ``_ResolveScope`` makes the walk once per
+request, and ``_resolved()`` is what the rest of the package reads.
 """
 
 from __future__ import annotations
@@ -32,13 +33,18 @@ from kubed.mcp.request import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BinaryPointer", "Delivery"]
+__all__ = ["BinaryPointer", "Delivery", "Resolved"]
 
 # A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
 _PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
 # A header-name token: letters and digits, with - only between them.
 _HEADER_TOKEN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 _KINDS = frozenset({"skills", "prompts", "agents"})
+_VIAS = ("mcp", "extension", "local")
+# What X-MCP-Listed defaults to under each Via (DLV-9).
+_PRESET: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"mcp": frozenset({"skills"}), "extension": frozenset(), "local": frozenset()}
+)
 _ON = frozenset({"on", "true", "1", "yes"})
 _OFF = frozenset({"off", "false", "0", "no", "none"})
 
@@ -92,6 +98,13 @@ def _take_resources(raw: str) -> str:
     raise ValueError(raw)
 
 
+def _take_via(raw: str) -> str:
+    value = raw.strip().lower()
+    if value not in _VIAS:
+        raise ValueError(raw)
+    return value
+
+
 def _take_listed(raw: str) -> frozenset[str]:
     value = raw.strip().lower()
     if value in ("", "none"):
@@ -111,7 +124,7 @@ class _Input:
     attr: str | None  # the Delivery attribute, None when the config has none
     take: Callable[[str], object]  # raises ValueError for a value it does not take
     rule: str  # what a warning quotes
-    default: object
+    default: object  # Listed's goes unused: its walk is given Via's preset
     blank: bool  # an empty value is a value
     plus: bool  # a space in the query reads as +
 
@@ -152,18 +165,36 @@ _INPUTS: Mapping[str, _Input] = MappingProxyType(
                 blank=True,
                 plus=False,
             ),
+            _Input(
+                "Via",
+                "via",
+                "via",
+                _take_via,
+                "it is mcp, extension or local",
+                "mcp",
+                blank=False,
+                plus=False,
+            ),
         )
     }
 )
 
 
 @dataclass(frozen=True)
-class _Resolved:
-    """What one request resolved its inputs to."""
+class Resolved:
+    """What one request resolved its inputs to (DLV-11).
+
+    ``resources`` is ``"on"`` or ``"off"``, ``listed`` the kinds ``resources/list``
+    shows, ``via`` ``"mcp"``, ``"extension"`` or ``"local"``, and ``prefix`` the
+    gateway prefix or None. ``extensions`` is the extension ids the client declares,
+    or None when the request does not say.
+    """
 
     resources: str
     listed: frozenset[str]
+    via: str
     prefix: str | None
+    extensions: frozenset[str] | None = None
 
 
 def _header(name: str) -> Level:
@@ -223,6 +254,11 @@ def _config_level(entry: _Input, delivery: object | None) -> Level | None:
     return lambda values: found
 
 
+def _nothing(values: tuple[Values, Values] | None) -> Found | None:
+    """A level that gives nothing: a config's, when the config gives no value."""
+    return None
+
+
 def _warning(source: str, value: str, entry: _Input) -> None:
     log.warning(
         "%s %r is ignored, and the next source answers: %s",
@@ -244,26 +280,48 @@ class _Resolver:
             levels = [_header(f"X-MCP-{entry.name}"), _query(entry)]
             if header_prefix is not None:
                 levels.insert(0, _header(f"{header_prefix}-{entry.name}"))
-            config = _config_level(entry, delivery)
-            if config is not None:
-                levels.append(config)
+            # Always a level, so Via's and Listed's levels line up by index (DLV-9).
+            if entry.attr is not None:
+                levels.append(_config_level(entry, delivery) or _nothing)
             self.levels[entry.name] = levels
 
     def resolve(
         self, values: tuple[Values, Values] | None, *, warn: bool = True
-    ) -> _Resolved:
-        """What ``values`` resolve each input to; ``warn`` False walks silently."""
-        got = {name: self._walk(_INPUTS[name], values, warn) for name in _INPUTS}
-        return _Resolved(
-            resources=got["Resources"],
-            listed=got["Listed"],
-            prefix=got["Resource-Prefix"],
+    ) -> Resolved:
+        """What ``values`` resolve each input to; ``warn`` False walks silently.
+
+        ``Via`` is walked first. ``Listed`` is walked up to and including the level
+        that answered it, every level when the built-in did, and ``Via``'s preset
+        answers past that: an ``X-MCP-Listed`` from a later level does not (DLV-9).
+        """
+
+        def walk(name: str) -> Any:
+            entry = _INPUTS[name]
+            return self._walk(entry, values, warn, entry.default)[0]
+
+        via, at = self._walk(_INPUTS["Via"], values, warn, _INPUTS["Via"].default)
+        upto = None if at == len(self.levels["Via"]) else at + 1
+        listed = self._walk(_INPUTS["Listed"], values, warn, _PRESET[via], upto)[0]
+        return Resolved(
+            resources=walk("Resources"),
+            listed=listed,
+            via=via,
+            prefix=walk("Resource-Prefix"),
         )
 
     def _walk(
-        self, entry: _Input, values: tuple[Values, Values] | None, warn: bool
-    ) -> Any:
-        for level in self.levels[entry.name]:
+        self,
+        entry: _Input,
+        values: tuple[Values, Values] | None,
+        warn: bool,
+        default: Any,
+        upto: int | None = None,
+    ) -> tuple[Any, int]:
+        """What ``entry`` resolves to over its first ``upto`` levels (all when None),
+        ``default`` answering when none does, and the index of the level that answered,
+        or the number walked when ``default`` did."""
+        levels = self.levels[entry.name][:upto]
+        for index, level in enumerate(levels):
             found = level(values)
             if found is None:
                 continue
@@ -271,15 +329,15 @@ class _Resolver:
             if not raw.strip() and not entry.blank:
                 continue
             try:
-                return entry.take(raw)
+                return entry.take(raw), index
             except ValueError:
                 shown = raw.strip()[:64]
                 if warn and _warn_once(source, shown):
                     _warning(source, shown, entry)
-        return entry.default
+        return default, len(levels)
 
 
-_RESOLVED: ContextVar[tuple[_Resolver, _Resolved] | None] = ContextVar(
+_RESOLVED: ContextVar[tuple[_Resolver, Resolved] | None] = ContextVar(
     "kubed_mcp_resolved", default=None
 )
 _RESOLVERS: WeakKeyDictionary[FastMCP, _Resolver] = WeakKeyDictionary()
@@ -312,7 +370,7 @@ class _ResolveScope(Middleware):
             _RESOLVED.reset(token)
 
 
-def _resolved() -> _Resolved:
+def _resolved() -> Resolved:
     """The current request's resolution.
 
     Off a request, as in a background task's worker, it is resolved afresh from what the
