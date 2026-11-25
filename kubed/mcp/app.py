@@ -176,11 +176,8 @@ class QuickMCP:
             **fastmcp_options,
         )
         # _CallScope is outermost but for the call metrics, so every other middleware
-        # and handler shares one call's slot. The metrics go first, to record what the
-        # client received, the slot's teardown included (APP-6, TEL-16).
+        # and handler shares one call's slot (APP-6). The metrics go in last, below.
         self.server.middleware.insert(0, _CallScope(self._container))
-        if (metrics := _call_metrics(telemetry)) is not None:
-            self.server.middleware.insert(0, metrics)
         SERVING[self.server] = self._container
         if config is not None:
             self._container.values[type(config)] = config
@@ -205,6 +202,11 @@ class QuickMCP:
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
         self.server.middleware.insert(3, _TakeThePrefix())
+        # The call metrics go first, after the scopes above are placed by their index
+        # from _CallScope, to record what the client received, the slot's teardown
+        # included (TEL-16).
+        if (metrics := _call_metrics(telemetry)) is not None:
+            self.server.middleware.insert(0, metrics)
         # Inside the resolution, so the handshake echoes and is written for this
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None

@@ -1682,22 +1682,26 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     )
     mcp.add_middleware(Added())
     assert isinstance(mcp.server.middleware[0], UsageMiddleware)
-    assert _middleware(mcp) == [
-        UsageMiddleware,
-        _CallScope,
-        Given,
-        Added,
-    ]
+    kinds = _middleware(mcp)
+    # The metrics, then the call's slot: every other layer, the plugin layer's
+    # included, runs inside both, in the order it was given.
+    assert kinds[:2] == [UsageMiddleware, _CallScope]
+    assert kinds.count(UsageMiddleware) == 1
+    assert kinds.index(Given) < kinds.index(Added)
 
 
 @pytest.mark.parametrize(
     "telemetry", [None, TelemetrySettings(), argparse.Namespace(profiles=None)]
 )
 def test_otel_off_adds_no_call_metrics(telemetry) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
     from kubed.mcp.app import _CallScope
 
     mcp = QuickMCP("plain", config=Config(telemetry=telemetry))
-    assert _middleware(mcp) == [_CallScope]
+    kinds = _middleware(mcp)
+    assert UsageMiddleware not in kinds
+    assert kinds[0] is _CallScope
 
 
 async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serves(
@@ -1707,12 +1711,16 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
 
     from kubed.mcp.app import _CallScope
 
+    real = usage.UsageMiddleware
+
     def broken(**kwargs):
         raise RuntimeError("https://user:s3cret@otlp.example.com")
 
     monkeypatch.setattr(usage, "UsageMiddleware", broken)
     mcp = served("unbuilt", TelemetrySettings(otel=True))
-    assert _middleware(mcp) == [_CallScope]
+    kinds = _middleware(mcp)
+    assert real not in kinds
+    assert kinds[0] is _CallScope
     async with Client(mcp.server) as client:
         assert (await client.call_tool("ping", {})).data == "pong"
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
