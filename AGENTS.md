@@ -31,6 +31,22 @@ This repo ships **a Python distribution and nothing else**: no image, no Kuberne
 | `docs/` | the wiki, as a submodule |
 | `.github/` | workflows, dependabot, zizmor, and the review instructions |
 
+## Downstream projects
+
+Two kubed-io servers build on this package. The agent flow reads them from
+[`.github/downstream.json`](.github/downstream.json):
+
+| Repo | What it uses |
+| --- | --- |
+| [kubed-io/selenium-flow](https://github.com/kubed-io/selenium-flow) | the server base, `protocol`, `request`, `skills`, `plugins` and `auth` |
+| [kubed-io/mcp-kb](https://github.com/kubed-io/mcp-kb) | the server base, `protocol`, `skills` and `request` |
+
+A change to a public name reaches both. An epic's release candidates reach them through the agent
+flow: the first rc opens an "Upgrade `kubed-mcp`" issue in each, linked to the epic, whose agent
+works against the rc and talks to the epic's. The final release tells each of those pull requests
+to move its pin. A merge to main releases at its pull request's `release:patch`, `release:minor`
+or `release:major` label (`publish.yml`); a pull request without one releases nothing.
+
 ## Things that cost someone an afternoon
 
 - **`kubed/` is a PEP 420 namespace and has no `__init__.py`.** That is what lets `kubed.mcp` install

@@ -48,14 +48,65 @@ on:
         description: Push changes and create release
         default: false
         type: boolean
+  # a merge to main releases at its PR's release:patch|minor|major label (spec 2026-11-24 R-UR2);
+  # a push whose PR has no such label, or no PR at all (version-bump's own commit), releases nothing
+  push:
+    branches:
+    - main
 
 permissions:
   contents: read
 
 jobs:
 
+  # The run's values, from the context: a manual run's inputs, or a merge's PR label. Every job
+  # below reads these, never inputs.*, so a push run and a manual one take the same path.
+  decide:
+    name: Decide
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      action: ${{ steps.decide.outputs.action }}
+      candidate: ${{ steps.decide.outputs.candidate }}
+      push: ${{ steps.decide.outputs.push }}
+    steps:
+    - name: Decide
+      id: decide
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: ${{ github.event_name }}
+        ACTION: ${{ inputs.action }}
+        CANDIDATE: ${{ inputs.candidate }}
+        PUSH: ${{ inputs.push }}
+      run: |
+        if [[ "$EVENT" == workflow_dispatch ]]; then
+          { echo "release=true"; echo "action=$ACTION"; echo "candidate=$CANDIDATE"; echo "push=$PUSH"; } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+          --jq '[.[] | select(.merged_at != null and .base.ref == "main")][0].labels // [] | [.[].name | select(startswith("release:"))] | join(" ")')
+        read -r -a levels <<< "$labels"
+        if (( ${#levels[@]} == 0 )); then
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          echo "No release label on the merged PR of $GITHUB_SHA: nothing to release." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        if (( ${#levels[@]} > 1 )); then
+          echo "::error::The merged PR of $GITHUB_SHA has several release labels (${levels[*]}): keep one."
+          exit 1
+        fi
+        level=${levels[0]#release:}
+        case "$level" in patch|minor|major) ;; *) echo "::error::Unknown release label release:$level"; exit 1 ;; esac
+        { echo "release=true"; echo "action=$level"; echo "candidate=$level"; echo "push=true"; } >> "$GITHUB_OUTPUT"
+        echo "Releasing a $level for the merge of $GITHUB_SHA." >> "$GITHUB_STEP_SUMMARY"
+
   test:
     name: Test
+    needs: decide
+    if: needs.decide.outputs.release == 'true'
     uses: ./.github/workflows/test.yml
     # A called job gets no more than its caller grants, and test.yml's results
     # job asks for these to post its check run.
@@ -66,8 +117,12 @@ jobs:
 
   version:
     name: Version
-    needs: test
+    needs: [decide, test]
     runs-on: ubuntu-26.04
+    # one release at a time; a manual run and a merge's run never write the same tag together
+    concurrency:
+      group: publish-version
+      cancel-in-progress: false
     permissions:
       contents: write   # a final: commit the rolled CHANGELOG and tag; an rc: the tag only
       id-token: write   # GCP workload-identity federation, for the App token
@@ -82,7 +137,7 @@ jobs:
     # Only a prerelease may push from another ref, a family branch say, so downstream can
     # adopt an epic before its family PR merges. patch, minor and major push from main.
     - name: Validate Branch
-      if: inputs.push && inputs.action != 'prerelease'
+      if: needs.decide.outputs.push == 'true' && needs.decide.outputs.action != 'prerelease'
       env:
         REF: ${{ github.ref_name }}
       run: |
@@ -126,9 +181,9 @@ jobs:
     # -rc.N, one past the highest candidate tagged for that X.Y.Z.
     - name: Next Candidate
       id: candidate
-      if: inputs.action == 'prerelease'
+      if: needs.decide.outputs.action == 'prerelease'
       env:
-        BUMP: ${{ inputs.candidate }}
+        BUMP: ${{ needs.decide.outputs.candidate }}
       run: |
         last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
         IFS=. read -r major minor patch <<< "${last:-0.0.0}"
@@ -148,7 +203,7 @@ jobs:
       id: preview
       uses: duplocloud/version-bump@main
       with:
-        version: ${{ steps.candidate.outputs.version || inputs.action }}
+        version: ${{ steps.candidate.outputs.version || needs.decide.outputs.action }}
         push: false
         token: ${{ steps.app-token.outputs.token }}
 
@@ -158,7 +213,7 @@ jobs:
     # next version from the last final tag (R-UR18), and an rc must not start a second line.
     - name: Guard the Release
       env:
-        ACTION: ${{ inputs.action }}
+        ACTION: ${{ needs.decide.outputs.action }}
         VERSION: ${{ steps.preview.outputs.version }}
       run: |
         last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
@@ -197,18 +252,18 @@ jobs:
     # Only a final writes through version-bump: it rolls CHANGELOG [Unreleased] and tags.
     - name: Bump Version
       id: bump
-      if: inputs.action != 'prerelease'
+      if: needs.decide.outputs.action != 'prerelease'
       uses: duplocloud/version-bump@main
       with:
-        version: ${{ inputs.action }}
-        push: ${{ inputs.push }}
+        version: ${{ needs.decide.outputs.action }}
+        push: ${{ needs.decide.outputs.push }}
         token: ${{ steps.app-token.outputs.token }}
 
     # An rc leaves the changelog alone (R-UR17): no commit, just the tag on this branch's
     # head, made before the package job checks it out, since setuptools_scm reads its
     # version from the tag.
     - name: Tag the Candidate
-      if: inputs.action == 'prerelease' && inputs.push
+      if: needs.decide.outputs.action == 'prerelease' && needs.decide.outputs.push == 'true'
       env:
         GH_TOKEN: ${{ steps.app-token.outputs.token }}
         TAG: ${{ steps.preview.outputs.tag }}
@@ -240,15 +295,15 @@ jobs:
   # On a dry run there is no tag, so it builds the current ref.
   package:
     name: Package
-    needs: version
+    needs: [decide, version]
     uses: ./.github/workflows/package.yml
     with:
-      tag: ${{ inputs.push && needs.version.outputs.tag || '' }}
+      tag: ${{ needs.decide.outputs.push == 'true' && needs.version.outputs.tag || '' }}
 
   pypi:
     name: PyPI
-    needs: package
-    if: inputs.push
+    needs: [decide, package]
+    if: needs.decide.outputs.push == 'true'
     runs-on: ubuntu-26.04
     environment:
       name: pypi
@@ -270,10 +325,11 @@ jobs:
   release:
     name: Release
     needs:
+    - decide
     - version
     - package
     - pypi
-    if: inputs.push
+    if: needs.decide.outputs.push == 'true'
     runs-on: ubuntu-26.04
     permissions:
       contents: write   # create the GitHub Release on the existing tag
