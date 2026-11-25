@@ -21,7 +21,12 @@ KEYS = ("resources", "listed", "prefix")
 
 def snapshot() -> dict:
     r = _resolved()
-    return {"resources": r.resources, "listed": sorted(r.listed), "prefix": r.prefix}
+    return {
+        "resources": r.resources,
+        "listed": sorted(r.listed),
+        "via": r.via,
+        "prefix": r.prefix,
+    }
 
 
 def server(delivery=None, header_prefix=None) -> QuickMCP:
@@ -237,7 +242,7 @@ async def test_the_warnings_remembered_are_bounded(monkeypatch, caplog):
     assert len(warnings(caplog)) == 3
 
 
-async def test_an_inserted_level_answers_between_config_and_built_in():
+async def test_an_appended_level_answers_before_the_built_in():
     mcp = server()
     mcp._resolver.levels["Listed"].append(lambda values: ("prompts", "stand-in"))
     async with over_http(mcp) as client:
@@ -256,6 +261,7 @@ async def test_on_stdio_the_defaults_answer():
         assert await seen(client) == {
             "resources": "off",
             "listed": ["skills"],
+            "via": "mcp",
             "prefix": None,
         }
 

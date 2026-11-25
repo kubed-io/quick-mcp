@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 from starlette.routing import WebSocketRoute
 
+from ._handshake import _Describe
 from .container import (
     _CALL,
     SERVING,
@@ -30,6 +31,8 @@ from .container import (
 from .delivery import (
     _RESOLVERS,
     BinaryPointer,
+    DeliveryDefault,
+    Instructions,
     _header_prefix,
     _Resolver,
     _ResolveScope,
@@ -180,6 +183,10 @@ class QuickMCP:
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
         self.server.middleware.insert(3, _TakeThePrefix())
+        # Inside the resolution, so the handshake echoes and is written for this
+        # request's; appended, as no other middleware needs to see it first.
+        self._instructions: Instructions | None = None
+        self.add_middleware(_Describe(lambda: self._instructions))
 
     @_signed_as(FastMCP.resource)
     def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
@@ -357,6 +364,41 @@ class QuickMCP:
         none.
         """
         self._plugins.set_binary_pointer(fn)
+        return fn
+
+    def delivery_default(self, fn: DeliveryDefault) -> DeliveryDefault:
+        """Sets a per-client default for the delivery inputs, and returns ``fn``, so it
+        works as a decorator (DLV-14). A second call replaces the first.
+
+        ``fn(client_info)`` is called once each time a request's inputs are resolved,
+        with the client's ``clientInfo``, an ``mcp_types.Implementation``, or None when
+        the request names none: on ``initialize`` its ``params.clientInfo``, on any
+        other request its ``_meta["io.modelcontextprotocol/clientInfo"]`` first, then
+        the session's ``initialize``. A lookup that fails, or a ``clientInfo`` that is
+        not one, counts as none. ``fn`` returns a partial ``Delivery``, None for any
+        input it leaves alone, or None for all of them. Its answer beats the config's
+        ``delivery`` and kubed-mcp's table of known clients, and a value its input does
+        not take, or of a type ``Delivery`` does not allow it, falls through with one
+        warning naming ``delivery_default <attribute>``. An ``fn`` that raises, or
+        answers with anything but a partial ``Delivery`` or None, is logged at error
+        and gives nothing.
+        """
+        self._resolver.default = fn
+        return fn
+
+    def instructions(self, fn: Instructions) -> Instructions:
+        """Sets the server's instructions, and returns ``fn``, so it works as a
+        decorator (DLV-11). A second call replaces the first.
+
+        ``fn(delivery)`` is called once per ``initialize`` and once per
+        ``server/discover``, with a ``kubed.mcp.delivery.Resolved``: what the request
+        resolved, its ``resources``, ``listed``, ``via``, gateway ``prefix`` and the
+        ``extensions`` the client declares. Its string is the result's
+        ``instructions``, written with the prefix as served text is. None, a raise or
+        anything but a string gives the ``instructions`` the server was built with, and
+        the last two are logged at error.
+        """
+        self._instructions = fn
         return fn
 
     def add_loader(self, loader: PluginLoader) -> None:

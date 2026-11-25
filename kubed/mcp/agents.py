@@ -176,7 +176,8 @@ class AgentsExtension(ServerExtension):
 
     The list is read on every request, so agents added to it after the extension is
     registered are served too. A subclass serves agents from elsewhere by overriding
-    ``_served()``, or ``_agents()`` when finding them takes an await.
+    ``_served()``, or ``_agents()`` when finding them takes an await, and lists fewer
+    than it serves by overriding ``_listed()``.
     """
 
     identifier = EXTENSION_ID
@@ -207,11 +208,18 @@ class AgentsExtension(ServerExtension):
         """The agents this request is served: ``_served()``, unless overridden."""
         return self._served()
 
+    async def _listed(self) -> Sequence[Agent]:
+        """The agents ``agents/list`` shows: ``_agents()``, unless overridden.
+
+        ``agents/get`` searches ``_agents()``, so an agent left out here still answers.
+        """
+        return await self._agents()
+
     async def list_agents(self, ctx: Any, params: PaginatedRequestParams) -> dict:
         if params.cursor is not None:
             # One page, so no cursor was ever issued.
             raise MCPError(code=INVALID_PARAMS, message="Invalid agents cursor")
-        agents = sorted(await self._agents(), key=lambda agent: agent.name)
+        agents = sorted(await self._listed(), key=lambda agent: agent.name)
         return complete(agents=[copy.deepcopy(a.card) for a in agents])
 
     async def get_agent(self, ctx: Any, params: GetAgentParams) -> dict:
