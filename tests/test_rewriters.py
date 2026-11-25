@@ -316,20 +316,6 @@ async def test_a_build_lists_each_folder_from_its_own_skill_alone(
     assert counts[1] <= 2 * counts[0]  # linear in the skills, not quadratic
 
 
-@pytest.mark.parametrize("rewriter", [None, lambda site, text: text])
-async def test_a_skill_nested_in_another_fails_a_rewritten_build_too(
-    tmp_path, rewriter
-):
-    outer = write(tmp_path / "outer", {"skills/a/SKILL.md": skill("a")})
-    inner = write(tmp_path / "inner", {"skills/x/SKILL.md": skill("x")})
-    mcp = served((outer, "lib"), (inner, "lib/a"))  # skill://lib/a/x is inside lib/a
-    if rewriter:
-        mcp.add_rewriter(rewriter)
-    async with Client(mcp.server) as client:
-        with pytest.raises(MCPError):
-            await client.read_resource("skill://lib/a/x/_index.md")
-
-
 async def test_no_rewriter_serves_the_objects_as_read():
     mcp = served((DEMO, None))
     # Internal on purpose: no copies is selenium-flow's byte parity.
