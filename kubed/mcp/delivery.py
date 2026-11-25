@@ -22,11 +22,17 @@ from weakref import WeakKeyDictionary
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 
-from kubed.mcp.request import Values, _warn_once, get_context, request_values
+from kubed.mcp.request import (
+    Values,
+    _warn_once,
+    get_context,
+    get_http_request,
+    request_values,
+)
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Delivery"]
+__all__ = ["BinaryPointer", "Delivery"]
 
 # A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
 _PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
@@ -38,6 +44,9 @@ _OFF = frozenset({"off", "false", "0", "no", "none"})
 
 Found = tuple[str, str]  # (raw value, source)
 Level = Callable[[tuple[Values, Values] | None], Found | None]
+
+# Where a binary's link is listed, given its URI as sent, or None (DLV-6).
+BinaryPointer = Callable[[str], str | None]
 
 
 class Delivery(Protocol):
@@ -315,4 +324,10 @@ def _resolved() -> _Resolved:
     resolver = _BARE
     with suppress(RuntimeError):  # no context
         resolver = _RESOLVERS.get(get_context().fastmcp, _BARE)
+    if resolver is _BARE:
+        # A custom route has a request, no context: FastMCP keeps its server on the app.
+        with suppress(RuntimeError):  # no request
+            served = getattr(get_http_request().app.state, "fastmcp_server", None)
+            if served is not None:
+                resolver = _RESOLVERS.get(served, _BARE)
     return resolver.resolve(request_values())

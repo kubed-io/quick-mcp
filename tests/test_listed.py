@@ -8,7 +8,7 @@ import pytest
 from fastmcp import Client
 from gateway_server import over_http
 from plugin_server import copy
-from skill_server import load_skill, make_skill, read_directory
+from skill_server import load_skill, make_skill, read_directory, request
 from test_delivery_inputs import config
 
 from kubed.mcp import QuickMCP, skills
@@ -116,6 +116,10 @@ async def test_the_other_lists_do_not_change(tmp_path):
             p.name for p in await none.list_prompts()
         ]
         assert await plain.list_prompts()
+        for method, key in (("skills/list", "skills"), ("agents/list", "agents")):
+            before = (await request(plain, method))[key]
+            assert before
+            assert (await request(none, method))[key] == before
         assert await plain.list_resource_templates() == (
             await none.list_resource_templates()
         )

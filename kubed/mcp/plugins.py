@@ -49,6 +49,7 @@ from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
+from fastmcp.tools import Tool
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import TextContent
 
@@ -63,6 +64,7 @@ from ._rewrite import (
     run,
     to_mcp_form,
 )
+from ._tools import TOOL_NAMES, _ResourceTools
 from .agents import (
     EXTENSION_ID,
     META_KEY,
@@ -73,7 +75,7 @@ from .agents import (
     served_as,
 )
 from .agents import usable_name as _usable
-from .delivery import _resolved
+from .delivery import BinaryPointer, _resolved
 from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
 
@@ -704,6 +706,31 @@ def _own_reserved(server: FastMCP) -> str | None:
         if _reserved(uri):
             return uri
     return None
+
+
+def _own_tool(server: FastMCP) -> str | None:
+    """The name of the server's first own tool that the plugin layer serves itself
+    (DLV-7), or None. Read as ``_own_reserved`` reads the server's resources."""
+    components = getattr(server.local_provider, "_components", None)
+    if components is None:
+        log.warning(
+            "FastMCP's LocalProvider has no _components: the server's own tools are "
+            "not checked against %s (DLV-7)",
+            " and ".join(TOOL_NAMES),
+        )
+        return None
+    for component in components.values():
+        if isinstance(component, Tool) and component.name in TOOL_NAMES:
+            return component.name
+    return None
+
+
+def _serves_itself(name: str) -> str:
+    """Why the server's own ``name`` is refused, as both of DLV-7's messages say it."""
+    return (
+        f"a server with a plugin serves {name} itself, over every resource, the "
+        "plugins' and its own (DLV-6)"
+    )
 
 
 class _Files(Provider):
@@ -1588,6 +1615,8 @@ class Plugins:
         self._prompts: _Prompts | None = None
         self._files: _Files | None = None
         self._agents: _Agents | None = None
+        self._tools: _ResourceTools | None = None
+        self._pointer: BinaryPointer | None = None
         self._state = _State(0, ())
         self._view: Callable[[], View] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
@@ -1657,10 +1686,20 @@ class Plugins:
                 "that has one"
             )
 
+    def check_own_tool(self, name: str | None) -> None:
+        """Refuses ``name`` for the server's own tool once it has a plugin, when the
+        plugin layer serves a tool by that name itself (DLV-7)."""
+        if self._tools is not None and name in TOOL_NAMES:
+            raise ValueError(
+                f"{name}: {_serves_itself(name)}, so the server's own is refused "
+                "(DLV-7)"
+            )
+
     def _check_first(self) -> None:
         """Refuses the server's first plugin when the server has its own resource
-        under a reserved scheme (PLUG-72). Once it has a plugin, ``check_own`` keeps
-        it from getting one."""
+        under a reserved scheme (PLUG-72), or its own tool by a name the plugin layer
+        serves (DLV-7). Once it has a plugin, ``check_own`` and ``check_own_tool``
+        keep it from getting one."""
         if self._files is not None:
             return
         uri = _own_reserved(self._server)
@@ -1669,6 +1708,17 @@ class Plugins:
                 f"the server has its own resource at {uri}, and {_RESERVED_TEXT} are "
                 "the plugins'"
             )
+        name = _own_tool(self._server)
+        if name is not None:
+            raise PluginError(
+                f"the server has its own tool {name}, but {_serves_itself(name)}: "
+                f"remove the server's {name} (DLV-7)"
+            )
+
+    def set_binary_pointer(self, fn: BinaryPointer) -> None:
+        """Makes ``fn`` what ``read_resource`` asks where a binary's link is listed
+        (DLV-6), in place of any earlier one."""
+        self._pointer = fn
 
     def set_view(self, fn: Callable[[], View]) -> None:
         """Makes ``fn`` the view, called once per request (PLUG-53)."""
@@ -2131,8 +2181,8 @@ class Plugins:
     def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
         # first plugin the prompts provider, the files provider (PLUG-66), the agents
-        # extension (PLUG-27), which binds resources/directory/read, and NameTheIndex
-        # (PLUG-68).
+        # extension (PLUG-27), which binds resources/directory/read, NameTheIndex
+        # (PLUG-68), and the resource tools (DLV-6).
         if self._skills is None and any(each.catalogue for each in served):
             self._skills = _Skills(self)
             skills.serve(self._server, self._skills)
@@ -2144,6 +2194,9 @@ class Plugins:
         if self._files is None:
             self._files = _Files(self)
             self._server.add_provider(self._files)
+        if self._tools is None:
+            self._tools = _ResourceTools(lambda: self._pointer)
+            self._server.add_provider(self._tools)
         if self._agents is None:
             self._agents = _Agents(self)
             self._server.add_extension(self._agents)

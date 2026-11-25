@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastmcp import Context
 from fastmcp.server.dependencies import _background_task_headers
+from fastmcp.utilities.tests import asgi_server
 from gateway_server import kit, over_http
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from test_delivery_inputs import seen, server, warnings
 
 from kubed.mcp import QuickMCP, gateway
@@ -98,3 +103,32 @@ def test_an_invalid_header_prefix_is_refused(bad):
 @pytest.mark.parametrize("good", ["Kb", "Sf", "My-Co", "kb", "X1"])
 def test_a_valid_header_prefix_is_taken(good):
     QuickMCP("t", header_prefix=good)
+
+
+async def test_each_source_warns_once_under_its_own_name(caplog):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        async with over_http(
+            server(header_prefix="Kb"),
+            headers={"Kb-Listed": "bogus", "X-MCP-Listed": "bogus"},
+        ) as client:
+            await seen(client)
+            await seen(client)
+    found = [r.getMessage() for r in warnings(caplog)]
+    assert len(found) == 2
+    assert sum(m.startswith("header Kb-Listed ") for m in found) == 1
+    assert sum(m.startswith("header X-MCP-Listed ") for m in found) == 1
+
+
+async def test_a_custom_route_reads_the_servers_own_prefix_header():
+    mcp = QuickMCP("t", header_prefix="Kb")
+
+    @mcp.custom_route("/prefix", methods=["GET"], name="prefix")
+    async def prefix(request: Request) -> JSONResponse:
+        return JSONResponse({"prefix": gateway.prefix()})
+
+    async with asgi_server(mcp.server) as running, running.http_client() as http:
+        url = str(running.app.url_path_for("prefix"))
+        answer = await http.get(url, headers={"Kb-Resource-Prefix": "kb+"})
+        bare = await http.get(url)
+    assert answer.json() == {"prefix": "kb+"}
+    assert bare.json() == {"prefix": None}
