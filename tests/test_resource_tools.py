@@ -125,6 +125,7 @@ async def test_off_lists_the_two_read_only_tools(tmp_path, asked):
     assert tools["read_resource"].title == "Read a resource"
     for name in TOOLS:
         a = tools[name].annotations
+        assert a.title == tools[name].title
         assert (
             a.read_only_hint,
             a.destructive_hint,

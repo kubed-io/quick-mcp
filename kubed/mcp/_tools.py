@@ -41,13 +41,16 @@ _IMAGES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _UNDECLARED = "application/octet-stream"
 NOT_TEXT = "Not returned: binary content is not text."
 
-# mcp-kb's annotations for its own resource tools (TOOL-6).
-_READ_ONLY = ToolAnnotations(
-    read_only_hint=True,
-    destructive_hint=False,
-    idempotent_hint=True,
-    open_world_hint=False,
-)
+
+def _read_only(title: str) -> ToolAnnotations:
+    """mcp-kb's annotations for its resource tools (TOOL-6), with the tool's title."""
+    return ToolAnnotations(
+        title=title,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    )
 
 
 class _ResourceTools(Provider):
@@ -71,14 +74,14 @@ class _ResourceTools(Provider):
                         "List every resource this server has, as resources/list does "
                         "for this request."
                     ),
-                    annotations=_READ_ONLY,
+                    annotations=_read_only("List resources"),
                 ),
                 Tool.from_function(
                     self._read,
                     name="read_resource",
                     title="Read a resource",
                     description="Read one resource by its URI, as resources/read does.",
-                    annotations=_READ_ONLY,
+                    annotations=_read_only("Read a resource"),
                 ),
             )
         }
