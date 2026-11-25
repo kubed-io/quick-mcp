@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -31,6 +32,12 @@ async def request(client, method: str, **params) -> dict:
     return await client.session.send_request(
         Request(method=method, params=ExtensionParams(**params)), TypeAdapter(dict)
     )
+
+
+def read_bytes(content) -> bytes:
+    """What a read served, as bytes: its text encoded, or its blob decoded."""
+    text = getattr(content, "text", None)
+    return text.encode() if text is not None else base64.b64decode(content.blob)
 
 
 async def read_directory(client, **params) -> dict:

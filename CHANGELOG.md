@@ -29,6 +29,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `add_plugin(…, manifest=entry)` and `read_plugin(root, manifest=…)` merge a marketplace entry with `plugin.json` as Claude Code does.
 - `Plugin.skipped` names each skill, command and agent file a plugin does not serve, and why.
+- `mcp.plugin_set()` and `mcp.serve(set)` swap a whole set of plugins at once, counted by `mcp.generation`.
+- `mcp.plugin_view(fn)` serves each request only the plugins its view admits.
+- `mcp.add_rewriter(fn)` rewrites the text a server serves, with digests that match.
+- `to_mcp_form` rewrites `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_SKILL_DIR}` and `<plugin>:<skill>` as `skill://` addresses.
+- A server's own `file` loader replaces the built-in one.
+- A server behind a multiplexing gateway takes its `X-MCP-Resource-Prefix` (or `?prefix=`) off the addresses clients send and writes it into the text it serves.
+- `kubed.mcp.gateway.prefix()` and `prefixed(text, prefix)` prefix a server's own text the same way.
+- `mcp.command_reader(fn)` reads a server's own command dialects as prompts.
+- Same-named agents from two plugins are both served, the later as `name@plugin`.
+- `Plugin.agent_files` gives each agent's file and whether it was renamed.
+- `mcp.agent_meta(fn)` adds a server's own `_meta` to `agents/get`.
+- A Copilot prompt file, `x.prompt.md`, is served as the prompt `x`.
+- Each prompt and agent a plugin serves reads as markdown at `prompts://` and `agents://`, with folder indexes.
+- `QuickMCP(…, header_prefix="Kb")` reads every `X-MCP-*` header as `Kb-*` too, the server's own name winning.
+- `X-MCP-Listed` (or `?listed=`) chooses which of skills, prompts and agents `resources/list` shows, and a config's `delivery` sets the default.
+- `X-MCP-Resources: off` (or `?resources=off`) lists read-only `list_resources` and `read_resource` tools for clients that cannot read resources.
+- `mcp.binary_pointer(fn)` tells `read_resource` where a binary's link is listed.
+- `X-MCP-Via: extension` or `local` (or `?via=`) stops listing what a client's hook or local install already has, while every read still answers.
+- `mcp.delivery_default(fn)` sets a client's delivery defaults from its `clientInfo`.
+- VS Code clients get `list_resources` and `read_resource` with no header sent.
+- `mcp.instructions(fn)` writes a server's instructions per request, from what the client sent.
+- `initialize` and `server/discover` results report what the server resolved, in `_meta["io.kubed/delivery"]`.
+
+### Changed
+
+- A `skill://`, `prompts://` or `agents://` address holding an escaped `/` (`%2F`) now fails as a missing one does.
+- `resources/read` resolves `.` and `..` segments in a `skill://`, `prompts://` or `agents://` address.
+- Under a namespace, prompt and agent names are prefixed with its first segment only.
+- A skill's JSON, YAML, TOML and script files read as text, and rewriters and the gateway prefix reach them.
+- A plugin is refused when its namespace would sit inside another plugin's skill, or one of its skills would hold another plugin's namespace.
+- `prompts://` and `agents://` belong to the plugins: a server's own resource there, or a second plugin's prompt at one address, is refused.
+- A plugin is refused beside a server's own `list_resources` or `read_resource` tool, and the other way round: the plugin layer serves both.
 
 ## [0.1.2] - 2026-11-23
 
