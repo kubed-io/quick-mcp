@@ -5,6 +5,7 @@ name: 📖 Wiki
 #
 #   pull_request        the pinned wiki commit can be fetched — never pushes
 #   push: main          bring master into the pin, push it to master, record the pointer
+#   push: issue-*       only bring the open PRs into that family branch up to date
 #   workflow_dispatch   the same, by hand, e.g. after master was edited in the browser
 #
 # The wiki is its own git repository at <repo>.wiki.git, and a submodule here at docs/ — hence
@@ -24,7 +25,7 @@ on:
   # every merge, not only one that moves the pin: after it, the open PRs are brought up to date
   # (the last step), and a merge of any kind leaves them behind
   push:
-    branches: [main]
+    branches: [main, 'issue-*']
   workflow_dispatch:
     inputs:
       push:
@@ -52,7 +53,10 @@ jobs:
     env:
       # true only for a real publish: a push to main, or a dispatch with push=true. A
       # pull_request run never pushes.
-      PUSH: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)) && 'true' || 'false' }}
+      PUSH: ${{ ((github.event_name == 'push' && github.ref_name == 'main') || (github.event_name == 'workflow_dispatch' && inputs.push)) && 'true' || 'false' }}
+      # a push to a family's branch (issue-*) only brings the PRs into it up to date (the last
+      # step): nothing is generated or published, and the wiki's master is never written
+      FAMILY: ${{ github.event_name == 'push' && github.ref_name != 'main' }}
     steps:
 
     # Only a run that pushes needs a writable identity. The App is the identity main's ruleset
@@ -85,6 +89,7 @@ jobs:
         persist-credentials: true
 
     - name: Pin
+      if: env.FAMILY != 'true'
       working-directory: docs
       run: |
         pin=$(git rev-parse HEAD)
@@ -164,7 +169,8 @@ jobs:
     # CHANGELOG's [Unreleased]) conflicts with every other's. This brings each one up to date:
     # GitHub's update-branch when it merges clean, otherwise a merge whose docs pointer goes to
     # the wiki's head and whose CHANGELOG keeps both sides. Anything else is left for the PR's
-    # agent. It pushes as the App, so each PR's checks run again.
+    # agent. It pushes as the App, so each PR's checks run again. On a family branch's push it
+    # is the only step, with that branch as the base (quick-mcp #41).
     # !cancelled(): it does not depend on the publish above, so a wiki push refused (a browser
     # edit) still leaves the PRs current
     - name: Bring the Open PRs Up to Date
