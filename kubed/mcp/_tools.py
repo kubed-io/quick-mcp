@@ -198,12 +198,12 @@ def _pointed(pointer: BinaryPointer | None, uri: str) -> str | None:
     try:
         pointed = pointer(uri)
     except Exception:
-        log.exception("binary_pointer failed for %s: the read gives no pointer", uri)
+        log.exception("binary_pointer failed for %r: the read gives no pointer", uri)
         return None
     if pointed is None or isinstance(pointed, str):
         return pointed
     log.error(
-        "binary_pointer returned %s for %s, not a string: the read gives no pointer",
+        "binary_pointer returned %s for %r, not a string: the read gives no pointer",
         type(pointed).__name__,
         uri,
     )
