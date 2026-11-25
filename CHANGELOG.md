@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.agent_meta(fn)` adds a server's own `_meta` to `agents/get`.
 - A Copilot prompt file, `x.prompt.md`, is served as the prompt `x`.
 - Each prompt and agent a plugin serves reads as markdown at `prompts://` and `agents://`, with folder indexes.
+- `QuickMCP(…, header_prefix="Kb")` reads every `X-MCP-*` header as `Kb-*` too, the server's own name winning.
 
 ### Changed
 

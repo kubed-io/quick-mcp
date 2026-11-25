@@ -27,7 +27,7 @@ from .container import (
     Recipe,
     _Call,
 )
-from .delivery import _RESOLVERS, _Resolver, _ResolveScope
+from .delivery import _RESOLVERS, _header_prefix, _Resolver, _ResolveScope
 from .gateway import _TakeThePrefix
 from .plugins import (
     AgentMeta,
@@ -126,11 +126,21 @@ def quiet_fastmcp_logging() -> None:
 
 
 class QuickMCP:
-    """A FastMCP server and a container, built by a factory and run by ``run()``."""
+    """A FastMCP server and a container, built by a factory and run by ``run()``.
+
+    ``header_prefix`` names the server's own headers: with ``"Kb"``, every ``X-MCP-*``
+    input is also read as ``Kb-*``, which wins (DLV-16).
+    """
 
     def __init__(
-        self, name: str, *, config: object | None = None, **fastmcp_options: Any
+        self,
+        name: str,
+        *,
+        config: object | None = None,
+        header_prefix: str | None = None,
+        **fastmcp_options: Any,
     ):
+        header_prefix = _header_prefix(header_prefix)
         self._container = Container()
         self._config = config
         lifespan = fastmcp_options.pop("lifespan", None)
@@ -156,7 +166,7 @@ class QuickMCP:
         self._plugins = Plugins(self.server)
         # The inputs resolve once per request, inside _CallScope and outside the pin, so
         # the build key's prefix is the one this request resolved.
-        self._resolver = _Resolver(None, getattr(config, "delivery", None))
+        self._resolver = _Resolver(header_prefix, getattr(config, "delivery", None))
         _RESOLVERS[self.server] = self._resolver
         self.server.middleware.insert(1, _ResolveScope(self._resolver))
         # Inside the resolution, outside everything that reads plugins.

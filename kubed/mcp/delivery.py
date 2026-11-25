@@ -30,6 +30,8 @@ __all__ = ["Delivery"]
 
 # A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
 _PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
+# A header-name token: letters and digits, with - only between them.
+_HEADER_TOKEN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 _KINDS = frozenset({"skills", "prompts", "agents"})
 _ON = frozenset({"on", "true", "1", "yes"})
 _OFF = frozenset({"off", "false", "0", "no", "none"})
@@ -47,6 +49,22 @@ class Delivery(Protocol):
     def listed(self) -> str | Collection[str] | None: ...
     @property
     def via(self) -> str | None: ...
+
+
+def _header_prefix(value: str | None) -> str | None:
+    """``value`` as the server's header prefix (DLV-16), or a ``ValueError``."""
+    if value is None:
+        return None
+    if not _HEADER_TOKEN.fullmatch(value):
+        raise ValueError(
+            f"header_prefix {value!r} is not a header-name token: letters and digits, "
+            "with - only between them (Kb, Sf, My-Co)"
+        )
+    if value.lower() == "x-mcp":
+        raise ValueError(
+            f"header_prefix {value!r} is the shared X-MCP alias: name the server's own"
+        )
+    return value
 
 
 def _take_prefix(raw: str) -> str:
@@ -215,6 +233,8 @@ class _Resolver:
         self.levels: dict[str, list[Level]] = {}
         for entry in _INPUTS.values():
             levels = [_header(f"X-MCP-{entry.name}"), _query(entry)]
+            if header_prefix is not None:
+                levels.insert(0, _header(f"{header_prefix}-{entry.name}"))
             config = _config_level(entry, delivery)
             if config is not None:
                 levels.append(config)

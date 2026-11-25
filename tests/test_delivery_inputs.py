@@ -25,7 +25,9 @@ def snapshot() -> dict:
 
 
 def server(delivery=None, header_prefix=None) -> QuickMCP:
-    mcp = QuickMCP("t", config=SimpleNamespace(delivery=delivery))
+    mcp = QuickMCP(
+        "t", config=SimpleNamespace(delivery=delivery), header_prefix=header_prefix
+    )
 
     @mcp.tool
     def seen() -> dict:
