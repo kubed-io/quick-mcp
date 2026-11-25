@@ -125,6 +125,7 @@ async def test_off_lists_the_two_read_only_tools(tmp_path, asked):
     assert tools["read_resource"].title == "Read a resource"
     for name in TOOLS:
         a = tools[name].annotations
+        assert a.title == tools[name].title
         assert (
             a.read_only_hint,
             a.destructive_hint,
@@ -270,6 +271,21 @@ async def test_a_pointer_that_gives_nothing_leaves_the_sentence(
         if r.name == "kubed.mcp.delivery" and r.levelno == logging.ERROR
     ]
     assert bool(errors) is logged
+
+
+@pytest.mark.parametrize(
+    "pointer", [lambda uri: 1 / 0, lambda uri: 3], ids=["raises", "not-a-string"]
+)
+def test_a_pointers_log_line_quotes_the_uri(pointer, caplog):
+    """A URI with a newline can't forge a second log line."""
+    from kubed.mcp._tools import _pointed
+
+    uri = "files://x.bin\nERROR forged"
+    with caplog.at_level(logging.ERROR, logger="kubed.mcp.delivery"):
+        assert _pointed(pointer, uri) is None
+    (record,) = [r for r in caplog.records if r.name == "kubed.mcp.delivery"]
+    assert "\n" not in record.getMessage()
+    assert repr(uri) in record.getMessage()
 
 
 @pytest.mark.parametrize(
