@@ -49,6 +49,7 @@ from .plugins import (
     View,
     _PinScope,
 )
+from .telemetry import Telemetry, _call_metrics, _start_signals
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -105,11 +106,18 @@ def _signed_as(
 def _with_teardown(
     container: Container,
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[Any]] | None,
+    *,
+    name: str,
+    telemetry: Telemetry | None,
 ) -> Callable[[FastMCP], AbstractAsyncContextManager[Any]]:
-    """The server's lifespan, with the container torn down after it ends."""
+    """The server's lifespan, with telemetry started before it and stopped after it.
+
+    The container is torn down last, after telemetry has stopped.
+    """
 
     @asynccontextmanager
     async def run(server: FastMCP) -> AsyncIterator[Any]:
+        signals = _start_signals(name, telemetry)
         try:
             if lifespan is None:
                 yield {}
@@ -117,6 +125,8 @@ def _with_teardown(
                 async with lifespan(server) as state:
                     yield state
         finally:
+            if signals is not None:
+                signals.stop()
             await container.aclose()
 
     return run
@@ -153,11 +163,20 @@ class QuickMCP:
         header_prefix = _header_prefix(header_prefix)
         self._container = Container()
         self._config = config
+        telemetry = getattr(config, "telemetry", None)
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
-            name, lifespan=_with_teardown(self._container, lifespan), **fastmcp_options
+            name,
+            lifespan=_with_teardown(
+                self._container,
+                lifespan,
+                name=name,
+                telemetry=telemetry,
+            ),
+            **fastmcp_options,
         )
-        # Outermost, so every middleware and handler inside it shares one call's slot.
+        # _CallScope is outermost but for the call metrics, so every other middleware
+        # and handler shares one call's slot (APP-6). The metrics go in last, below.
         self.server.middleware.insert(0, _CallScope(self._container))
         SERVING[self.server] = self._container
         if config is not None:
@@ -183,6 +202,11 @@ class QuickMCP:
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
         self.server.middleware.insert(3, _TakeThePrefix())
+        # The call metrics go first, after the scopes above are placed by their index
+        # from _CallScope, to record what the client received, the slot's teardown
+        # included (TEL-16).
+        if (metrics := _call_metrics(telemetry)) is not None:
+            self.server.middleware.insert(0, metrics)
         # Inside the resolution, so the handshake echoes and is written for this
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None

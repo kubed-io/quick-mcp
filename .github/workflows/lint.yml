@@ -70,11 +70,13 @@ jobs:
         cache: pip
         cache-dependency-path: pyproject.toml
 
-    # Runtime only. The test extra is deliberately NOT installed here: ruff and
-    # pytest never reach a user, and an advisory against a test-only tool that
-    # stops a release is noise, not security.
+    # Runtime, with the telemetry extra: the servers' images ship it, so its
+    # OpenTelemetry and pyroscope packages are audited as a user's install. The
+    # test extra is still deliberately NOT installed here: ruff and pytest never
+    # reach a user, and an advisory against a test-only tool that stops a release
+    # is noise, not security.
     - name: Install Runtime Dependencies
-      run: pip install --editable .
+      run: pip install --editable '.[telemetry]'
 
     # --exclude-editable drops kubed-mcp itself: pip-audit would look up this
     # checkout's dev version on PyPI and fail to resolve it, which reads like a
