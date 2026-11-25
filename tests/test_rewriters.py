@@ -184,10 +184,10 @@ async def test_a_broken_rewrite_fails_only_its_item(  # Review Focus 3
     assert any("scoped" in m and logged in m for m in errors)
 
 
-async def test_binary_and_non_utf8_files_pass_untouched(tmp_path):
+async def test_binary_and_non_utf8_files_pass_untouched_and_json_is_text(tmp_path):
     png = b"\x89PNG\r\n${CLAUDE_PLUGIN_ROOT}"
     latin = "café ${CLAUDE_PLUGIN_ROOT}".encode("latin-1")
-    data = b'{"root": "${CLAUDE_PLUGIN_ROOT}"}'  # UTF-8, but application/json
+    data = b'{"root": "${CLAUDE_PLUGIN_ROOT}"}'  # UTF-8 and text-like (PLUG-75)
     root = copy(tmp_path)
     (root / "skills/demo-guide/logo.png").write_bytes(png)
     (root / "skills/demo-guide/notes.txt").write_bytes(latin)
@@ -204,10 +204,11 @@ async def test_binary_and_non_utf8_files_pass_untouched(tmp_path):
         notes = (await client.read_resource("skill://t/demo-guide/notes.txt"))[0]
         config = (await client.read_resource("skill://t/demo-guide/data.json"))[0]
     assert "skills/demo-guide/SKILL.md" in seen  # the rewriter ran
-    untouched = {"logo.png", "notes.txt", "data.json"}
+    assert "skills/demo-guide/data.json" in seen
+    untouched = {"logo.png", "notes.txt"}
     assert not {f"skills/demo-guide/{name}" for name in untouched} & set(seen)
     assert read_bytes(logo) == png and read_bytes(notes) == latin
-    assert read_bytes(config) == data
+    assert config.text == '{"root": "X"}'
 
 
 async def test_an_index_is_rewritten_once_per_build():
@@ -313,20 +314,6 @@ async def test_a_build_lists_each_folder_from_its_own_skill_alone(
         counts.append(len(calls))
     assert counts[0] <= 3 * 4  # a listing per folder (two a skill), a load a skill
     assert counts[1] <= 2 * counts[0]  # linear in the skills, not quadratic
-
-
-@pytest.mark.parametrize("rewriter", [None, lambda site, text: text])
-async def test_a_skill_nested_in_another_fails_a_rewritten_build_too(
-    tmp_path, rewriter
-):
-    outer = write(tmp_path / "outer", {"skills/a/SKILL.md": skill("a")})
-    inner = write(tmp_path / "inner", {"skills/x/SKILL.md": skill("x")})
-    mcp = served((outer, "lib"), (inner, "lib/a"))  # skill://lib/a/x is inside lib/a
-    if rewriter:
-        mcp.add_rewriter(rewriter)
-    async with Client(mcp.server) as client:
-        with pytest.raises(MCPError):
-            await client.read_resource("skill://lib/a/x/_index.md")
 
 
 async def test_no_rewriter_serves_the_objects_as_read():

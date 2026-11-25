@@ -49,11 +49,11 @@ from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
-from fastmcp.skills.provider import SkillCatalogProvider
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import TextContent
 
 from . import gateway, skills
+from ._media import text_of
 from ._rewrite import (
     Kind,
     RewriteFailed,
@@ -61,7 +61,6 @@ from ._rewrite import (
     Site,
     name_of,
     run,
-    text_of,
     to_mcp_form,
 )
 from .agents import (
@@ -1438,6 +1437,34 @@ class _Rewrite:
         return found
 
 
+def _within(path: str, folder: str) -> bool:
+    """Whether ``path`` is ``folder`` or lies below it, by whole ``/`` segments."""
+    return path == folder or path.startswith(folder + "/")
+
+
+def _nested(served: _Served, earlier: Iterable[_Served]) -> str | None:
+    """Why ``served`` may not join a set holding ``earlier`` (PLUG-76), else None:
+    its namespace inside a skill of an earlier plugin, or a skill of its holding an
+    earlier plugin's namespace. Checked in ``earlier``'s order, the first direction
+    before the second for each."""
+    ns = served.plugin.namespace
+    for other in earlier:
+        for key in other.catalogue:
+            if _within(ns, key):
+                return (
+                    f"namespace {ns} is inside skill {skills._root(key)} "
+                    f"of plugin {other.plugin.name}"
+                )
+        theirs = other.plugin.namespace
+        for key in served.catalogue:
+            if _within(theirs, key):
+                return (
+                    f"skill {skills._root(key)} holds namespace {theirs} "
+                    f"of plugin {other.plugin.name}"
+                )
+    return None
+
+
 class PluginSet:
     """A set of plugins built apart from what is served, then served whole (PLUG-50).
 
@@ -1445,11 +1472,12 @@ class PluginSet:
     the server serves now, unread. A clash is checked against the plugins in this set
     alone, so a set that leaves a plugin out may add another that serves the same
     thing. A skill URI, a prompt name or a prompt's address served already refuses
-    the plugin; an agent name is renamed or skipped instead, and an agent whose
-    address is served skipped, decided as the plugin enters the set (PLUG-64,
-    PLUG-66), so each returns the plugin as it entered. A refused plugin raises and
-    leaves the set unchanged. Nothing here is served until ``mcp.serve(set)``; the
-    set is then a snapshot, and adding to it afterwards changes nothing served.
+    the plugin, and so does a namespace nesting with a skill (PLUG-76); an agent
+    name is renamed or skipped instead, and an agent whose address is served
+    skipped, decided as the plugin enters the set (PLUG-64, PLUG-66), so each
+    returns the plugin as it entered. A refused plugin raises and leaves the set
+    unchanged. Nothing here is served until ``mcp.serve(set)``; the set is then a
+    snapshot, and adding to it afterwards changes nothing served.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -1472,7 +1500,13 @@ class PluginSet:
         """Reads and checks the plugin at ``address`` as ``add_plugin`` does (PLUG-2,
         PLUG-3) and adds it to the set. A refused plugin raises its ``PluginError``."""
         served = self._plugins._load(address, namespace, manifest, self._owners)
-        return self._carry(served).plugin
+        try:
+            entered = self._carry(served)
+        except PluginError as exc:
+            raise PluginError(
+                f"plugin {served.plugin.address} is not served: {exc}"
+            ) from None
+        return entered.plugin
 
     def keep(self, plugin: Plugin) -> Plugin:
         """Carries a plugin the server serves now into the set, without reading it
@@ -1494,8 +1528,9 @@ class PluginSet:
 
     def _carry(self, served: _Served) -> _Served:
         """Adds ``served`` to the set as it enters it, and returns that: refused whole
-        when a skill, a prompt or a prompt's address of it is owned already, its
-        agents named and addressed by the set (PLUG-64, PLUG-66)."""
+        when a skill, a prompt or a prompt's address of it is owned already, or when
+        its namespace and a skill of the set nest (PLUG-76), its agents named and
+        addressed by the set (PLUG-64, PLUG-66)."""
         for key in _owned(served):
             if key.startswith(("agent:", "agents://")):
                 continue
@@ -1503,6 +1538,8 @@ class PluginSet:
             if owner is not None:
                 what = key if "://" in key else key.replace(":", " ", 1)
                 raise PluginError(f"{what} is already served by plugin {owner}")
+        if (reason := _nested(served, self._served)) is not None:
+            raise PluginError(reason)
         entered = _enter(served, self._owners, self._plugins._agent_meta)
         self._owners.update(_owned(entered))
         self._served.append(entered)
@@ -1798,9 +1835,6 @@ class Plugins:
                 materials.append(_material(served, file, agent, _as_served(file, text)))
         files = {m.file.uri: m for m in materials}
         folders = _folder_rows(materials)
-        # FastMCP refuses a catalogue with a skill nested in another, which no one
-        # skill's renderer can see: the build fails on it as the whole catalogue would.
-        SkillCatalogProvider(catalogue)
         # Throwaway renderers, one per skill: FastMCP keys what it loads per request
         # by a provider's id, so the build keeps them alive while a request may still
         # see them.

@@ -38,6 +38,7 @@ import mcp_types
 from fastmcp import FastMCP
 from fastmcp.exceptions import NotFoundError
 from fastmcp.resources import Resource, TextResource
+from fastmcp.resources.base import ResourceContent, ResourceResult
 from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding, ServerExtension
 from fastmcp.server.middleware import Middleware
@@ -51,6 +52,7 @@ from pydantic import Field, ValidationError
 
 from mcp.shared.exceptions import MCPError
 
+from . import _media
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -456,6 +458,17 @@ def _without_unserved(manifest: SkillManifest) -> SkillManifest:
     return manifest.model_copy(update={"files": files})
 
 
+class _SkillFile(SkillFileResource):
+    """A skill's file other than its ``SKILL.md``, read as text when it is a text
+    file (PLUG-75) and as a blob of its bytes otherwise."""
+
+    async def read(self) -> ResourceResult:
+        data = await self.provider.read_file(self)
+        text = _media.text_of(self.file_path, data)
+        value: str | bytes = data if text is None else text
+        return ResourceResult([ResourceContent(value, mime_type=self.mime_type)])
+
+
 class EntryOnlySkillProvider(SkillCatalogProvider):
     """A catalogue of skills, listed by each skill's ``SKILL.md`` alone.
 
@@ -537,11 +550,16 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
             if resource.file_path.endswith(".md"):
                 title = _heading(await self.read_file(resource))
             name = posixpath.basename(resource.skill_path)
-            # Still a SkillFileResource with the same `file`: FastMCP offers a skill's
-            # entry only while every file resolves to the one its manifest lists.
-            resource = resource.model_copy(
-                update={"description": title or f"File from {name} skill"}
-            )
+            # Still a SkillFileResource with every other field kept, `file` included:
+            # FastMCP offers a skill's entry only while every file resolves to the one
+            # its manifest lists.
+            fields = {
+                field: getattr(resource, field)
+                for field in SkillFileResource.model_fields
+            }
+            fields["description"] = title or f"File from {name} skill"
+            fields["mime_type"] = _media.media_type(resource.file_path)
+            resource = _SkillFile(**fields)
         return resource
 
 

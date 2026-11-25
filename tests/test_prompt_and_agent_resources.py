@@ -1250,3 +1250,58 @@ def test_an_empty_set_is_served_beside_its_own():
     mcp.serve(mcp.plugin_set())
     assert mcp.generation == 1
     assert mcp.resource("agents://own/y.md")(own_text) is own_text
+
+
+async def test_no_address_has_a_dot_segment(tmp_path):  # PLUG-66, PLUG-12 (#20)
+    root = write(
+        tmp_path / "p",
+        {
+            ".claude-plugin/plugin.json": manifest(
+                "p",
+                commands=[
+                    "./commands/../x.md",
+                    "commands/sub/../z.md",
+                    "./commands/./y.md",
+                    "./extra/./w.md",
+                ],
+                agents=["./agents/../b.md", "./agents/./a.md"],
+            ),
+            "x.md": command_md(),
+            "z.md": command_md(),
+            "commands/y.md": command_md(),
+            "extra/w.md": command_md(),
+            "b.md": agent_md("b"),
+            "agents/a.md": agent_md("a"),
+        },
+    )
+    mcp = QuickMCP("t")
+    seen = addresses(mcp)
+    plugin = mcp.add_plugin(
+        root, namespace="kit", manifest={"commands": ["./extra/../x.md"]}
+    )
+    await listed(mcp)
+    for path in ("./commands/../x.md", "commands/sub/../z.md", "./extra/../x.md"):
+        assert (
+            f"commands path '{path}' leaves the plugin root" in plugin.components.notes
+        )
+    assert (
+        "agents path './agents/../b.md' leaves the plugin root"
+        in plugin.components.notes
+    )
+    build = (await mcp._plugins.pinned()).build
+    uris = [*build.files, *build.folders, *(uri for _, uri in seen)]
+    assert uris
+    assert all(
+        segment not in (".", "..")
+        for uri in uris
+        for segment in uri.split("://", 1)[1].split("/")
+    )
+    assert {
+        "prompts://kit/y.md",
+        "prompts://kit/extra/w.md",
+        "agents://kit/a.md",
+    } <= set(build.files)
+    # the refused paths serve nothing, at the root or anywhere else
+    assert not {"prompts://kit/x.md", "prompts://kit/z.md", "agents://kit/b.md"} & set(
+        build.files
+    )
