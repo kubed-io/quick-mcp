@@ -19,7 +19,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast, get_args
 from weakref import WeakKeyDictionary
 
 from fastmcp import FastMCP
@@ -36,14 +36,19 @@ from kubed.mcp.request import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BinaryPointer", "Delivery", "DeliveryDefault", "Resolved"]
+__all__ = ["BinaryPointer", "Delivery", "DeliveryDefault", "Instructions", "Resolved"]
 
 # A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
 _PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
 # A header-name token: letters and digits, with - only between them.
 _HEADER_TOKEN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 _KINDS = frozenset({"skills", "prompts", "agents"})
-_VIAS = ("mcp", "extension", "local")
+# The order the handshake's echo lists the kinds in (DLV-2, DLV-12).
+_ECHO_ORDER = ("skills", "prompts", "agents")
+# What Resources and Via resolve to, as Resolved spells them out (DLV-11).
+_Resources = Literal["on", "off"]
+_Via = Literal["mcp", "extension", "local"]
+_VIAS: tuple[_Via, ...] = get_args(_Via)
 # What X-MCP-Listed defaults to under each Via (DLV-9).
 _PRESET: Mapping[str, frozenset[str]] = MappingProxyType(
     {"mcp": frozenset({"skills"}), "extension": frozenset(), "local": frozenset()}
@@ -127,7 +132,7 @@ def _take_prefix(raw: str) -> str:
     return value
 
 
-def _take_resources(raw: str) -> str:
+def _take_resources(raw: str) -> _Resources:
     value = raw.strip().lower()
     if value in _ON:
         return "on"
@@ -136,11 +141,11 @@ def _take_resources(raw: str) -> str:
     raise ValueError(raw)
 
 
-def _take_via(raw: str) -> str:
+def _take_via(raw: str) -> _Via:
     value = raw.strip().lower()
     if value not in _VIAS:
         raise ValueError(raw)
-    return value
+    return cast(_Via, value)
 
 
 def _take_listed(raw: str) -> frozenset[str]:
@@ -232,11 +237,25 @@ class Resolved:
     or None when the request does not say.
     """
 
-    resources: str
+    resources: Literal["on", "off"]
     listed: frozenset[str]
-    via: str
+    via: Literal["mcp", "extension", "local"]
     prefix: str | None
     extensions: frozenset[str] | None = None
+
+
+# A server's instructions for a request, given what it resolved, or None (DLV-11).
+Instructions = Callable[[Resolved], str | None]
+
+
+def _echo(r: Resolved) -> dict:
+    """What the handshake reports ``r`` as (DLV-12): ``extensions`` is the client's."""
+    return {
+        "resources": r.resources,
+        "listed": [kind for kind in _ECHO_ORDER if kind in r.listed],
+        "via": r.via,
+        "prefix": r.prefix,
+    }
 
 
 def _header(name: str) -> Level:
@@ -386,6 +405,37 @@ def _client_info(context: Any | None) -> Implementation | None:
     return None
 
 
+def _extension_ids(capabilities: Any) -> frozenset[str] | None:
+    """The extension ids ``capabilities`` declares: empty for none, None for no
+    capabilities. As ``client_supports_extension`` does, the ``extensions`` field is
+    read first, then an ``extensions`` extra key."""
+    if capabilities is None:
+        return None
+    extensions = capabilities.extensions
+    if extensions is None:
+        extensions = (capabilities.model_extra or {}).get("extensions")
+    return frozenset(extensions or ())
+
+
+def _extensions(context: Any | None) -> frozenset[str] | None:
+    """The extension ids the client of the request ``context`` is for declares, or None
+    (DLV-11).
+
+    On ``initialize`` they are its params' ``capabilities.extensions``. On any other
+    request, and off a request (``context`` None), they are its session's
+    ``client_capabilities``, which ``client_supports_extension`` reads: the handshake's
+    on a legacy session, the request's ``_meta`` envelope's on the 2026-07-28 protocol.
+    A lookup that fails is None.
+    """
+    try:
+        if context is not None and context.method == "initialize":
+            return _extension_ids(context.message.params.capabilities)
+        held = get_context() if context is None else context.fastmcp_context
+        return _extension_ids(held.session.client_capabilities)
+    except Exception:  # noqa: BLE001 - a lookup that fails is none (DLV-11)
+        return None
+
+
 def _warning(source: str, value: str, entry: _Input) -> None:
     log.warning(
         "%s %r is ignored, and the next source answers: %s",
@@ -416,6 +466,9 @@ class _Resolver:
                     _known_level(entry),
                 ]
             self.levels[entry.name] = levels
+        assert len(self.levels["Via"]) == len(self.levels["Listed"]), (
+            "Via's and Listed's levels must line up by index (DLV-9)"
+        )
 
     def resolve(
         self,
@@ -537,6 +590,7 @@ class _ResolveScope(Middleware):
         resolved = self._resolver.resolve(
             request_values(),
             _client_info(context),
+            _extensions(context),
             warn=context.method != "initialize",
         )
         token = _RESOLVED.set((self._resolver, resolved))
@@ -564,4 +618,4 @@ def _resolved() -> Resolved:
             served = getattr(get_http_request().app.state, "fastmcp_server", None)
             if served is not None:
                 resolver = _RESOLVERS.get(served, _BARE)
-    return resolver.resolve(request_values(), _client_info(None))
+    return resolver.resolve(request_values(), _client_info(None), _extensions(None))

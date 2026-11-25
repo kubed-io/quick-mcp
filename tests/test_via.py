@@ -159,6 +159,27 @@ async def test_every_get_answers_in_every_mode(tmp_path, via):
         assert await gets(client) == today
 
 
+INDEXES = ("prompts://t/_index.json", "agents://t/_index.json")
+
+
+@pytest.mark.parametrize("via", ["extension", "local"])
+async def test_the_indexes_a_hook_installs_from_are_todays(tmp_path, via):  # DLV-10
+    mcp = make(tmp_path)
+
+    async def indexes(client: Client) -> dict:
+        return {
+            uri: [c.model_dump(mode="json") for c in await client.read_resource(uri)]
+            for uri in INDEXES
+        }
+
+    async with over_http(mcp, headers={"X-MCP-Via": "mcp"}) as client:
+        today = await indexes(client)
+    assert all(today.values())
+    assert "greet" in str(today[INDEXES[0]]) and "helper" in str(today[INDEXES[1]])
+    async with over_http(mcp, headers={"X-MCP-Via": via}) as client:
+        assert await indexes(client) == today
+
+
 @pytest.mark.parametrize("via", ["extension", "local"])
 async def test_an_explicit_listed_beats_the_preset(tmp_path, via):
     mcp = make(tmp_path)

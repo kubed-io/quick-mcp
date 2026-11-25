@@ -242,7 +242,7 @@ async def test_the_warnings_remembered_are_bounded(monkeypatch, caplog):
     assert len(warnings(caplog)) == 3
 
 
-async def test_an_inserted_level_answers_between_config_and_built_in():
+async def test_an_appended_level_answers_before_the_built_in():
     mcp = server()
     mcp._resolver.levels["Listed"].append(lambda values: ("prompts", "stand-in"))
     async with over_http(mcp) as client:

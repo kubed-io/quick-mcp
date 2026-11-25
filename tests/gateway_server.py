@@ -48,12 +48,13 @@ async def over_http(
     headers: dict[str, str] | None = None,
     params: dict[str, str] | None = None,
     client_info: Implementation | None = None,
+    extensions: list | None = None,
 ):
     """An open client over real HTTP, naming a prefix by header and/or query.
 
     ``headers`` and ``params`` send any others: a header as given, a parameter URL-encoded
     (``query`` is kept as sent). ``client_info`` is the client's ``clientInfo``, FastMCP's
-    own when None.
+    own when None, and ``extensions`` the client extensions it declares.
 
     ``mode="legacy"`` pins the handshake era, where a connection outlives a request:
     the default era makes every request its own connection.
@@ -66,5 +67,7 @@ async def over_http(
             pairs.append(urlencode(params))
         if pairs:
             transport.url = f"{running.url}?{'&'.join(pairs)}"
-        async with Client(transport, mode=mode, client_info=client_info) as client:
+        async with Client(
+            transport, mode=mode, client_info=client_info, extensions=extensions
+        ) as client:
             yield client
