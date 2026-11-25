@@ -27,6 +27,13 @@ from .container import (
     Recipe,
     _Call,
 )
+from .delivery import (
+    _RESOLVERS,
+    BinaryPointer,
+    _header_prefix,
+    _Resolver,
+    _ResolveScope,
+)
 from .gateway import _TakeThePrefix
 from .plugins import (
     AgentMeta,
@@ -125,11 +132,22 @@ def quiet_fastmcp_logging() -> None:
 
 
 class QuickMCP:
-    """A FastMCP server and a container, built by a factory and run by ``run()``."""
+    """A FastMCP server and a container, built by a factory and run by ``run()``.
+
+    ``header_prefix`` names the server's own headers: with ``"Kb"``, every ``X-MCP-*``
+    input is also read as ``Kb-*``, which wins (DLV-16). An invalid ``header_prefix``
+    raises ``ValueError``.
+    """
 
     def __init__(
-        self, name: str, *, config: object | None = None, **fastmcp_options: Any
+        self,
+        name: str,
+        *,
+        config: object | None = None,
+        header_prefix: str | None = None,
+        **fastmcp_options: Any,
     ):
+        header_prefix = _header_prefix(header_prefix)
         self._container = Container()
         self._config = config
         lifespan = fastmcp_options.pop("lifespan", None)
@@ -142,7 +160,6 @@ class QuickMCP:
         if config is not None:
             self._container.values[type(config)] = config
         # FastMCP's own, unchanged.
-        self.tool = self.server.tool
         self.prompt = self.server.prompt
         self.add_middleware = self.server.add_middleware
         self.add_provider = self.server.add_provider
@@ -153,11 +170,16 @@ class QuickMCP:
         # QuickMCP.get_tool.
         self.get_tool = self.server.get_tool
         self._plugins = Plugins(self.server)
-        # Right inside _CallScope, outside everything that reads plugins.
-        self.server.middleware.insert(1, _PinScope(self._plugins))
+        # The inputs resolve once per request, inside _CallScope and outside the pin, so
+        # the build key's prefix is the one this request resolved.
+        self._resolver = _Resolver(header_prefix, getattr(config, "delivery", None))
+        _RESOLVERS[self.server] = self._resolver
+        self.server.middleware.insert(1, _ResolveScope(self._resolver))
+        # Inside the resolution, outside everything that reads plugins.
+        self.server.middleware.insert(2, _PinScope(self._plugins))
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
-        self.server.middleware.insert(2, _TakeThePrefix())
+        self.server.middleware.insert(3, _TakeThePrefix())
 
     @_signed_as(FastMCP.resource)
     def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
@@ -167,6 +189,30 @@ class QuickMCP:
         (PLUG-72). FastMCP's own documentation follows."""
         self._plugins.check_own(uri)
         return self.server.resource(uri, *args, **kwargs)
+
+    @_signed_as(FastMCP.tool)
+    def tool(self, name_or_fn: Any = None, *args: Any, **kwargs: Any) -> Any:
+        """FastMCP's ``tool``, with its signature, given what it is given (APP-4),
+        except that once the server has a plugin a tool named ``list_resources`` or
+        ``read_resource`` is refused with a ``ValueError``: the plugin layer serves
+        both itself (DLV-7). FastMCP's own documentation follows."""
+        name = kwargs.get("name")
+        if name is None:
+            if isinstance(name_or_fn, str):
+                name = name_or_fn
+            elif inspect.isroutine(name_or_fn):
+                name = name_or_fn.__name__
+        if name is not None or name_or_fn is not None:
+            self._plugins.check_own_tool(name)
+            return self.server.tool(name_or_fn, *args, **kwargs)
+        # @mcp.tool(), named by the function it is given.
+        decorator = self.server.tool(name_or_fn, *args, **kwargs)
+
+        def register(fn: Any) -> Any:
+            self._plugins.check_own_tool(getattr(fn, "__name__", None))
+            return decorator(fn)
+
+        return register
 
     def websocket_route(
         self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
@@ -297,6 +343,20 @@ class QuickMCP:
         unchanged.
         """
         self._plugins.set_agent_meta(fn)
+        return fn
+
+    def binary_pointer(self, fn: BinaryPointer) -> BinaryPointer:
+        """Sets where ``read_resource`` says a binary's link is listed, and returns
+        ``fn``, so it works as a decorator (DLV-6). A second call replaces the first.
+
+        ``fn(uri)``, called with ``uri`` as the client sent it, returns where the
+        blob's link is listed, or None. Its string follows, after a space, the
+        sentence ``Not returned: binary content is not text.`` in the description
+        ``read_resource`` gives of a blob that is neither an image nor text. An ``fn``
+        that raises, or returns anything but a string, is logged at error and gives
+        none.
+        """
+        self._plugins.set_binary_pointer(fn)
         return fn
 
     def add_loader(self, loader: PluginLoader) -> None:

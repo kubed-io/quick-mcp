@@ -35,12 +35,14 @@ from fastmcp.utilities.types import Image
 from mcp_types import TextContent
 
 from .app import QuickMCP, Serving
+from .delivery import Delivery
 from .inject import Inject, lookup
 
 __version__ = version("kubed-mcp")
 
 __all__ = [
     "Context",
+    "Delivery",
     "Depends",
     "FastMCPError",
     "Image",

@@ -16,33 +16,43 @@ Values = dict[str, list[str]]
 
 __all__ = ["Values", "get_context", "get_http_request", "request_values"]
 
-# What each connection has already been told, by name, keyed by session id. The session
-# object is no key: FastMCP builds a new one per HTTP request. The map is bounded, the
-# oldest connection forgotten first, so a server that lives for years does not grow it.
-_TOLD_MAX = 1024
-_told: OrderedDict[str, set[str]] = OrderedDict()
+# What has been warned of, as (session, source, value), least recently warned first. The
+# set is bounded, the oldest forgotten first, so a server that lives for years does not
+# grow it. FastMCP gives a middleware no signal that a session ended, so none is dropped
+# before the bound.
+_WARNED_MAX = 4096
+_warned: OrderedDict[tuple[str | None, str, str], None] = OrderedDict()
 
 
-def _first_time(name: str) -> bool:
-    """True the first time the current connection asks for ``name``, then False.
+def _session() -> str | None:
+    """The current request's session id, or None.
 
-    It is how a warning is made once per connection and not once per request. With
-    no context or no session to key on, it is always True. On a protocol era where every
-    request is its own connection, so is every request.
+    On a live HTTP request it is the ``mcp-session-id`` header, since FastMCP builds a
+    new session object, and so an id, for each one. Off HTTP it is the context's.
     """
     try:
-        key = get_context().session_id
+        return get_http_request().headers.get("mcp-session-id")
+    except RuntimeError:  # no live HTTP request
+        pass
+    try:
+        return get_context().session_id
     except RuntimeError:  # no context, or no session established yet
-        return True
-    if not key:
-        return True
-    names = _told.setdefault(key, set())
-    _told.move_to_end(key)
-    while len(_told) > _TOLD_MAX:
-        _told.popitem(last=False)
-    if name in names:
+        return None
+
+
+def _warn_once(source: str, value: str) -> bool:
+    """True the first time the current session is warned of ``value`` from ``source``.
+
+    With no session the key is server-wide, as on the 2026-07-28 protocol, where every
+    request is its own connection.
+    """
+    key = (_session(), source, value)
+    if key in _warned:
+        _warned.move_to_end(key)
         return False
-    names.add(name)
+    _warned[key] = None
+    while len(_warned) > _WARNED_MAX:
+        _warned.popitem(last=False)
     return True
 
 

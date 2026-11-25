@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.agent_meta(fn)` adds a server's own `_meta` to `agents/get`.
 - A Copilot prompt file, `x.prompt.md`, is served as the prompt `x`.
 - Each prompt and agent a plugin serves reads as markdown at `prompts://` and `agents://`, with folder indexes.
+- `QuickMCP(…, header_prefix="Kb")` reads every `X-MCP-*` header as `Kb-*` too, the server's own name winning.
+- `X-MCP-Listed` (or `?listed=`) chooses which of skills, prompts and agents `resources/list` shows, and a config's `delivery` sets the default.
+- `X-MCP-Resources: off` (or `?resources=off`) lists read-only `list_resources` and `read_resource` tools for clients that cannot read resources.
+- `mcp.binary_pointer(fn)` tells `read_resource` where a binary's link is listed.
 
 ### Changed
 
@@ -51,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A skill's JSON, YAML, TOML and script files read as text, and rewriters and the gateway prefix reach them.
 - A plugin is refused when its namespace would sit inside another plugin's skill, or one of its skills would hold another plugin's namespace.
 - `prompts://` and `agents://` belong to the plugins: a server's own resource there, or a second plugin's prompt at one address, is refused.
+- A plugin is refused beside a server's own `list_resources` or `read_resource` tool, and the other way round: the plugin layer serves both.
 
 ## [0.1.2] - 2026-11-23
 

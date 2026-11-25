@@ -49,6 +49,7 @@ from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
+from fastmcp.tools import Tool
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import TextContent
 
@@ -63,6 +64,7 @@ from ._rewrite import (
     run,
     to_mcp_form,
 )
+from ._tools import TOOL_NAMES, _ResourceTools
 from .agents import (
     EXTENSION_ID,
     META_KEY,
@@ -73,6 +75,7 @@ from .agents import (
     served_as,
 )
 from .agents import usable_name as _usable
+from .delivery import BinaryPointer, _resolved
 from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
 
@@ -624,6 +627,12 @@ class _Skills(skills.EntryOnlySkillProvider):
     async def load_skills(self) -> dict[str, skills.Skill]:
         return dict((await self._plugins.pinned()).build.catalogue)
 
+    async def _list_resources(self) -> list[Resource]:
+        # Listed only as the request lists skills (DLV-8, SKL-8); reads are not.
+        if "skills" not in _resolved().listed:
+            return []
+        return await super()._list_resources()
+
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
 
@@ -699,12 +708,38 @@ def _own_reserved(server: FastMCP) -> str | None:
     return None
 
 
+def _own_tool(server: FastMCP) -> str | None:
+    """The name of the server's first own tool that the plugin layer serves itself
+    (DLV-7), or None. Read as ``_own_reserved`` reads the server's resources."""
+    components = getattr(server.local_provider, "_components", None)
+    if components is None:
+        log.warning(
+            "FastMCP's LocalProvider has no _components: the server's own tools are "
+            "not checked against %s (DLV-7)",
+            " and ".join(TOOL_NAMES),
+        )
+        return None
+    for component in components.values():
+        if isinstance(component, Tool) and component.name in TOOL_NAMES:
+            return component.name
+    return None
+
+
+def _serves_itself(name: str) -> str:
+    """Why the server's own ``name`` is refused, as both of DLV-7's messages say it."""
+    return (
+        f"a server with a plugin serves {name} itself, over every resource, the "
+        "plugins' and its own (DLV-6)"
+    )
+
+
 class _Files(Provider):
     """The server's one provider of prompt and agent files (PLUG-66 to PLUG-68): each
     file of the request's build at its address, its folders' children and indexes.
 
-    Nothing is listed (PLUG-67): a file, an index and a folder are read by URI alone.
-    It answers ``prompts://`` and ``agents://`` only.
+    A file is listed only as the request lists its kind (PLUG-67, DLV-8); an index and
+    a folder never are, and all of them read by URI alone. It answers ``prompts://``
+    and ``agents://`` only.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -712,7 +747,13 @@ class _Files(Provider):
         self._plugins = plugins
 
     async def _list_resources(self) -> list[Resource]:
-        return []
+        listed = _resolved().listed
+        build = (await self._plugins.pinned()).build
+        return [
+            material.resource
+            for uri, material in build.files.items()
+            if uri.partition("://")[0] in listed
+        ]
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
@@ -811,6 +852,14 @@ BUILDS = 64
 _Key = tuple[Hashable, ...]
 
 
+class _FileResource(TextResource):
+    """A prompt's or agent's file whose row is its ``_meta`` alone, wherever it is
+    listed: FastMCP's ``get_meta`` would add a ``fastmcp`` key to it (PLUG-68)."""
+
+    def to_mcp_resource(self, **overrides: Any):
+        return super().to_mcp_resource(**{"_meta": self.meta, **overrides})
+
+
 @dataclass(frozen=True)
 class _Material:
     """One prompt or agent file as a build serves it (PLUG-66): ``text`` what it reads
@@ -820,7 +869,7 @@ class _Material:
     served: _Served
     file: _File
     text: str
-    resource: TextResource
+    resource: _FileResource
     row: Mapping[str, Any]
 
 
@@ -844,7 +893,7 @@ def _material(
     else:
         description = item.description
         meta = index_meta(item, text)
-    resource = TextResource(
+    resource = _FileResource(
         uri=file.uri,
         name=item.name,
         description=description,
@@ -852,7 +901,7 @@ def _material(
         text=text,
         meta=meta,
     )
-    row = skills._wire(resource.to_mcp_resource(_meta=resource.meta))
+    row = skills._wire(resource.to_mcp_resource())
     return _Material(served, file, text, resource, row)
 
 
@@ -1566,6 +1615,8 @@ class Plugins:
         self._prompts: _Prompts | None = None
         self._files: _Files | None = None
         self._agents: _Agents | None = None
+        self._tools: _ResourceTools | None = None
+        self._pointer: BinaryPointer | None = None
         self._state = _State(0, ())
         self._view: Callable[[], View] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
@@ -1635,10 +1686,20 @@ class Plugins:
                 "that has one"
             )
 
+    def check_own_tool(self, name: str | None) -> None:
+        """Refuses ``name`` for the server's own tool once it has a plugin, when the
+        plugin layer serves a tool by that name itself (DLV-7)."""
+        if self._tools is not None and name in TOOL_NAMES:
+            raise ValueError(
+                f"{name}: {_serves_itself(name)}, so the server's own is refused "
+                "(DLV-7)"
+            )
+
     def _check_first(self) -> None:
         """Refuses the server's first plugin when the server has its own resource
-        under a reserved scheme (PLUG-72). Once it has a plugin, ``check_own`` keeps
-        it from getting one."""
+        under a reserved scheme (PLUG-72), or its own tool by a name the plugin layer
+        serves (DLV-7). Once it has a plugin, ``check_own`` and ``check_own_tool``
+        keep it from getting one."""
         if self._files is not None:
             return
         uri = _own_reserved(self._server)
@@ -1647,6 +1708,17 @@ class Plugins:
                 f"the server has its own resource at {uri}, and {_RESERVED_TEXT} are "
                 "the plugins'"
             )
+        name = _own_tool(self._server)
+        if name is not None:
+            raise PluginError(
+                f"the server has its own tool {name}, but {_serves_itself(name)}: "
+                f"remove the server's {name} (DLV-7)"
+            )
+
+    def set_binary_pointer(self, fn: BinaryPointer) -> None:
+        """Makes ``fn`` what ``read_resource`` asks where a binary's link is listed
+        (DLV-6), in place of any earlier one."""
+        self._pointer = fn
 
     def set_view(self, fn: Callable[[], View]) -> None:
         """Makes ``fn`` the view, called once per request (PLUG-53)."""
@@ -2109,8 +2181,8 @@ class Plugins:
     def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
         # first plugin the prompts provider, the files provider (PLUG-66), the agents
-        # extension (PLUG-27), which binds resources/directory/read, and NameTheIndex
-        # (PLUG-68).
+        # extension (PLUG-27), which binds resources/directory/read, NameTheIndex
+        # (PLUG-68), and the resource tools (DLV-6).
         if self._skills is None and any(each.catalogue for each in served):
             self._skills = _Skills(self)
             skills.serve(self._server, self._skills)
@@ -2122,6 +2194,9 @@ class Plugins:
         if self._files is None:
             self._files = _Files(self)
             self._server.add_provider(self._files)
+        if self._tools is None:
+            self._tools = _ResourceTools(lambda: self._pointer)
+            self._server.add_provider(self._tools)
         if self._agents is None:
             self._agents = _Agents(self)
             self._server.add_extension(self._agents)

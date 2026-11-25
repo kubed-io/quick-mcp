@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastmcp import Client
 from fastmcp.utilities.tests import asgi_server
@@ -30,9 +31,9 @@ KIT_TREE = {
 }
 
 
-def kit(tmp_path: Path) -> QuickMCP:
+def kit(tmp_path: Path, header_prefix: str | None = None) -> QuickMCP:
     """A server ``t`` serving the plugin ``kit`` under the namespace ``lib``."""
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", header_prefix=header_prefix)
     mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
     return mcp
 
@@ -43,16 +44,24 @@ async def over_http(
     header: str | None = None,
     query: str | None = None,
     mode: str = "auto",
+    headers: dict[str, str] | None = None,
+    params: dict[str, str] | None = None,
 ):
     """An open client over real HTTP, naming a prefix by header and/or query.
+
+    ``headers`` and ``params`` send any others: a header as given, a parameter URL-encoded
+    (``query`` is kept as sent).
 
     ``mode="legacy"`` pins the handshake era, where a connection outlives a request:
     the default era makes every request its own connection.
     """
     async with asgi_server(mcp.server) as running:
-        headers = {} if header is None else {"X-MCP-Resource-Prefix": header}
-        transport = running.transport(headers=headers)
-        if query is not None:
-            transport.url = f"{running.url}?prefix={query}"
+        sent = {} if header is None else {"X-MCP-Resource-Prefix": header}
+        transport = running.transport(headers={**sent, **(headers or {})})
+        pairs = [] if query is None else [f"prefix={query}"]
+        if params:
+            pairs.append(urlencode(params))
+        if pairs:
+            transport.url = f"{running.url}?{'&'.join(pairs)}"
         async with Client(transport, mode=mode) as client:
             yield client

@@ -107,27 +107,27 @@ def warnings(caplog) -> list[logging.LogRecord]:
     return [
         r
         for r in caplog.records
-        if r.name == "kubed.mcp.gateway" and r.levelno == logging.WARNING
+        if r.name == "kubed.mcp.delivery" and r.levelno == logging.WARNING
     ]
 
 
-async def test_an_invalid_prefix_is_none_and_warned_once_per_connection(caplog):
+async def test_an_invalid_prefix_falls_through_warned_once_per_session(caplog):
     mcp = server()
-    with caplog.at_level(logging.WARNING, logger="kubed.mcp.gateway"):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
         async with over_http(mcp, header="kb", mode="legacy") as client:
             assert await seen(client) is None
             assert await seen(client) is None
         assert len(warnings(caplog)) == 1
-        assert "X-MCP-Resource-Prefix" in warnings(caplog)[0].getMessage()
+        assert "header X-MCP-Resource-Prefix" in warnings(caplog)[0].getMessage()
         async with over_http(mcp, header="kb", mode="legacy") as client:
             assert await seen(client) is None
         assert len(warnings(caplog)) == 2
         async with over_http(mcp, header="kb", query="xx+", mode="legacy") as client:
-            assert await seen(client) is None
+            assert await seen(client) == "xx+"
 
 
 async def test_a_long_invalid_prefix_is_logged_cut(caplog):
-    with caplog.at_level(logging.WARNING, logger="kubed.mcp.gateway"):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
         async with over_http(server(), header="x" * 1000) as client:
             assert await seen(client) is None
     (record,) = warnings(caplog)
@@ -148,7 +148,7 @@ def test_a_prefix_is_at_most_64_characters():
 
 
 async def test_a_longer_prefix_is_none_and_warned(caplog):
-    with caplog.at_level(logging.WARNING, logger="kubed.mcp.gateway"):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
         async with over_http(server(), header=LONGEST) as client:
             assert await seen(client) == LONGEST
         assert not warnings(caplog)
