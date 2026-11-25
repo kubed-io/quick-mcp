@@ -256,7 +256,7 @@ async def test_every_file_verifies_against_its_digest(mode):
     async with Client(demo().server, mode=mode) as client:
         entry = (await request(client, "skills/list"))["skills"][0]
         for resource in entry["resources"]:
-            # A blob or text by the host's media types: run.sh is either.
+            # A blob or text by its media type: run.sh is text (PLUG-75).
             data = read_bytes((await client.read_resource(resource["uri"]))[0])
             assert resource["size"] == len(data), resource["uri"]
             digest = f"sha256:{hashlib.sha256(data).hexdigest()}"

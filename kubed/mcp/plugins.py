@@ -54,6 +54,7 @@ from fastmcp.utilities.versions import VersionSpec
 from mcp_types import TextContent
 
 from . import gateway, skills
+from ._media import text_of
 from ._rewrite import (
     Kind,
     RewriteFailed,
@@ -61,7 +62,6 @@ from ._rewrite import (
     Site,
     name_of,
     run,
-    text_of,
     to_mcp_form,
 )
 from .agents import (

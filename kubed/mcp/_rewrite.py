@@ -10,15 +10,11 @@ item it was rewriting (PLUG-59).
 from __future__ import annotations
 
 import functools
-import mimetypes
 import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import unquote
-
-# FastMCP registers text/markdown for .md here: a file is text when it is served so.
-import fastmcp.skills.provider  # noqa: F401
 
 if TYPE_CHECKING:
     from .plugins import Plugin
@@ -48,18 +44,6 @@ class Site:
 
 
 Rewriter = Callable[[Site, str], str]
-
-
-def text_of(path: str, data: bytes) -> str | None:
-    """The text of the file at ``path``, when it is served as ``text/*`` and its bytes
-    are UTF-8 (PLUG-58); else None, and no rewriter sees it."""
-    mime_type = mimetypes.guess_type(path)[0]
-    if mime_type is None or not mime_type.startswith("text/"):
-        return None
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
 
 
 class RewriteFailed(ValueError):
