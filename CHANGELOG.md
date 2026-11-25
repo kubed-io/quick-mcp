@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
 ### Added
 
 - **`kubed-mcp[telemetry]` and `TelemetrySettings`:** set `telemetry.profiles` to push CPU and memory profiles to Pyroscope.
