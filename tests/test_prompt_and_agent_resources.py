@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 
@@ -1128,3 +1129,124 @@ async def test_a_handler_added_by_hand_is_refused_by_fastmcp():
     with pytest.raises(ValueError, match="'resources/directory/read' is already"):
         serve(server, [load_skill(SKILL_DEMO)])
     assert holders(server) == []
+
+
+# PLUG-72: prompts:// and agents:// are the plugins' once the server has one.
+RESERVED_HERE = r"reserved for the plugins in a server that has one"
+
+
+def own_text() -> str:
+    return "own"
+
+
+def own_template(id: str) -> str:
+    return id
+
+
+@pytest.mark.parametrize(
+    "uri", ["prompts://own/x.md", "AGENTS://own/{id}", " prompts://own/x.md"]
+)
+def test_a_server_with_a_plugin_refuses_its_own(uri):
+    mcp = served((DEMO, None))
+    with pytest.raises(ValueError, match=RESERVED_HERE):
+        mcp.resource(uri)
+    # Any other scheme is FastMCP's as ever, and the decorator returns the function.
+    assert mcp.resource("own://x")(own_text) is own_text
+    assert mcp.resource("own://{id}")(own_template) is own_template
+
+
+def test_a_bare_decorator_is_refused_by_fastmcp():
+    # A function passed as the URI is FastMCP's TypeError, plugin or not.
+    mcp = served((DEMO, None))
+    with pytest.raises(TypeError, match="used incorrectly"):
+        mcp.resource(own_text)
+
+
+def test_resource_has_fastmcps_signature_and_documentation():
+    mcp = QuickMCP("t")
+    ours = inspect.signature(mcp.resource).parameters
+    theirs = inspect.signature(mcp.server.resource).parameters
+    assert list(ours.values()) == list(theirs.values())
+    assert inspect.cleandoc(FastMCP.resource.__doc__) in inspect.getdoc(mcp.resource)
+
+
+def test_fastmcp_keeps_the_store_the_check_reads():
+    # _own_reserved reads LocalProvider's private store: a FastMCP that renames it
+    # fails here, not quietly in every server.
+    assert hasattr(QuickMCP("t").server.local_provider, "_components")
+
+
+def test_without_the_store_the_first_plugin_serves_with_a_warning(caplog):
+    mcp = QuickMCP("t")
+    mcp.resource("prompts://own/x.md")(own_text)
+    del mcp.server.local_provider._components
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.plugins"):
+        mcp.add_plugin(DEMO)
+    assert mcp.generation == 1
+    assert "LocalProvider has no _components" in caplog.text
+
+
+def test_later_plugins_are_not_checked_again(tmp_path):
+    # Past the first plugin, mcp.resource refuses; one added around it on the server
+    # does not refuse the next plugin (PLUG-72's last paragraph).
+    mcp = served((DEMO, None))
+    mcp.server.resource("prompts://own/x.md")(own_text)
+    plugin = mcp.add_plugin(prompts_only(tmp_path), namespace="more")
+    assert mcp.plugins[-1] is plugin and mcp.generation == 2
+
+
+def test_a_server_with_no_plugin_takes_the_schemes():
+    mcp = QuickMCP("t")
+    assert mcp.resource("prompts://own/x.md")(own_text) is own_text
+
+
+@pytest.mark.parametrize(
+    ("uri", "fn"),
+    [("agents://own/y.md", own_text), ("Prompts://own/{id}", own_template)],
+)
+def test_its_own_refuses_the_first_plugin(uri, fn):
+    mcp = QuickMCP("t")
+    mcp.resource(uri)(fn)
+    reason = (
+        f"the server has its own resource at {uri}, and prompts:// and agents:// "
+        "are the plugins'"
+    )
+    with pytest.raises(PluginError) as caught:
+        mcp.add_plugin(DEMO)
+    assert str(caught.value) == f"plugin {DEMO} is not served: {reason}"
+    assert mcp.plugins == () and mcp.generation == 0
+    # A refused first plugin adds no provider: the server can still take its own.
+    assert mcp.resource("agents://own/z.md")(own_text) is own_text
+
+
+def test_a_staged_plugin_is_refused_on_add():
+    mcp = QuickMCP("t")
+    mcp.resource("prompts://own/x.md")(own_text)
+    staging = mcp.plugin_set()
+    with pytest.raises(PluginError, match=r"^plugin .* is not served: the server has"):
+        staging.add(DEMO)
+    assert staging.plugins == ()
+
+
+def test_a_staged_set_is_refused_too():
+    mcp = QuickMCP("t")
+    staging = mcp.plugin_set()
+    staging.add(DEMO)
+    mcp.resource("prompts://own/x.md")(own_text)
+    with pytest.raises(PluginError) as caught:
+        mcp.serve(staging)
+    assert str(caught.value) == (
+        "the plugin set is not served: the server has its own resource at "
+        "prompts://own/x.md, and prompts:// and agents:// are the plugins'"
+    )
+    assert mcp.plugins == () and mcp.generation == 0
+    # A refused set adds no provider: the server can still take its own.
+    assert mcp.resource("agents://own/y.md")(own_text) is own_text
+
+
+def test_an_empty_set_is_served_beside_its_own():
+    mcp = QuickMCP("t")
+    mcp.resource("prompts://own/x.md")(own_text)
+    mcp.serve(mcp.plugin_set())
+    assert mcp.generation == 1
+    assert mcp.resource("agents://own/y.md")(own_text) is own_text

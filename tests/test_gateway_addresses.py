@@ -210,24 +210,6 @@ async def test_every_address_in_the_served_text_reads(tmp_path):
                 assert read["contents"], address
 
 
-async def test_prompts_and_agents_addresses_lose_the_prefix(tmp_path):
-    mcp = kit(tmp_path)
-
-    @mcp.resource("prompts://own/x.md")
-    def x() -> str:
-        return "the x prompt"
-
-    @mcp.resource("agents://own/y.md")
-    def y() -> str:
-        return "the y agent"
-
-    async with over_http(mcp, header="kb+") as client:
-        prompt = await request(client, "resources/read", uri="kb+prompts://own/x.md")
-        agent = await request(client, "resources/read", uri="kb+agents://own/y.md")
-    assert prompt["contents"][0]["text"] == "the x prompt"
-    assert agent["contents"][0]["text"] == "the y agent"
-
-
 MISSES = [  # (method, header, sent)
     ("resources/read", "kb+", "xx+skill://lib/guide/SKILL.md"),
     ("resources/read", None, "kb+skill://lib/guide/SKILL.md"),

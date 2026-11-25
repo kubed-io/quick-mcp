@@ -44,7 +44,7 @@ from urllib.parse import quote, unquote, urlparse
 import anyio
 from fastmcp import FastMCP
 from fastmcp.prompts import Message, Prompt, PromptResult
-from fastmcp.resources import Resource, TextResource
+from fastmcp.resources import Resource, ResourceTemplate, TextResource
 from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
@@ -657,7 +657,47 @@ class _Prompts(Provider):
         return []
 
 
-_FILE_SCHEMES = ("prompts://", "agents://")
+# The schemes of the plugins' files, reserved in a server that has a plugin (PLUG-72).
+_RESERVED = ("prompts", "agents")
+_FILE_SCHEMES = tuple(f"{scheme}://" for scheme in _RESERVED)
+# "prompts:// and agents://", as both of PLUG-72's messages name them.
+_RESERVED_TEXT = " and ".join(_FILE_SCHEMES)
+
+
+def _reserved(uri: object) -> bool:
+    """Whether ``uri``, a URI or a URI template, is under a reserved scheme, compared
+    in lowercase and with the whitespace FastMCP drops stripped (PLUG-72). Anything
+    but a string is not: FastMCP refuses it on its own terms."""
+    if not isinstance(uri, str):
+        return False
+    scheme, sep, _ = uri.strip().partition("://")
+    return bool(sep) and scheme.lower() in _RESERVED
+
+
+def _own_reserved(server: FastMCP) -> str | None:
+    """The URI or URI template of the server's first own resource or template under a
+    reserved scheme, or None (PLUG-72). Read synchronously: ``add_plugin`` is sync,
+    and is called inside running event loops."""
+    # FastMCP lists a provider's components only by awaiting, and has no public sync
+    # read. This is the one place quick-mcp touches LocalProvider's private store.
+    components = getattr(server.local_provider, "_components", None)
+    if components is None:
+        log.warning(
+            "FastMCP's LocalProvider has no _components: the server's own resources "
+            "are not checked against %s (PLUG-72)",
+            _RESERVED_TEXT,
+        )
+        return None
+    for component in components.values():
+        if isinstance(component, Resource):
+            uri = str(component.uri)
+        elif isinstance(component, ResourceTemplate):
+            uri = component.uri_template
+        else:
+            continue
+        if _reserved(uri):
+            return uri
+    return None
 
 
 class _Files(Provider):
@@ -1540,9 +1580,36 @@ class Plugins:
         if staging._plugins is not self:
             raise ValueError("this plugin set belongs to another server")
         served = tuple(staging._served)
+        if served:
+            try:
+                self._check_first()
+            except PluginError as exc:
+                raise PluginError(f"the plugin set is not served: {exc}") from None
         self._providers(served)
         self._state = _State(self._state.generation + 1, served)
         self._memo = _Memo(OrderedDict(), {})  # last: no build of the old set is kept
+
+    def check_own(self, uri: object) -> None:
+        """Refuses ``uri`` for the server's own resource once it has a plugin, when it
+        is under a reserved scheme (PLUG-72)."""
+        if self._files is not None and _reserved(uri):
+            raise ValueError(
+                f"{uri}: {_RESERVED_TEXT} are reserved for the plugins in a server "
+                "that has one"
+            )
+
+    def _check_first(self) -> None:
+        """Refuses the server's first plugin when the server has its own resource
+        under a reserved scheme (PLUG-72). Once it has a plugin, ``check_own`` keeps
+        it from getting one."""
+        if self._files is not None:
+            return
+        uri = _own_reserved(self._server)
+        if uri is not None:
+            raise PluginError(
+                f"the server has its own resource at {uri}, and {_RESERVED_TEXT} are "
+                "the plugins'"
+            )
 
     def set_view(self, fn: Callable[[], View]) -> None:
         """Makes ``fn`` the view, called once per request (PLUG-53)."""
@@ -1782,6 +1849,7 @@ class Plugins:
         address = os.fspath(address)
         prefix = _namespace(namespace, self._server.name)
         try:
+            self._check_first()
             loader = self._loader_for(address)
             try:
                 root = loader.materialise(address)
