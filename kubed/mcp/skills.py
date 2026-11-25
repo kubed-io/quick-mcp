@@ -38,6 +38,7 @@ import mcp_types
 from fastmcp import FastMCP
 from fastmcp.exceptions import NotFoundError
 from fastmcp.resources import Resource, TextResource
+from fastmcp.resources.base import ResourceContent, ResourceResult
 from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding, ServerExtension
 from fastmcp.server.middleware import Middleware
@@ -51,6 +52,7 @@ from pydantic import Field, ValidationError
 
 from mcp.shared.exceptions import MCPError
 
+from . import _media
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -267,6 +269,12 @@ async def _index_resource(folders: Folders, uri: str) -> Resource | None:
     children = await folders.children(parent)
     if children is None:
         return None
+    return _index_of(uri, children)
+
+
+def _index_of(uri: str, children: list[dict]) -> TextResource:
+    """The index file at ``uri``, one of ``_INDEXES``, listing ``children``."""
+    parent, _, name = uri.rpartition("/")
     mime_type, render = _INDEXES[name]
     return TextResource(
         uri=uri,
@@ -307,6 +315,49 @@ class _DirectoryRead:
         if end < len(children):
             result["nextCursor"] = str(end)
         return result
+
+
+class _FolderExtension(Folders, Protocol):
+    """An extension that binds ``resources/directory/read`` over its ``children``: the
+    Skills extension and the plugin layer's agents extension."""
+
+    identifier: str
+
+    @property
+    def server(self) -> FastMCP: ...
+
+
+def _answered_elsewhere(extension: _FolderExtension, method: str) -> bool:
+    """Whether another extension identifier on ``extension``'s server bound ``method``.
+
+    FastMCP has no public record of which extension bound a method, so this reads
+    ``FastMCP._extension_methods`` (FastMCP 4.2.5's identifier-to-methods map), here
+    alone. Its own identifier is not another's, so a registration that replaces its own
+    (FastMCP's same-identifier path) binds the method again. A handler added outside an
+    extension is not counted, so FastMCP refuses the binding as it would. An unbound
+    extension answers False.
+    """
+    try:
+        server = extension.server
+    except RuntimeError:
+        return False
+    return any(
+        method in bound
+        for identifier, bound in server._extension_methods.items()
+        if identifier != extension.identifier
+    )
+
+
+def _with_directory_read(
+    extension: _FolderExtension, bindings: Iterable[MethodBinding]
+) -> tuple[MethodBinding, ...]:
+    """``bindings``, and ``resources/directory/read`` over ``extension``'s ``children``
+    unless another extension on its server bound it already: whichever registers first
+    binds it, so it is bound once in every order."""
+    bindings = tuple(bindings)
+    if _answered_elsewhere(extension, DIRECTORY_READ):
+        return bindings
+    return (*bindings, _DirectoryRead(extension).binding())
 
 
 def _offset(cursor: str | None, total: int) -> int:
@@ -360,6 +411,12 @@ class NameTheIndex(Middleware):
             raise FolderNotFound(uri) from None
 
 
+def _name_the_index(server: FastMCP) -> None:
+    """Add ``NameTheIndex`` to ``server`` unless it has one (SKL-4, PLUG-68)."""
+    if not any(isinstance(m, NameTheIndex) for m in server.middleware):
+        server.add_middleware(NameTheIndex())
+
+
 # ---- the provider ------------------------------------------------------------------
 
 
@@ -399,6 +456,17 @@ def _without_unserved(manifest: SkillManifest) -> SkillManifest:
         return manifest
     files = {p: f for p, f in manifest.files.items() if p not in unserved}
     return manifest.model_copy(update={"files": files})
+
+
+class _SkillFile(SkillFileResource):
+    """A skill's file other than its ``SKILL.md``, read as text when it is a text
+    file (PLUG-75) and as a blob of its bytes otherwise."""
+
+    async def read(self) -> ResourceResult:
+        data = await self.provider.read_file(self)
+        text = _media.text_of(self.file_path, data)
+        value: str | bytes = data if text is None else text
+        return ResourceResult([ResourceContent(value, mime_type=self.mime_type)])
 
 
 class EntryOnlySkillProvider(SkillCatalogProvider):
@@ -482,11 +550,16 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
             if resource.file_path.endswith(".md"):
                 title = _heading(await self.read_file(resource))
             name = posixpath.basename(resource.skill_path)
-            # Still a SkillFileResource with the same `file`: FastMCP offers a skill's
-            # entry only while every file resolves to the one its manifest lists.
-            resource = resource.model_copy(
-                update={"description": title or f"File from {name} skill"}
-            )
+            # Still a SkillFileResource with every other field kept, `file` included:
+            # FastMCP offers a skill's entry only while every file resolves to the one
+            # its manifest lists.
+            fields = {
+                field: getattr(resource, field)
+                for field in SkillFileResource.model_fields
+            }
+            fields["description"] = title or f"File from {name} skill"
+            fields["mime_type"] = _media.media_type(resource.file_path)
+            resource = _SkillFile(**fields)
         return resource
 
 
@@ -499,19 +572,20 @@ class SkillsExtension(_extension.SkillsExtension):
     ``skills/list`` and ``skills/get`` are FastMCP's handlers, bound with no
     ``protocol_versions`` so a handshake-era client is answered too. It declares
     ``directoryRead`` and binds ``resources/directory/read`` over every provider on the
-    server that knows its folders.
+    server that knows its folders, unless another extension there binds it already (the
+    plugin layer's agents extension, registered first): either asks every provider.
     """
 
     def settings(self) -> dict:
         return dict(SETTINGS)
 
     def methods(self) -> Sequence[MethodBinding]:
-        return (
-            *(
+        return _with_directory_read(
+            self,
+            (
                 dataclasses.replace(binding, protocol_versions=None)
                 for binding in super().methods()
             ),
-            _DirectoryRead(self).binding(),
         )
 
     def clone(self) -> SkillsExtension:
@@ -520,8 +594,22 @@ class SkillsExtension(_extension.SkillsExtension):
 
     async def children(self, uri: str) -> list[dict] | None:
         """The children of folder ``uri`` from the server's providers, per request."""
-        async with Context(fastmcp=self.server):
-            return await _children(self.server.providers, uri)
+        return await _served_children(self.server, uri)
+
+
+async def _served_children(server: FastMCP, uri: str) -> list[dict] | None:
+    """The children of folder ``uri`` from ``server``'s providers, inside a
+    ``Context``, so a catalogue loaded per request is loaded once for it (SKL-21)."""
+    async with Context(fastmcp=server):
+        return await _children(server.providers, uri)
+
+
+def _advertises(server: FastMCP, identifier: str) -> bool:
+    """Whether ``server`` already declares ``identifier`` in a legacy ``initialize``."""
+    return any(
+        isinstance(m, AdvertiseLegacyExtensions) and identifier in m._declared
+        for m in server.middleware
+    )
 
 
 # ---- composing them ----------------------------------------------------------------
@@ -533,9 +621,10 @@ def serve(
     """Serve a catalogue of skills on ``server``, by the rules above.
 
     Each call adds one provider, ``skills`` itself when it is one; the provider brings
-    ``SkillsExtension``, which FastMCP registers once. The first call on a server also
-    adds the two middlewares a served skill needs: ``AdvertiseLegacyExtensions`` for the
-    extension, and ``NameTheIndex``.
+    ``SkillsExtension``, which FastMCP registers once. A call also adds the two
+    middlewares a served skill needs: ``AdvertiseLegacyExtensions`` for the extension,
+    unless one on the server declares it already, and ``NameTheIndex``, unless the
+    server has one. So a later call adds neither again.
     """
     provider = (
         skills
@@ -543,9 +632,9 @@ def serve(
         else EntryOnlySkillProvider(skills)
     )
     server.add_provider(provider)
-    if not any(isinstance(m, NameTheIndex) for m in server.middleware):
+    if not _advertises(server, SkillsExtension.identifier):
         server.add_middleware(
             AdvertiseLegacyExtensions({SkillsExtension.identifier: dict(SETTINGS)})
         )
-        server.add_middleware(NameTheIndex())
+    _name_the_index(server)
     return provider

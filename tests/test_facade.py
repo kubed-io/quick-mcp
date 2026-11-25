@@ -92,6 +92,7 @@ SOURCES = {
 # Names this package defines rather than re-exports.
 OWN = {
     "kubed.mcp": {
+        "Delivery",
         "Inject",
         "QuickMCP",
         "Serving",

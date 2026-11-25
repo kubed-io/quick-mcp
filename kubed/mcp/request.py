@@ -6,6 +6,7 @@ server reads its own settings out of what it returns.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 
 from fastmcp.server.dependencies import get_context, get_http_headers, get_http_request
@@ -14,6 +15,45 @@ from starlette.requests import Request
 Values = dict[str, list[str]]
 
 __all__ = ["Values", "get_context", "get_http_request", "request_values"]
+
+# What has been warned of, as (session, source, value), least recently warned first. The
+# set is bounded, the oldest forgotten first, so a server that lives for years does not
+# grow it. FastMCP gives a middleware no signal that a session ended, so none is dropped
+# before the bound.
+_WARNED_MAX = 4096
+_warned: OrderedDict[tuple[str | None, str, str], None] = OrderedDict()
+
+
+def _session() -> str | None:
+    """The current request's session id, or None.
+
+    On a live HTTP request it is the ``mcp-session-id`` header, since FastMCP builds a
+    new session object, and so an id, for each one. Off HTTP it is the context's.
+    """
+    try:
+        return get_http_request().headers.get("mcp-session-id")
+    except RuntimeError:  # no live HTTP request
+        pass
+    try:
+        return get_context().session_id
+    except RuntimeError:  # no context, or no session established yet
+        return None
+
+
+def _warn_once(source: str, value: str) -> bool:
+    """True the first time the current session is warned of ``value`` from ``source``.
+
+    With no session the key is server-wide, as on the 2026-07-28 protocol, where every
+    request is its own connection.
+    """
+    key = (_session(), source, value)
+    if key in _warned:
+        _warned.move_to_end(key)
+        return False
+    _warned[key] = None
+    while len(_warned) > _WARNED_MAX:
+        _warned.popitem(last=False)
+    return True
 
 
 def request_values(

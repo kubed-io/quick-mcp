@@ -13,7 +13,6 @@ the server serves.
 from __future__ import annotations
 
 import copy
-import json
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -27,7 +26,7 @@ from pydantic import Field
 
 from mcp.shared.exceptions import MCPError
 
-from .prompts import split_frontmatter
+from .prompts import _survives_json, split_frontmatter
 
 __all__ = ["EXTENSION_ID", "META_KEY", "Agent", "AgentsExtension", "parse_agent"]
 
@@ -71,18 +70,6 @@ def routing_hint(model: object) -> dict | None:
         if word in _HINTS:
             return {"role": _HINTS[word], "vision": False}
     return None
-
-
-def _survives_json(value: object) -> bool:
-    """Whether the value arrives as written after a trip through JSON.
-
-    A YAML-only value fails to encode, and a non-string key (1 beside "1") encodes but
-    comes back renamed or lost.
-    """
-    try:
-        return json.loads(json.dumps(value, allow_nan=False)) == value
-    except (TypeError, ValueError):
-        return False
 
 
 def _strings(value: object) -> list[str]:
@@ -158,6 +145,23 @@ def parse_agent(
     return Agent(name=name, card=card, detail=detail)
 
 
+def served_as(agent: Agent, name: str, meta: Mapping[str, object]) -> Agent:
+    """``agent`` served under ``name``, ``meta``'s keys added to its ``_meta``.
+
+    The card's ``name`` and the definition's ``agent`` are ``name``. The result's dicts
+    are copies, so ``agent``'s are untouched; ``agent`` itself when ``name`` is its own
+    and ``meta`` is empty.
+    """
+    if name == agent.name and not meta:
+        return agent
+    card = copy.deepcopy(agent.card)
+    detail = copy.deepcopy(agent.detail)
+    card["name"] = name
+    detail["agent"] = name
+    detail.setdefault("_meta", {}).update(copy.deepcopy(dict(meta)))
+    return Agent(name=name, card=card, detail=detail)
+
+
 def complete(**fields: object) -> dict:
     """An extension result in the envelope the Skills extension's results share."""
     return {"resultType": "complete", "ttlMs": 0, "cacheScope": "private", **fields}
@@ -172,7 +176,8 @@ class AgentsExtension(ServerExtension):
 
     The list is read on every request, so agents added to it after the extension is
     registered are served too. A subclass serves agents from elsewhere by overriding
-    ``_served()``.
+    ``_served()``, or ``_agents()`` when finding them takes an await, and lists fewer
+    than it serves by overriding ``_listed()``.
     """
 
     identifier = EXTENSION_ID
@@ -199,17 +204,26 @@ class AgentsExtension(ServerExtension):
         """The agents this request is served, read once per call."""
         return self.agents
 
-    def _sorted(self) -> list[Agent]:
-        return sorted(self._served(), key=lambda agent: agent.name)
+    async def _agents(self) -> Sequence[Agent]:
+        """The agents this request is served: ``_served()``, unless overridden."""
+        return self._served()
+
+    async def _listed(self) -> Sequence[Agent]:
+        """The agents ``agents/list`` shows: ``_agents()``, unless overridden.
+
+        ``agents/get`` searches ``_agents()``, so an agent left out here still answers.
+        """
+        return await self._agents()
 
     async def list_agents(self, ctx: Any, params: PaginatedRequestParams) -> dict:
         if params.cursor is not None:
             # One page, so no cursor was ever issued.
             raise MCPError(code=INVALID_PARAMS, message="Invalid agents cursor")
-        return complete(agents=[copy.deepcopy(a.card) for a in self._sorted()])
+        agents = sorted(await self._listed(), key=lambda agent: agent.name)
+        return complete(agents=[copy.deepcopy(a.card) for a in agents])
 
     async def get_agent(self, ctx: Any, params: GetAgentParams) -> dict:
-        for agent in self._served():
+        for agent in await self._agents():
             if agent.name == params.name:
                 return complete(**copy.deepcopy(agent.detail))
         raise MCPError(

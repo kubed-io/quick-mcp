@@ -7,7 +7,6 @@ names and checks it against the digest, so the strongest tests here do that over
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
@@ -24,6 +23,7 @@ from skill_server import (
     MANIFEST_URI,
     demo,
     make_skill,
+    read_bytes,
     request,
     served,
 )
@@ -256,7 +256,7 @@ async def test_every_file_verifies_against_its_digest(mode):
     async with Client(demo().server, mode=mode) as client:
         entry = (await request(client, "skills/list"))["skills"][0]
         for resource in entry["resources"]:
-            # A blob or text by the host's media types: run.sh is either.
+            # A blob or text by its media type: run.sh is text (PLUG-75).
             data = read_bytes((await client.read_resource(resource["uri"]))[0])
             assert resource["size"] == len(data), resource["uri"]
             digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
@@ -316,11 +316,6 @@ async def test_a_dash_run_inside_a_value_is_not_the_header_end(tmp_path):
     async with Client(served(tmp_path, {}, front=front).server) as client:
         entry = (await request(client, "skills/list"))["skills"][0]
     assert entry["frontmatter"]["description"] == "before --- after"
-
-
-def read_bytes(content) -> bytes:
-    text = getattr(content, "text", None)
-    return text.encode() if text is not None else base64.b64decode(content.blob)
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
