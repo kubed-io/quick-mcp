@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Copilot prompt file, `x.prompt.md`, is served as the prompt `x`.
 - Each prompt and agent a plugin serves reads as markdown at `prompts://` and `agents://`, with folder indexes.
 - `QuickMCP(…, header_prefix="Kb")` reads every `X-MCP-*` header as `Kb-*` too, the server's own name winning.
+- `X-MCP-Listed` (or `?listed=`) chooses which of skills, prompts and agents `resources/list` shows, and a config's `delivery` sets the default.
 
 ### Changed
 

@@ -73,6 +73,7 @@ from .agents import (
     served_as,
 )
 from .agents import usable_name as _usable
+from .delivery import _resolved
 from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
 
@@ -624,6 +625,12 @@ class _Skills(skills.EntryOnlySkillProvider):
     async def load_skills(self) -> dict[str, skills.Skill]:
         return dict((await self._plugins.pinned()).build.catalogue)
 
+    async def _list_resources(self) -> list[Resource]:
+        # Listed only as the request lists skills (DLV-8, SKL-8); reads are not.
+        if "skills" not in _resolved().listed:
+            return []
+        return await super()._list_resources()
+
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
 
@@ -703,8 +710,9 @@ class _Files(Provider):
     """The server's one provider of prompt and agent files (PLUG-66 to PLUG-68): each
     file of the request's build at its address, its folders' children and indexes.
 
-    Nothing is listed (PLUG-67): a file, an index and a folder are read by URI alone.
-    It answers ``prompts://`` and ``agents://`` only.
+    A file is listed only as the request lists its kind (PLUG-67, DLV-8); an index and
+    a folder never are, and all of them read by URI alone. It answers ``prompts://``
+    and ``agents://`` only.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -712,7 +720,13 @@ class _Files(Provider):
         self._plugins = plugins
 
     async def _list_resources(self) -> list[Resource]:
-        return []
+        listed = _resolved().listed
+        build = (await self._plugins.pinned()).build
+        return [
+            material.resource
+            for uri, material in build.files.items()
+            if uri.partition("://")[0] in listed
+        ]
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
@@ -811,6 +825,14 @@ BUILDS = 64
 _Key = tuple[Hashable, ...]
 
 
+class _FileResource(TextResource):
+    """A prompt's or agent's file whose row is its ``_meta`` alone, wherever it is
+    listed: FastMCP's ``get_meta`` would add a ``fastmcp`` key to it (PLUG-68)."""
+
+    def to_mcp_resource(self, **overrides: Any):
+        return super().to_mcp_resource(**{"_meta": self.meta, **overrides})
+
+
 @dataclass(frozen=True)
 class _Material:
     """One prompt or agent file as a build serves it (PLUG-66): ``text`` what it reads
@@ -820,7 +842,7 @@ class _Material:
     served: _Served
     file: _File
     text: str
-    resource: TextResource
+    resource: _FileResource
     row: Mapping[str, Any]
 
 
@@ -844,7 +866,7 @@ def _material(
     else:
         description = item.description
         meta = index_meta(item, text)
-    resource = TextResource(
+    resource = _FileResource(
         uri=file.uri,
         name=item.name,
         description=description,
@@ -852,7 +874,7 @@ def _material(
         text=text,
         meta=meta,
     )
-    row = skills._wire(resource.to_mcp_resource(_meta=resource.meta))
+    row = skills._wire(resource.to_mcp_resource())
     return _Material(served, file, text, resource, row)
 
 
