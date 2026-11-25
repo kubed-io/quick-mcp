@@ -293,3 +293,16 @@ async def test_a_nested_request_shares_the_resolution():
         assert len(walks) == len(outer)  # one walk per outer request, none per read
     assert got["tool"] == got["read"]  # a fresh walk would have answered the other kind
     assert got["tool"]["prefix"] == "kb+"
+
+
+def test_via_and_listed_out_of_line_fail_at_startup(monkeypatch):
+    """An explicit check, not an assert, so python -O keeps it (DLV-9)."""
+    from dataclasses import replace
+
+    from kubed.mcp import delivery
+
+    inputs = dict(delivery._INPUTS)
+    inputs["Listed"] = replace(inputs["Listed"], attr=None)
+    monkeypatch.setattr(delivery, "_INPUTS", inputs)
+    with pytest.raises(RuntimeError, match=r"line up by index \(DLV-9\)"):
+        QuickMCP("t")

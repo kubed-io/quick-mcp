@@ -466,9 +466,11 @@ class _Resolver:
                     _known_level(entry),
                 ]
             self.levels[entry.name] = levels
-        assert len(self.levels["Via"]) == len(self.levels["Listed"]), (
-            "Via's and Listed's levels must line up by index (DLV-9)"
-        )
+        # Explicit, not an assert: python -O would strip it (DLV-9).
+        if len(self.levels["Via"]) != len(self.levels["Listed"]):
+            raise RuntimeError(
+                "Via's and Listed's levels must line up by index (DLV-9)"
+            )
 
     def resolve(
         self,
