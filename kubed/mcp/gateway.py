@@ -10,7 +10,6 @@ sends back, before any provider is asked.
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -18,18 +17,12 @@ from typing import Any
 from fastmcp.exceptions import NotFoundError
 from fastmcp.server.middleware import Middleware
 
-from kubed.mcp.request import _first_time, request_values
+from kubed.mcp.delivery import _INPUTS, _PREFIX, _resolved
 from kubed.mcp.skills import FolderNotFound
 from mcp.shared.exceptions import MCPError
 
-log = logging.getLogger(__name__)
-
-HEADER = "x-mcp-resource-prefix"
-QUERY = "prefix"
 SCHEMES = ("skill", "prompts", "agents")
 
-# A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
-_VALID = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
 # The start of an address of a served scheme, not the tail of a longer word or scheme.
 _ADDRESS = re.compile(r"(?<![A-Za-z0-9+.-])(?=(?:skill|prompts|agents)://)")
 
@@ -42,41 +35,16 @@ def prefixed(text: str, prefix: str | None) -> str:
     """
     if prefix is None:
         return text
-    if not _VALID.fullmatch(prefix):
+    if not _PREFIX.fullmatch(prefix):
         raise ValueError(
-            f"{prefix[:64]!r} is not a valid prefix: a prefix is a letter, then "
-            "letters, digits, +, - or ., ending in +, at most 64 characters"
+            f"{prefix[:64]!r} is not a valid prefix: {_INPUTS['Resource-Prefix'].rule}"
         )
     return _ADDRESS.sub(lambda _: prefix, text)
 
 
 def prefix() -> str | None:
-    """The current request's prefix, or None.
-
-    The header wins over the query parameter; an empty one is no answer. A prefix that
-    is not valid is None, with one warning per connection.
-    """
-    found = request_values()
-    if found is None:
-        return None
-    params, headers = found
-    value = ""
-    if headers.get(HEADER):
-        value = headers[HEADER][0].strip()
-    if not value and params.get(QUERY):
-        value = params[QUERY][0].replace(" ", "+")
-    if not value:
-        return None
-    if _VALID.fullmatch(value):
-        return value
-    if _first_time("prefix"):
-        log.warning(
-            "X-MCP-Resource-Prefix %r is not a valid prefix, so this connection is "
-            "served none: a prefix is a letter, then letters, digits, +, - or ., "
-            "ending in +, at most 64 characters",
-            value[:64],
-        )
-    return None
+    """The current request's prefix, or None: the resolved one (DLV-3)."""
+    return _resolved().prefix
 
 
 # ---- incoming addresses (GW-4) -----------------------------------------------------

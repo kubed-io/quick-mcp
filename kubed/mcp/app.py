@@ -27,6 +27,7 @@ from .container import (
     Recipe,
     _Call,
 )
+from .delivery import _RESOLVERS, _Resolver, _ResolveScope
 from .gateway import _TakeThePrefix
 from .plugins import (
     AgentMeta,
@@ -153,11 +154,16 @@ class QuickMCP:
         # QuickMCP.get_tool.
         self.get_tool = self.server.get_tool
         self._plugins = Plugins(self.server)
-        # Right inside _CallScope, outside everything that reads plugins.
-        self.server.middleware.insert(1, _PinScope(self._plugins))
+        # The inputs resolve once per request, inside _CallScope and outside the pin, so
+        # the build key's prefix is the one this request resolved.
+        self._resolver = _Resolver(None, getattr(config, "delivery", None))
+        _RESOLVERS[self.server] = self._resolver
+        self.server.middleware.insert(1, _ResolveScope(self._resolver))
+        # Inside the resolution, outside everything that reads plugins.
+        self.server.middleware.insert(2, _PinScope(self._plugins))
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
-        self.server.middleware.insert(2, _TakeThePrefix())
+        self.server.middleware.insert(3, _TakeThePrefix())
 
     @_signed_as(FastMCP.resource)
     def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
