@@ -27,12 +27,13 @@ namespace merge, and a second thing at one address is refused.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -43,8 +44,9 @@ from urllib.parse import quote, unquote, urlparse
 import anyio
 from fastmcp import FastMCP
 from fastmcp.prompts import Message, Prompt, PromptResult
-from fastmcp.resources import Resource, TextResource
+from fastmcp.resources import Resource, ResourceTemplate, TextResource
 from fastmcp.server.context import Context
+from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.skills.provider import SkillCatalogProvider
@@ -68,12 +70,11 @@ from .agents import (
     SETTINGS,
     Agent,
     AgentsExtension,
-    _survives_json,
     parse_agent,
     served_as,
 )
 from .agents import usable_name as _usable
-from .prompts import read_command
+from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -445,21 +446,26 @@ def _skill_folders(
 
 def _md_files(
     base: Path, kind: str, entries: Iterable[str], notes: list[str]
-) -> list[tuple[Path, tuple[str, ...]]]:
-    """The ``.md`` files each entry names, each with its folders' name segments.
+) -> list[tuple[Path, tuple[str, ...], tuple[str, ...]]]:
+    """The ``.md`` files each entry names, each with its folders' name segments and
+    its place, the segments of its address below the namespace (PLUG-66).
 
-    A listed file is itself, with no segment. A folder is read at any depth, in path
-    order, each folder between it and the file a segment; a dot folder is not read,
-    and a file that resolves outside the root is not either.
+    A listed file is itself, with no segment, placed at its path below ``kind``'s
+    folder when the entry starts with it, else at its path below the root: the entry
+    decides, never the resolved path. A folder is read at any depth, in path order,
+    each folder between it and the file a segment, and each file placed at its path
+    below the folder; a dot folder is not read, and a file that resolves outside the
+    root is not either.
     """
-    found: list[tuple[Path, tuple[str, ...]]] = []
+    found: list[tuple[Path, tuple[str, ...], tuple[str, ...]]] = []
     for entry in entries:
         path = base / entry
         if entry.endswith(".md"):
             if _readable(base, entry) is None:
                 notes.append(f"{kind} entry '{entry}' is not in the plugin")
             else:
-                found.append((path, ()))
+                parts = PurePosixPath(entry).parts
+                found.append((path, (), parts[1:] if parts[0] == kind else parts))
             continue
         if _inside(path, base) is None or not path.is_dir():
             notes.append(f"{kind} entry '{entry}' is not a folder in the plugin")
@@ -483,7 +489,8 @@ def _md_files(
                 and _readable(base, (here / name).relative_to(base))
             )
         for file in sorted(files, key=lambda f: f.relative_to(path).parts):
-            found.append((file, file.relative_to(path).parent.parts))
+            place = file.relative_to(path).parts
+            found.append((file, place[:-1], place))
     return found
 
 
@@ -511,11 +518,13 @@ class _File:
     """One command or agent file, as read: kept so a build can re-parse it from
     memory.
 
-    ``path`` is root-relative, ``uri`` the ``prompts://`` or ``agents://`` address a
-    rewriter is shown, ``data`` the raw bytes and ``text`` them as ``read_text``
-    gives them. ``stem`` and ``folders`` are what ``parse_agent`` names it by, and
-    ``read_name`` an agent's name as parsed, which its set may serve otherwise
-    (PLUG-64); ``meta`` the keys its set adds to an agent's ``_meta`` (PLUG-73).
+    ``path`` is root-relative, ``uri`` the ``prompts://`` or ``agents://`` address
+    (PLUG-66) a rewriter is shown, ``data`` the raw bytes and ``text`` them as
+    ``read_text`` gives them. ``stem`` and ``folders`` are what ``parse_agent`` names
+    it by, and ``place`` the address's segments below the namespace: ``uri`` is
+    always ``_file_uri`` of them. ``read_name`` is an agent's name as parsed, which
+    its set may serve otherwise (PLUG-64), its address then following its served name;
+    ``meta`` the keys its set adds to an agent's ``_meta`` (PLUG-73).
     """
 
     path: str
@@ -525,6 +534,7 @@ class _File:
     item: Prompt | Agent
     stem: str
     folders: tuple[str, ...]
+    place: tuple[str, ...]
     read_name: str = ""
     meta: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
 
@@ -534,10 +544,19 @@ def _decoded(data: bytes) -> str:
     return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _file_uri(scheme: str, namespace: str, folders: Iterable[str], name: str) -> str:
-    """The address of a command or agent file: its path below its folder, under the
-    namespace."""
-    return f"{scheme}://{quote('/'.join((namespace, *folders, name)), safe='/')}"
+def _file_uri(scheme: str, namespace: str, place: Iterable[str]) -> str:
+    """The address of a command or agent file (PLUG-66): its ``place`` under the
+    namespace, quoted as a skill's URI is with ``@`` kept too, so a renamed agent is
+    ``<name>@<plugin>.md`` as a client copies it."""
+    return f"{scheme}://{quote('/'.join((namespace, *place)), safe='/@')}"
+
+
+def _at_index(place: Iterable[str], uri: str) -> str | None:
+    """Why a file at ``place`` is not served, when its address has a folder index's
+    name as a segment, its own name included (PLUG-66, SKL-11); else None."""
+    if any(skills._is_index(segment) for segment in place):
+        return f"its address {uri} is its folder's index"
+    return None
 
 
 def _joined(*parts: str) -> str:
@@ -638,12 +657,111 @@ class _Prompts(Provider):
         return []
 
 
-class _Agents(AgentsExtension):
-    """The server's one agents extension: the agents of the request's build."""
+# The schemes of the plugins' files, reserved in a server that has a plugin (PLUG-72).
+_RESERVED = ("prompts", "agents")
+_FILE_SCHEMES = tuple(f"{scheme}://" for scheme in _RESERVED)
+# "prompts:// and agents://", as both of PLUG-72's messages name them.
+_RESERVED_TEXT = " and ".join(_FILE_SCHEMES)
+
+
+def _reserved(uri: object) -> bool:
+    """Whether ``uri``, a URI or a URI template, is under a reserved scheme, compared
+    in lowercase and with the whitespace FastMCP drops stripped (PLUG-72). Anything
+    but a string is not: FastMCP refuses it on its own terms."""
+    if not isinstance(uri, str):
+        return False
+    scheme, sep, _ = uri.strip().partition("://")
+    return bool(sep) and scheme.lower() in _RESERVED
+
+
+def _own_reserved(server: FastMCP) -> str | None:
+    """The URI or URI template of the server's first own resource or template under a
+    reserved scheme, or None (PLUG-72). Read synchronously: ``add_plugin`` is sync,
+    and is called inside running event loops."""
+    # FastMCP lists a provider's components only by awaiting, and has no public sync
+    # read. This is the one place quick-mcp touches LocalProvider's private store.
+    components = getattr(server.local_provider, "_components", None)
+    if components is None:
+        log.warning(
+            "FastMCP's LocalProvider has no _components: the server's own resources "
+            "are not checked against %s (PLUG-72)",
+            _RESERVED_TEXT,
+        )
+        return None
+    for component in components.values():
+        if isinstance(component, Resource):
+            uri = str(component.uri)
+        elif isinstance(component, ResourceTemplate):
+            uri = component.uri_template
+        else:
+            continue
+        if _reserved(uri):
+            return uri
+    return None
+
+
+class _Files(Provider):
+    """The server's one provider of prompt and agent files (PLUG-66 to PLUG-68): each
+    file of the request's build at its address, its folders' children and indexes.
+
+    Nothing is listed (PLUG-67): a file, an index and a folder are read by URI alone.
+    It answers ``prompts://`` and ``agents://`` only.
+    """
 
     def __init__(self, plugins: Plugins) -> None:
         super().__init__()
         self._plugins = plugins
+
+    async def _list_resources(self) -> list[Resource]:
+        return []
+
+    async def get_tasks(self) -> list:
+        return []  # see _Prompts.get_tasks
+
+    async def _get_resource(
+        self, uri: str, version: VersionSpec | None = None
+    ) -> Resource | None:
+        if not uri.startswith(_FILE_SCHEMES):
+            return None
+        build = (await self._plugins.pinned()).build
+        material = build.files.get(uri)
+        if material is not None:
+            return material.resource
+        if not skills._is_index(uri):
+            return None
+        # A rewritten build holds its indexes, as _Skills reads a skill folder's.
+        if build.rewritten:
+            return build.indexes.get(uri)
+        children = build.folders.get(uri.rpartition("/")[0])
+        return None if children is None else skills._index_of(uri, list(children))
+
+    async def children(self, uri: str) -> list[dict] | None:
+        """The children of folder ``uri`` (``skills.Folders``), or None."""
+        if not uri.startswith(_FILE_SCHEMES):
+            return None
+        children = (await self._plugins.pinned()).build.folders.get(uri)
+        return None if children is None else copy.deepcopy(list(children))
+
+
+class _Agents(AgentsExtension):
+    """The server's one agents extension: the agents of the request's build.
+
+    It also binds ``resources/directory/read`` over every provider on the server
+    (``skills.Folders``), so the folders answer from the first plugin, whatever its
+    plugins serve (PLUG-68), unless a Skills extension registered before it binds it
+    already. It declares nothing more than the agents extension does.
+    """
+
+    def __init__(self, plugins: Plugins) -> None:
+        super().__init__()
+        self._plugins = plugins
+
+    def methods(self) -> Sequence[MethodBinding]:
+        return skills._with_directory_read(self, super().methods())
+
+    async def children(self, uri: str) -> list[dict] | None:
+        """The children of folder ``uri`` from the server's providers, per request."""
+        return await skills._served_children(self.server, uri)
 
     async def _agents(self) -> tuple[Agent, ...]:
         return (await self._plugins.pinned()).build.agents
@@ -695,8 +813,117 @@ _Key = tuple[Hashable, ...]
 
 
 @dataclass(frozen=True)
+class _Material:
+    """One prompt or agent file as a build serves it (PLUG-66): ``text`` what it reads
+    as, ``resource`` what a read of its address gives, and ``row`` that resource's
+    wire form, its row in its folder (PLUG-68)."""
+
+    served: _Served
+    file: _File
+    text: str
+    resource: TextResource
+    row: Mapping[str, Any]
+
+
+def _material(
+    served: _Served, file: _File, item: Prompt | Agent, text: str
+) -> _Material:
+    """``file`` as a build serves it, ``item`` its prompt or agent as built and
+    ``text`` what it reads as: the one place its resource, and so its row, is made.
+
+    The resource's ``_meta`` is what registers it (PLUG-69, PLUG-70): a prompt's
+    ``io.kubed/prompt``, or everything ``agents/get`` gives as an agent's ``_meta``,
+    its served name added to ``io.kubed/agent``. The row is that alone:
+    ``to_mcp_resource(_meta=...)`` leaves out the ``fastmcp`` key FastMCP's
+    ``get_meta`` always adds, and the tests that compare a row's whole ``_meta`` guard
+    that override.
+    """
+    if isinstance(item, Agent):
+        description = _text(item.card.get("description"))
+        meta = copy.deepcopy(item.detail["_meta"])
+        meta[META_KEY] = {"name": item.name, **meta[META_KEY]}
+    else:
+        description = item.description
+        meta = index_meta(item, text)
+    resource = TextResource(
+        uri=file.uri,
+        name=item.name,
+        description=description,
+        mime_type="text/markdown",
+        text=text,
+        meta=meta,
+    )
+    row = skills._wire(resource.to_mcp_resource(_meta=resource.meta))
+    return _Material(served, file, text, resource, row)
+
+
+def _as_served(file: _File, text: str | None) -> str:
+    """What ``file`` reads as: the bytes read unless a build changed its text (None)."""
+    return file.data.decode("utf-8") if text is None else text
+
+
+def _folders_in(material: _Material) -> tuple[str, str, list[tuple[str, int]]]:
+    """The scheme and namespace of ``material``'s file, and each folder it sits in as
+    its URI and its depth below the namespace, the namespace's own first (PLUG-68)."""
+    file = material.file
+    scheme = file.uri.partition("://")[0]
+    namespace = material.served.plugin.namespace
+    folders = [
+        (_file_uri(scheme, namespace, file.place[:depth]), depth)
+        for depth in range(len(file.place))
+    ]
+    return scheme, namespace, folders
+
+
+def _read_place(material: _Material) -> tuple[str, ...]:
+    """The place ``material``'s file was read at: its own, unless it is an agent its
+    set renamed (PLUG-64), whose address is its served name's."""
+    file = material.file
+    if not isinstance(file.item, Agent) or file.item.name == file.read_name:
+        return file.place
+    read = next(f for f in material.served.read_agents if f.path == file.path)
+    return read.place
+
+
+def _folder_rows(materials: Iterable[_Material]) -> dict[str, tuple[dict, ...]]:
+    """Each folder of ``materials``, as its children's rows sorted by URI (PLUG-68).
+
+    A folder is every one a file sits in, from its namespace down. A namespace's
+    folder is also a row in the folder above it, when that is a folder, named by the
+    namespace alone. A folder two plugins share takes its row from the first.
+    """
+    rows: dict[str, dict] = {}  # each folder's own row, the first plugin's
+    children: dict[str, dict[str, dict]] = {}  # folder -> child URI -> row
+    for material in materials:
+        file = material.file
+        scheme, namespace, folders = _folders_in(material)
+        for uri, depth in folders:
+            if uri in rows:
+                continue
+            children[uri] = {}
+            name = _joined(namespace, *file.place[:depth])
+            about = f"A folder of {scheme} in {namespace}"
+            rows[uri] = skills._folder(uri, name, about)
+        parent = file.uri.rpartition("/")[0]
+        children[parent].setdefault(file.uri, dict(material.row))
+    for uri, row in rows.items():
+        parent = uri.rpartition("/")[0]
+        if parent in children:
+            # A file and a folder at one URI keep the file's row, pending a spec ruling.
+            children[parent].setdefault(uri, row)
+    return {
+        uri: tuple(sorted(found.values(), key=lambda row: row["uri"]))
+        for uri, found in children.items()
+    }
+
+
+@dataclass(frozen=True)
 class _Build:
-    """What one build key is served: the admitted plugins and what they serve."""
+    """What one build key is served: the admitted plugins and what they serve.
+
+    ``files`` is each prompt and agent file served, by its address, and ``folders``
+    each of their folders' children (PLUG-66, PLUG-68), rewritten or not.
+    """
 
     admitted: tuple[Plugin, ...]
     catalogue: Mapping[str, skills.Skill]
@@ -705,6 +932,10 @@ class _Build:
     rewritten: bool  # the rewriter chain was not empty
     indexes: Mapping[str, TextResource | None]
     _renderers: tuple[object, ...] = ()  # kept alive with the build they rendered
+    files: Mapping[str, _Material] = field(default_factory=lambda: MappingProxyType({}))
+    folders: Mapping[str, tuple[dict, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -784,12 +1015,15 @@ class _Memo:
 
 
 def _owned(served: _Served) -> dict[str, str]:
-    """What ``served`` serves, as the owners map names it: what -> its plugin."""
+    """What ``served`` serves, as the owners map names it: what -> its plugin. A
+    file's address is keyed by its URI, as a skill's is (PLUG-66)."""
     name = served.plugin.name
     return {
         **dict.fromkeys(served.plugin.skills, name),
         **{f"prompt:{prompt}": name for prompt in served.plugin.prompts},
+        **{file.uri: name for file in served.prompts},
         **{f"agent:{agent}": name for agent in served.plugin.agents},
+        **{file.uri: name for file in served.agents},
     }
 
 
@@ -801,7 +1035,10 @@ def _enter(
     Built from the plugin and agents as read, never as an earlier set served them, so
     each entry is decided afresh, in two passes. Names first: an agent keeps its read
     name when the set has none of it, else is served as ``<name>@<plugin>``, else is
-    skipped, taken or not usable; that gives the plugin as it enters. Then ``meta``,
+    skipped, taken or not usable. Its address follows the name decided, its file's for
+    its read name and ``<name>@<plugin>.md`` for a rename, and an agent whose address
+    the set or an agent entered before it serves is skipped too, claiming no name
+    (PLUG-66); that gives the plugin as it enters. Then ``meta``,
     once per agent named, with that name and that plugin (PLUG-73): its keys are added
     to the agent's ``_meta``, and a raise skips the agent, so it claims no name.
 
@@ -816,26 +1053,46 @@ def _enter(
     last = served.plugin
     named: list[tuple[_File, AgentFile]] = []
     clashes: dict[str, str] = {}  # a renamed agent's path -> the plain name's owner
+    addresses: dict[str, str] = {}  # an entered agent's URI -> its file's path
     skipped = list(read.skipped)
     changed = False
     for file in served.read_agents:
         name = file.item.name
         owner = owners.get(f"agent:{name}")
-        if owner is None:
-            named.append((file, AgentFile(name, file.path)))
-            continue
-        changed = True
-        renamed = f"{name}@{read.name}"
-        held = owners.get(f"agent:{renamed}")
-        if not _usable(read.name):
-            reason = f"agent name {renamed!r} is not a usable name"
-        elif held is not None:
-            reason = f"agent {renamed} is already served by plugin {held}"
-        else:
+        entry = AgentFile(name, file.path)
+        if owner is not None:
+            changed = True
+            renamed = f"{name}@{read.name}"
+            held = owners.get(f"agent:{renamed}")
+            if not _usable(read.name):
+                reason = f"agent name {renamed!r} is not a usable name"
+                _skip_agent(read, last, skipped, file.path, reason)
+                continue
+            if held is not None:
+                reason = f"agent {renamed} is already served by plugin {held}"
+                _skip_agent(read, last, skipped, file.path, reason)
+                continue
             clashes[file.path] = owner
-            named.append((file, AgentFile(renamed, file.path, renamed=True)))
+            entry = AgentFile(renamed, file.path, renamed=True)
+            place = (f"{renamed}.md",)
+            uri = _file_uri("agents", read.namespace, place)
+            file = replace(file, uri=uri, place=place)
+        # Its address, as its name gives it: another plugin's, or a file of this one
+        # entered before it, named as a clash within one plugin is (PLUG-18, PLUG-66).
+        holder = owners.get(file.uri)
+        if holder is not None:
+            changed = True
+            reason = f"{file.uri} is already served by plugin {holder}"
+            _skip_agent(read, last, skipped, file.path, reason)
             continue
-        _skip_agent(read, last, skipped, file.path, reason)
+        first = addresses.get(file.uri)
+        if first is not None:
+            changed = True
+            reason = f"{file.uri} is already served by {first}"
+            _skip_agent(read, last, skipped, file.path, reason)
+            continue
+        addresses[file.uri] = file.path
+        named.append((file, entry))
 
     entering = read
     if changed:
@@ -877,6 +1134,7 @@ def _enter(
                 entry.name,
             )
         if entry.renamed or keys:
+            # A renamed file's uri and place were set with its name, above.
             file = replace(file, item=served_as(file.item, entry.name, keys), meta=keys)
         agents.append(file)
         files.append(entry)
@@ -1077,9 +1335,10 @@ class _Rewrite:
             return None
         return built
 
-    def prompt(self, served: _Served, file: _File) -> Prompt | None:
-        """A command, rewritten: the one read when its text is unchanged, else read
-        again under its name by the reader it was read with (PLUG-62)."""
+    def prompt(self, served: _Served, file: _File) -> tuple[Prompt, str | None] | None:
+        """A command, rewritten, and its text when that changed (else None): the one
+        read when its text is unchanged, else read again under its name by the reader
+        it was read with (PLUG-62)."""
         item = file.item
         what = f"prompt {item.name}"
         site = self._site(served, "command", file.path, file.uri)
@@ -1087,17 +1346,18 @@ class _Rewrite:
         if new is None:
             return None
         if new == file.text:
-            return item
+            return item, None
         prompt = _read_command(served.reader, new, file.path, item.name, served.plugin)
         if isinstance(prompt, str):
             self._failed(served, None, file.path, what, prompt)
             return None
-        return prompt
+        return prompt, new
 
-    def agent(self, served: _Served, file: _File) -> Agent | None:
-        """An agent, rewritten: the one served when its text is unchanged, else
-        re-parsed and served under the name its set gave it (PLUG-64), failed when it
-        no longer parses or is named otherwise than it was read."""
+    def agent(self, served: _Served, file: _File) -> tuple[Agent, str | None] | None:
+        """An agent, rewritten, and its text when that changed (else None): the one
+        served when its text is unchanged, else re-parsed and served under the name
+        its set gave it (PLUG-64), failed when it no longer parses or is named
+        otherwise than it was read."""
         item = file.item
         what = f"agent {item.name}"
         site = self._site(served, "agent", file.path, file.uri)
@@ -1105,7 +1365,7 @@ class _Rewrite:
         if new is None:
             return None
         if new == file.text:
-            return item
+            return item, None
         agent = parse_agent(
             new, served.by_name, served.prefix, stem=file.stem, folders=file.folders
         )
@@ -1116,7 +1376,43 @@ class _Rewrite:
             reason = f"its name is now {agent.name!r}, not {file.read_name!r}"
             self._failed(served, None, file.path, what, reason)
             return None
-        return served_as(agent, item.name, file.meta)
+        return served_as(agent, item.name, file.meta), new
+
+    def file_indexes(
+        self,
+        folders: Mapping[str, tuple[dict, ...]],
+        files: Mapping[str, _Material],
+    ) -> dict[str, TextResource | None]:
+        """Each prompt and agent folder's ``_index.md`` and ``_index.json``, rendered
+        from ``folders`` and rewritten; None for one that failed (PLUG-68).
+
+        Its site is the first plugin of ``files`` with a file in the folder, at the
+        folder's path in it: the file's folder, less one segment for each folder
+        between the index's and the file where it was read. A renamed agent's address
+        is its name's, at the namespace's top (PLUG-66), but its file stays where it
+        was read, so the segments are counted from its place as read.
+        """
+        first: dict[str, tuple[_Material, int]] = {}
+        for material in files.values():
+            for uri, depth in _folders_in(material)[2]:
+                first.setdefault(uri, (material, depth))
+        found: dict[str, TextResource | None] = {}
+        for folder, children in folders.items():
+            material, depth = first[folder]
+            parts = PurePosixPath(material.file.path).parent.parts
+            # The place as read ends in a suffix of the file's folder, and depth is
+            # below its length, so this drops what is there and never more.
+            below = len(_read_place(material)) - 1 - depth
+            path = _joined(*parts[: len(parts) - below])
+            for name in (skills.INDEX_MD, skills.INDEX_JSON):
+                uri = f"{folder}/{name}"
+                resource = skills._index_of(uri, list(children))
+                site = self._site(material.served, "index", path, uri)
+                new = self._run(material.served, site, resource.text, uri)
+                found[uri] = (
+                    None if new is None else resource.model_copy(update={"text": new})
+                )
+        return found
 
     async def indexes(
         self, served: _Served, key: str, renderer: _Renderer
@@ -1148,9 +1444,10 @@ class PluginSet:
     ``add`` reads and checks a plugin as ``add_plugin`` does and ``keep`` carries one
     the server serves now, unread. A clash is checked against the plugins in this set
     alone, so a set that leaves a plugin out may add another that serves the same
-    thing. A skill URI or a prompt name served already refuses the plugin; an agent
-    name is renamed or skipped instead, decided as the plugin enters the set
-    (PLUG-64), so each returns the plugin as it entered. A refused plugin raises and
+    thing. A skill URI, a prompt name or a prompt's address served already refuses
+    the plugin; an agent name is renamed or skipped instead, and an agent whose
+    address is served skipped, decided as the plugin enters the set (PLUG-64,
+    PLUG-66), so each returns the plugin as it entered. A refused plugin raises and
     leaves the set unchanged. Nothing here is served until ``mcp.serve(set)``; the
     set is then a snapshot, and adding to it afterwards changes nothing served.
     """
@@ -1197,14 +1494,14 @@ class PluginSet:
 
     def _carry(self, served: _Served) -> _Served:
         """Adds ``served`` to the set as it enters it, and returns that: refused whole
-        when a skill or a prompt of it is owned already, its agents named by the set
-        (PLUG-64)."""
+        when a skill, a prompt or a prompt's address of it is owned already, its
+        agents named and addressed by the set (PLUG-64, PLUG-66)."""
         for key in _owned(served):
-            if key.startswith("agent:"):
+            if key.startswith(("agent:", "agents://")):
                 continue
             owner = self._owners.get(key)
             if owner is not None:
-                what = key if key.startswith("skill://") else key.replace(":", " ", 1)
+                what = key if "://" in key else key.replace(":", " ", 1)
                 raise PluginError(f"{what} is already served by plugin {owner}")
         entered = _enter(served, self._owners, self._plugins._agent_meta)
         self._owners.update(_owned(entered))
@@ -1230,6 +1527,7 @@ class Plugins:
         self._replaceable: set[str] = {"file"}
         self._skills: _Skills | None = None
         self._prompts: _Prompts | None = None
+        self._files: _Files | None = None
         self._agents: _Agents | None = None
         self._state = _State(0, ())
         self._view: Callable[[], View] | None = None
@@ -1282,9 +1580,36 @@ class Plugins:
         if staging._plugins is not self:
             raise ValueError("this plugin set belongs to another server")
         served = tuple(staging._served)
+        if served:
+            try:
+                self._check_first()
+            except PluginError as exc:
+                raise PluginError(f"the plugin set is not served: {exc}") from None
         self._providers(served)
         self._state = _State(self._state.generation + 1, served)
         self._memo = _Memo(OrderedDict(), {})  # last: no build of the old set is kept
+
+    def check_own(self, uri: object) -> None:
+        """Refuses ``uri`` for the server's own resource once it has a plugin, when it
+        is under a reserved scheme (PLUG-72)."""
+        if self._files is not None and _reserved(uri):
+            raise ValueError(
+                f"{uri}: {_RESERVED_TEXT} are reserved for the plugins in a server "
+                "that has one"
+            )
+
+    def _check_first(self) -> None:
+        """Refuses the server's first plugin when the server has its own resource
+        under a reserved scheme (PLUG-72). Once it has a plugin, ``check_own`` keeps
+        it from getting one."""
+        if self._files is not None:
+            return
+        uri = _own_reserved(self._server)
+        if uri is not None:
+            raise PluginError(
+                f"the server has its own resource at {uri}, and {_RESERVED_TEXT} are "
+                "the plugins'"
+            )
 
     def set_view(self, fn: Callable[[], View]) -> None:
         """Makes ``fn`` the view, called once per request (PLUG-53)."""
@@ -1416,12 +1741,18 @@ class Plugins:
     async def _make(self, state: _State, view: View, key: _Key) -> _Build:
         """A build of what ``view`` admits of ``state``, from what was read: it never
         reads the disk. With no rewriter it serves the objects read; with any, the
-        rewritten text, and each skill folder's indexes, rendered now."""
+        rewritten text, and each folder's indexes, rendered now. Either way it holds
+        each prompt and agent file and their folders (PLUG-66, PLUG-68)."""
         chain = self._chain(key)
         prefix = self._prefix_of(key)
         admitted = tuple(s for s in state.current if view.admits(s.plugin))
         plugins = tuple(s.plugin for s in admitted)
         if not chain:
+            read = [
+                _material(s, f, f.item, _as_served(f, None))
+                for s in admitted
+                for f in (*s.prompts, *s.agents)
+            ]
             return _Build(
                 admitted=plugins,
                 catalogue=MappingProxyType(
@@ -1431,29 +1762,42 @@ class Plugins:
                 agents=tuple(f.item for s in admitted for f in s.agents),
                 rewritten=False,
                 indexes=MappingProxyType({}),
+                files=MappingProxyType({m.file.uri: m for m in read}),
+                folders=MappingProxyType(_folder_rows(read)),
             )
         rewrite = _Rewrite(chain, view.key, plugins)
         catalogue: dict[str, skills.Skill] = {}
         prompts: list[Prompt] = []
         agents: list[Agent] = []
+        materials: list[_Material] = []
         for served in admitted:
             for k, skill in served.catalogue.items():
                 if (built := rewrite.skill(served, k, skill)) is not None:
                     catalogue[k] = built
             for file in served.prompts:
-                if (prompt := rewrite.prompt(served, file)) is not None:
-                    prompts.append(
-                        prompt
-                        if prefix is None
-                        else _Prefixed(
-                            **{f: getattr(prompt, f) for f in Prompt.model_fields},
-                            inner=prompt,
-                            prefix=prefix,
-                        )
+                if (rewritten := rewrite.prompt(served, file)) is None:
+                    continue
+                prompt, text = rewritten
+                prompts.append(
+                    prompt
+                    if prefix is None
+                    else _Prefixed(
+                        **{f: getattr(prompt, f) for f in Prompt.model_fields},
+                        inner=prompt,
+                        prefix=prefix,
                     )
+                )
+                materials.append(
+                    _material(served, file, prompt, _as_served(file, text))
+                )
             for file in served.agents:
-                if (agent := rewrite.agent(served, file)) is not None:
-                    agents.append(agent)
+                if (rewritten := rewrite.agent(served, file)) is None:
+                    continue
+                agent, text = rewritten
+                agents.append(agent)
+                materials.append(_material(served, file, agent, _as_served(file, text)))
+        files = {m.file.uri: m for m in materials}
+        folders = _folder_rows(materials)
         # FastMCP refuses a catalogue with a skill nested in another, which no one
         # skill's renderer can see: the build fails on it as the whole catalogue would.
         SkillCatalogProvider(catalogue)
@@ -1468,6 +1812,7 @@ class Plugins:
                     if k in catalogue:
                         renderers.append(renderer := _Renderer(k, catalogue[k]))
                         indexes |= await rewrite.indexes(served, k, renderer)
+        indexes |= rewrite.file_indexes(folders, files)
         return _Build(
             admitted=plugins,
             catalogue=MappingProxyType(catalogue),
@@ -1476,6 +1821,8 @@ class Plugins:
             rewritten=True,
             indexes=MappingProxyType(indexes),
             _renderers=tuple(renderers),
+            files=MappingProxyType(files),
+            folders=MappingProxyType(folders),
         )
 
     def add(
@@ -1502,6 +1849,7 @@ class Plugins:
         address = os.fspath(address)
         prefix = _namespace(namespace, self._server.name)
         try:
+            self._check_first()
             loader = self._loader_for(address)
             try:
                 root = loader.materialise(address)
@@ -1553,34 +1901,37 @@ class Plugins:
 
     def _claim(
         self,
-        key: str,
+        claims: Sequence[tuple[str, str]],
         plugin: Plugin,
-        what: str,
         seen: dict[str, Path],
         path: Path,
         skip: _Skip,
-        owners: dict[str, str],
+        owners: Mapping[str, str],
         *,
         files: bool = True,
     ) -> bool:
-        """Whether ``key`` is free: refused when served, skipped when this plugin
-        has it already, the warning naming both files when ``files``."""
-        owner = owners.get(key)
-        if owner is not None:
-            raise PluginError(f"{what} is already served by plugin {owner}")
-        if key in seen:
-            first = seen[key]
-            if files:
-                log.warning(
-                    "%s is already served by %s; %s is skipped", what, first, path
-                )
-            else:
-                log.warning(
-                    "plugin %s: %s is skipped, served already", plugin.name, what
-                )
-            skip(path, f"{what} is already served by {skip.relative(first)}")
-            return False
-        seen[key] = path
+        """Whether every ``(key, what)`` of ``claims`` is free, recording them all
+        only then, so a file skipped for one never holds another. The first held
+        decides: refused when served, skipped when this plugin has it already, the
+        warning naming both files when ``files``."""
+        for key, what in claims:
+            owner = owners.get(key)
+            if owner is not None:
+                raise PluginError(f"{what} is already served by plugin {owner}")
+            if key in seen:
+                first = seen[key]
+                if files:
+                    log.warning(
+                        "%s is already served by %s; %s is skipped", what, first, path
+                    )
+                else:
+                    log.warning(
+                        "plugin %s: %s is skipped, served already", plugin.name, what
+                    )
+                skip(path, f"{what} is already served by {skip.relative(first)}")
+                return False
+        for key, _ in claims:
+            seen[key] = path
         return True
 
     def _read(
@@ -1588,7 +1939,7 @@ class Plugins:
         plugin: Plugin,
         prefix: str,
         notes: list[str],
-        owners: dict[str, str],
+        owners: Mapping[str, str],
         reader: CommandReader,
     ) -> _Read:
         base = plugin.root.resolve()
@@ -1609,7 +1960,7 @@ class Plugins:
                 key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
                 if not self._claim(
-                    uri, plugin, uri, seen, location, skip, owners, files=False
+                    ((uri, uri),), plugin, seen, location, skip, owners, files=False
                 ):
                     continue
                 skill = skills._load_skill(location)
@@ -1634,7 +1985,14 @@ class Plugins:
         own = prefix == self._server.name
         named = "" if own else prefix.split("/")[0] + "_"
         prompts: list[_File] = []
-        for path, folders_in in _md_files(base, "commands", parts.commands, notes):
+        for path, folders_in, place in _md_files(
+            base, "commands", parts.commands, notes
+        ):
+            uri = _file_uri("prompts", prefix, place)
+            if reason := _at_index(place, uri):
+                log.warning("prompt %s is skipped: %s", path, reason)
+                skip(path, reason)
+                continue
             # Copilot's .prompt.md is the file type: x.prompt.md is x (PLUG-62).
             segments = (*folders_in, path.stem.removesuffix(".prompt"))
             name = named + "_".join(segments)
@@ -1655,29 +2013,29 @@ class Plugins:
                 log.warning("prompt %s is skipped: %s", path, prompt)
                 skip(path, prompt)
                 continue
-            if self._claim(
-                f"prompt:{prompt.name}",
-                plugin,
-                f"prompt {prompt.name}",
-                seen,
-                path,
-                skip,
-                owners,
-            ):
+            # The name first, so a file both clash on is refused or skipped for it.
+            claims = ((f"prompt:{prompt.name}", f"prompt {prompt.name}"), (uri, uri))
+            if self._claim(claims, plugin, seen, path, skip, owners):
                 prompts.append(
                     _File(
                         path=skip.relative(path),
-                        uri=_file_uri("prompts", prefix, folders_in, path.name),
+                        uri=uri,
                         data=data,
                         text=text,
                         item=prompt,
                         stem=path.stem,
                         folders=tuple(folders_in),
+                        place=place,
                     )
                 )
 
         agents: list[_File] = []
-        for path, segments in _md_files(base, "agents", parts.agents, notes):
+        for path, segments, place in _md_files(base, "agents", parts.agents, notes):
+            uri = _file_uri("agents", prefix, place)
+            if reason := _at_index(place, uri):
+                log.warning("agent file %s is skipped: %s", path, reason)
+                skip(path, reason)
+                continue
             try:
                 data = path.read_bytes()
                 text = _decoded(data)
@@ -1690,23 +2048,23 @@ class Plugins:
                 log.warning("agent file %s is skipped: %s", path, agent)
                 skip(path, agent)
             elif self._claim(
-                f"agent:{agent.name}",
+                ((f"agent:{agent.name}", f"agent {agent.name}"), (uri, uri)),
                 plugin,
-                f"agent {agent.name}",
                 seen,
                 path,
                 skip,
-                {},  # across plugins, the set names agents (PLUG-64)
+                {},  # across plugins, the set names and addresses agents (PLUG-64)
             ):
                 agents.append(
                     _File(
                         path=skip.relative(path),
-                        uri=_file_uri("agents", prefix, segments, path.name),
+                        uri=uri,
                         data=data,
                         text=text,
                         item=agent,
                         stem=path.stem,
                         folders=tuple(segments),
+                        place=place,
                         read_name=agent.name,
                     )
                 )
@@ -1716,7 +2074,9 @@ class Plugins:
 
     def _providers(self, served: tuple[_Served, ...]) -> None:
         # The first plugin with a skill brings the Skills extension (PLUG-20), the
-        # first plugin the prompts provider and the agents extension (PLUG-27).
+        # first plugin the prompts provider, the files provider (PLUG-66), the agents
+        # extension (PLUG-27), which binds resources/directory/read, and NameTheIndex
+        # (PLUG-68).
         if self._skills is None and any(each.catalogue for each in served):
             self._skills = _Skills(self)
             skills.serve(self._server, self._skills)
@@ -1725,9 +2085,13 @@ class Plugins:
         if self._prompts is None:
             self._prompts = _Prompts(self)
             self._server.add_provider(self._prompts)
+        if self._files is None:
+            self._files = _Files(self)
+            self._server.add_provider(self._files)
         if self._agents is None:
             self._agents = _Agents(self)
             self._server.add_extension(self._agents)
             self._server.add_middleware(
                 AdvertiseLegacyExtensions({EXTENSION_ID: SETTINGS})
             )
+            skills._name_the_index(self._server)

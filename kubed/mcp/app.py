@@ -6,11 +6,12 @@ for what this class does not cover.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any, Protocol, TypeVar
+from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
@@ -40,6 +41,8 @@ from .plugins import (
 )
 
 T = TypeVar("T")
+P = ParamSpec("P")
+R = TypeVar("R")
 
 # ``singleton``'s ``instance`` when none is given: ``None`` may be one.
 _UNSET: Any = object()
@@ -70,6 +73,23 @@ class _CallScope(Middleware):
                 return await call_next(context)
         finally:
             _CALL.reset(token)
+
+
+def _signed_as(
+    source: Callable[Concatenate[Any, P], R],
+) -> Callable[[Callable[..., Any]], Callable[Concatenate[Any, P], R]]:
+    """Gives a method that passes everything through to ``source`` its signature: for
+    type checkers by its type, for ``inspect`` and ``help()`` by ``__wrapped__``, and
+    its own docstring followed by ``source``'s."""
+
+    def sign(fn: Callable[..., Any]) -> Callable[Concatenate[Any, P], R]:
+        fn.__wrapped__ = source  # type: ignore[attr-defined]
+        fn.__doc__ = "\n\n".join(
+            inspect.cleandoc(doc) for doc in (fn.__doc__, source.__doc__) if doc
+        )
+        return fn
+
+    return sign
 
 
 def _with_teardown(
@@ -123,7 +143,6 @@ class QuickMCP:
             self._container.values[type(config)] = config
         # FastMCP's own, unchanged.
         self.tool = self.server.tool
-        self.resource = self.server.resource
         self.prompt = self.server.prompt
         self.add_middleware = self.server.add_middleware
         self.add_provider = self.server.add_provider
@@ -139,6 +158,15 @@ class QuickMCP:
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
         self.server.middleware.insert(2, _TakeThePrefix())
+
+    @_signed_as(FastMCP.resource)
+    def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
+        """FastMCP's ``resource``, with its signature, given what it is given (APP-4),
+        except that once the server has a plugin a URI or template under ``prompts://``
+        or ``agents://`` is refused with a ``ValueError``: those are the plugins'
+        (PLUG-72). FastMCP's own documentation follows."""
+        self._plugins.check_own(uri)
+        return self.server.resource(uri, *args, **kwargs)
 
     def websocket_route(
         self, path: str, endpoint: Callable[..., Any], *, name: str | None = None
@@ -191,7 +219,9 @@ class QuickMCP:
         ``generation`` on by one (PLUG-51).
 
         A plugin left out of the set is no longer served. A set made by another
-        server is refused with a ``ValueError``.
+        server is refused with a ``ValueError``, and a server's first plugins, when it
+        has its own resource under ``prompts://`` or ``agents://``, with a
+        ``PluginError`` (PLUG-72).
         """
         self._plugins.serve(staging)
 

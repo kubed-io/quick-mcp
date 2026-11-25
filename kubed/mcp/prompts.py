@@ -14,6 +14,7 @@ prompt ignores them.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,7 +27,19 @@ from pydantic import Field
 if TYPE_CHECKING:
     from .plugins import Plugin
 
-__all__ = ["FilePrompt", "load_prompt", "read_command"]
+__all__ = [
+    "INVOCATION_KEYS",
+    "META_KEY",
+    "FilePrompt",
+    "index_meta",
+    "load_prompt",
+    "read_command",
+]
+
+# Where a prompt's row in its folder's index carries its registration (PLUG-69).
+META_KEY = "io.kubed/prompt"
+# The frontmatter keys Claude Code reads for invocation, kept on a prompt's row.
+INVOCATION_KEYS = ("disable-model-invocation", "user-invocable", "argument-hint")
 
 PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
@@ -50,6 +63,47 @@ def split_frontmatter(text: str) -> tuple[Any, str] | None:
         return None
     header = yaml.safe_load("".join(lines[1:end]))
     return header, "".join(lines[end + 1 :]).lstrip("\r\n")
+
+
+def _survives_json(value: object) -> bool:
+    """Whether the value arrives as written after a trip through JSON.
+
+    A YAML-only value fails to encode, and a non-string key (1 beside "1") encodes but
+    comes back renamed or lost.
+    """
+    try:
+        return json.loads(json.dumps(value, allow_nan=False)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def index_meta(prompt: Prompt, text: str) -> dict[str, dict[str, Any]]:
+    """What a prompt's row registers it by (PLUG-69): ``{META_KEY: ...}`` with its MCP
+    ``name``, its ``arguments`` as ``prompts/list`` gives them, and each invocation
+    key the frontmatter of ``text``, the file as served, sets as written.
+
+    The keys are read from ``text`` and not the prompt, so a reader's ``Prompt``
+    (PLUG-62) has them too. A text with no header, a header that does not parse or is
+    not a mapping, gives none, and a value that does not survive a trip through JSON
+    is left out.
+    """
+    arguments = [
+        argument.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for argument in prompt.to_mcp_prompt().arguments or []
+    ]
+    try:
+        split = split_frontmatter(text)
+    except yaml.YAMLError:
+        split = None
+    header = split[0] if split is not None else None
+    keys: dict[str, Any] = {}
+    if isinstance(header, dict):
+        keys = {
+            key: header[key]
+            for key in INVOCATION_KEYS
+            if key in header and _survives_json(header[key])
+        }
+    return {META_KEY: {"name": prompt.name, "arguments": arguments, **keys}}
 
 
 class FilePrompt(Prompt):

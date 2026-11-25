@@ -13,7 +13,6 @@ the server serves.
 from __future__ import annotations
 
 import copy
-import json
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -27,7 +26,7 @@ from pydantic import Field
 
 from mcp.shared.exceptions import MCPError
 
-from .prompts import split_frontmatter
+from .prompts import _survives_json, split_frontmatter
 
 __all__ = ["EXTENSION_ID", "META_KEY", "Agent", "AgentsExtension", "parse_agent"]
 
@@ -71,18 +70,6 @@ def routing_hint(model: object) -> dict | None:
         if word in _HINTS:
             return {"role": _HINTS[word], "vision": False}
     return None
-
-
-def _survives_json(value: object) -> bool:
-    """Whether the value arrives as written after a trip through JSON.
-
-    A YAML-only value fails to encode, and a non-string key (1 beside "1") encodes but
-    comes back renamed or lost.
-    """
-    try:
-        return json.loads(json.dumps(value, allow_nan=False)) == value
-    except (TypeError, ValueError):
-        return False
 
 
 def _strings(value: object) -> list[str]:
