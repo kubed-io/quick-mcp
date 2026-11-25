@@ -103,13 +103,16 @@ _LAZY: dict[str, str] = {
 }
 
 
-def __getattr__(name: str) -> object:
-    module = _LAZY.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(module, __name__), name)
-    globals()[name] = value
-    return value
+# Hidden from type checkers, so an unknown name stays an error to them.
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> object:
+        module = _LAZY.get(name)
+        if module is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        value = getattr(import_module(module, __name__), name)
+        globals()[name] = value
+        return value
 
 
 def __dir__() -> list[str]:
