@@ -30,6 +30,7 @@ from .container import (
 from .delivery import (
     _RESOLVERS,
     BinaryPointer,
+    DeliveryDefault,
     _header_prefix,
     _Resolver,
     _ResolveScope,
@@ -357,6 +358,26 @@ class QuickMCP:
         none.
         """
         self._plugins.set_binary_pointer(fn)
+        return fn
+
+    def delivery_default(self, fn: DeliveryDefault) -> DeliveryDefault:
+        """Sets a per-client default for the delivery inputs, and returns ``fn``, so it
+        works as a decorator (DLV-14). A second call replaces the first.
+
+        ``fn(client_info)`` is called once each time a request's inputs are resolved,
+        with the client's ``clientInfo``, an ``mcp_types.Implementation``, or None when
+        the request names none: on ``initialize`` its ``params.clientInfo``, on any
+        other request its ``_meta["io.modelcontextprotocol/clientInfo"]`` first, then
+        the session's ``initialize``. A lookup that fails, or a ``clientInfo`` that is
+        not one, counts as none. ``fn`` returns a partial ``Delivery``, None for any
+        input it leaves alone, or None for all of them. Its answer beats the config's
+        ``delivery`` and kubed-mcp's table of known clients, and a value its input does
+        not take, or of a type ``Delivery`` does not allow it, falls through with one
+        warning naming ``delivery_default <attribute>``. An ``fn`` that raises, or
+        answers with anything but a partial ``Delivery`` or None, is logged at error
+        and gives nothing.
+        """
+        self._resolver.default = fn
         return fn
 
     def add_loader(self, loader: PluginLoader) -> None:
