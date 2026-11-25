@@ -25,16 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`kubed-mcp[telemetry]` and `TelemetrySettings`:** set `telemetry.profiles` to push CPU and memory profiles to Pyroscope.
+- **`telemetry.otel`:** export traces through the standard `OTEL_*` variables, linked to profiles and to log lines.
+- **Call metrics with `telemetry.otel`:** each tool call and prompt render, per name, pushed over OTLP or scraped with `OTEL_METRICS_EXPORTER=prometheus`.
+- A server's config module can import `kubed.mcp.TelemetrySettings` without loading FastMCP.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added
 
 - `add_plugin(…, manifest=entry)` and `read_plugin(root, manifest=…)` merge a marketplace entry with `plugin.json` as Claude Code does.
 - `Plugin.skipped` names each skill, command and agent file a plugin does not serve, and why.
-- **`kubed-mcp[telemetry]` and `TelemetrySettings`:** set `telemetry.profiles` to push CPU and memory profiles to Pyroscope.
-- **`telemetry.otel`:** export traces through the standard `OTEL_*` variables, linked to profiles and to log lines.
-- **Call metrics with `telemetry.otel`:** each tool call and prompt render, per name, pushed over OTLP or scraped with `OTEL_METRICS_EXPORTER=prometheus`.
-- A server's config module can import `kubed.mcp.TelemetrySettings` without loading FastMCP.
 - `mcp.plugin_set()` and `mcp.serve(set)` swap a whole set of plugins at once, counted by `mcp.generation`.
 - `mcp.plugin_view(fn)` serves each request only the plugins its view admits.
 - `mcp.add_rewriter(fn)` rewrites the text a server serves, with digests that match.
