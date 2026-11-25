@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resources/read` resolves `.` and `..` segments in a `skill://`, `prompts://` or `agents://` address.
 - Under a namespace, prompt and agent names are prefixed with its first segment only.
 - A skill's JSON, YAML, TOML and script files read as text, and rewriters and the gateway prefix reach them.
-- A plugin whose namespace would sit inside another plugin's skill is refused.
+- A plugin is refused when its namespace would sit inside another plugin's skill, or one of its skills would hold another plugin's namespace.
+- `prompts://` and `agents://` belong to the plugins: a server's own resource there, or a second plugin's prompt at one address, is refused.
 
 ## [0.1.2] - 2026-11-23
 
