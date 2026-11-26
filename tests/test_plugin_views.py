@@ -352,7 +352,7 @@ async def test_a_serve_during_a_build_is_never_stored(monkeypatch):
 
     async def changing(self, state, view, key):
         build = await plain(self, state, view, key)
-        if not changed:  # a new set is served mid-build
+        if not changed:  # a new set is served after the build, before it is stored
             changed.append(1)
             mcp.serve(mcp.plugin_set())
         return build

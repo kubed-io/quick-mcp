@@ -13,8 +13,9 @@ warning naming it.
 Each kind is then served by its rules: skills by ``kubed.mcp.skills``, commands as MCP
 prompts (``kubed.mcp.prompts``) and agents through the agents extension
 (``kubed.mcp.agents``). A server has one provider of each kind, whatever its plugins,
-and each reads what its request is pinned to: the plugins served when the request
-began that its view admits (``mcp.plugin_view``), built once per build key and reused.
+and each reads what its request is pinned to: the plugins served once the request's
+view has run, of those its view admits (``mcp.plugin_view``), built once per build key
+and reused.
 A build runs the server's rewriters (``mcp.add_rewriter``) over the text it serves, from
 what was read and never from the disk.
 The layout and names are Claude Code's: a skill is one folder below ``skills/``, while
