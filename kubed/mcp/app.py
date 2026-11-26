@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
@@ -18,7 +18,7 @@ from fastmcp.server.middleware import Middleware
 from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
-from ._config import Config, _load
+from ._config import Config, Source, _load
 from ._handshake import _Describe
 from .container import (
     _CALL,
@@ -158,6 +158,12 @@ class QuickMCP:
     of them. The config loads first thing in ``__init__``, so a bad one stops
     construction, and ``mcp.config`` is the loaded instance. Each section class resolves
     by ``Inject[...]``, and ``Inject[Config]`` is the whole config.
+
+    ``argv`` is the server's flags, ``sys.argv[1:]`` from its entry point: None reads
+    none, as quick-mcp never reads ``sys.argv``. ``environ`` is the env vars read, and
+    ``os.environ`` when None. Neither goes with ``config``, which reads no file, env var
+    or flag: passing either with it raises ``TypeError``. ``mcp.config_sources`` says
+    where each item's value came from.
     """
 
     def __init__(
@@ -166,13 +172,16 @@ class QuickMCP:
         *,
         sections: Iterable[type[BaseModel]] = (),
         config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
+        argv: Sequence[str] | None = None,
+        environ: Mapping[str, str] | None = None,
         header_prefix: str | None = None,
         **fastmcp_options: Any,
     ):
-        loaded = _load([sections], config)
+        loaded = _load([sections], config, argv=argv, environ=environ)
         header_prefix = _header_prefix(header_prefix)
         self._container = Container()
         self._config = loaded.config
+        self._config_sources = loaded.sources
         telemetry = getattr(self._config, "telemetry", None)
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
@@ -228,6 +237,12 @@ class QuickMCP:
     def config(self) -> Config:
         """The config loaded at construction: read-only, and never reloaded."""
         return self._config
+
+    @property
+    def config_sources(self) -> Mapping[str, Source]:
+        """Where each leaf item's value came from, by its dotted path, in item order:
+        read-only, as ``config`` is."""
+        return self._config_sources
 
     @_signed_as(FastMCP.resource)
     def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:

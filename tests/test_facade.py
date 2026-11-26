@@ -96,8 +96,10 @@ OWN = {
         "Delivery",
         "Field",
         "Inject",
+        "NoDecode",
         "QuickMCP",
         "Serving",
+        "Source",
         "Telemetry",
         "TelemetrySettings",
         "config",
@@ -187,7 +189,7 @@ def _fresh(code: str) -> dict:
         "import kubed.mcp.telemetry",
         "from kubed.mcp import telemetry",
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
-        "from kubed.mcp import Config, Field, config, config_schema",
+        "from kubed.mcp import Config, Field, NoDecode, Source, config, config_schema",
         "from kubed.mcp import Config, Field, config, config_schema\n"
         "@config('recording')\n"
         "class Recording(Config):\n"

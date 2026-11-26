@@ -915,7 +915,7 @@ def test_the_config_is_there_right_after_construction_and_frozen() -> None:
 
 
 def test_a_server_with_no_sections_has_an_empty_config() -> None:
-    assert type(QuickMCP("t").config).model_fields == {}
+    assert type(QuickMCP("t", environ={}).config).model_fields == {}
 
 
 def test_a_bad_config_stops_construction() -> None:
@@ -924,7 +924,7 @@ def test_a_bad_config_stops_construction() -> None:
 
 
 async def test_sections_and_the_config_are_injected_by_class() -> None:
-    mcp = QuickMCP("t", sections=[Root, Base, Sub])
+    mcp = QuickMCP("t", sections=[Root, Base, Sub], environ={})
 
     @mcp.tool
     def seen(
@@ -942,7 +942,7 @@ async def test_sections_and_the_config_are_injected_by_class() -> None:
 
 def test_the_composed_class_is_not_a_key() -> None:
     # The composed class isn't a key: Duck and Config resolve, it doesn't.
-    mcp = QuickMCP("t", sections=[Duck])
+    mcp = QuickMCP("t", sections=[Duck], environ={})
     assert mcp._container.knows(Duck) and mcp._container.knows(Config)
     assert not mcp._container.knows(type(mcp.config))
 
@@ -980,7 +980,7 @@ def test_sections_must_be_an_iterable() -> None:
     with pytest.raises(
         TypeError, match=r"sections= takes an iterable of section classes"
     ):
-        QuickMCP("t", sections=None)  # type: ignore[arg-type]
+        QuickMCP("t", sections=None, environ={})  # type: ignore[arg-type]
     with pytest.raises(TypeError, match=r"sections= takes an iterable"):
         _compose([None])  # type: ignore[list-item]
 
@@ -1020,4 +1020,4 @@ def test_an_instance_in_sections_is_a_type_error_through_the_server() -> None:
     with pytest.raises(
         TypeError, match="Sections are classes, got an instance of Root"
     ):
-        QuickMCP("t", sections=[Root()])
+        QuickMCP("t", sections=[Root()], environ={})
