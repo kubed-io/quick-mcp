@@ -16,7 +16,7 @@ from fastmcp.exceptions import NotFoundError
 from gateway_server import kit, over_http
 from skill_server import DIRECTORY, request
 
-from kubed.mcp.gateway import _as_sent, _plain, _TakeThePrefix
+from kubed.mcp.gateway import _as_sent, _plain, _TakeThePrefix, prefixed, unprefixed
 from kubed.mcp.protocol import MCPError, Middleware
 from kubed.mcp.skills import FolderNotFound
 
@@ -56,6 +56,7 @@ pytestmark = pytest.mark.unit
             "skill://lib/guide/SKILL.md?v=../x",
         ),
         ("workspace://a%2Fb/../c", "kb+", "workspace://a%2Fb/../c"),
+        ("kb+kb+skill://lib/guide/SKILL.md", "kb+", "kb+kb+skill://lib/guide/SKILL.md"),
         # Not in the brief: a trailing slash names no folder, so it stays a plain miss
         # (test_skill_folders.py::test_a_trailing_slash_is_a_plain_miss).
         ("skill://lib/guide/references/", None, "skill://lib/guide/references/"),
@@ -351,3 +352,46 @@ def test_any_other_error_names_the_address_as_sent():
         {"uri": sent, "x": 1},
     )
     assert _as_sent(ValueError(passed), passed, sent) is None
+
+
+@pytest.mark.parametrize(
+    ("uri", "prefix", "expected"),
+    [
+        ("kb+skill://lib/guide/SKILL.md", "kb+", "skill://lib/guide/SKILL.md"),
+        ("kb+prompts://lib/ask.md", "kb+", "prompts://lib/ask.md"),
+        ("kb+agents://lib/scout.md", "kb+", "agents://lib/scout.md"),
+        ("a.b-c+skill://x", "a.b-c+", "skill://x"),
+        ("xx+skill://lib/guide/SKILL.md", "kb+", "xx+skill://lib/guide/SKILL.md"),
+        ("kb+skill://lib/guide/SKILL.md", None, "kb+skill://lib/guide/SKILL.md"),
+        ("skill://lib/guide/SKILL.md", "kb+", "skill://lib/guide/SKILL.md"),
+        ("kb+kb+skill://lib/guide/SKILL.md", "kb+", "kb+kb+skill://lib/guide/SKILL.md"),
+        ("KB+skill://lib/guide/SKILL.md", "kb+", "KB+skill://lib/guide/SKILL.md"),
+        ("kb+workspace://a", "kb+", "kb+workspace://a"),
+        ("kb+skill://lib/a/../b%2Fc", "kb+", "skill://lib/a/../b%2Fc"),
+        ("", "kb+", ""),
+    ],
+)
+def test_unprefixed(uri, prefix, expected):
+    assert unprefixed(uri, prefix) == expected
+
+
+def test_unprefixed_defaults_to_no_prefix():
+    assert unprefixed("kb+skill://x") == "kb+skill://x"
+
+
+@pytest.mark.parametrize("bad", ["", "kb", "1b+", "k" * 64 + "+", "kb +"])
+def test_unprefixed_refuses_an_invalid_prefix(bad):
+    with pytest.raises(ValueError) as refused:
+        unprefixed("skill://x", bad)
+    with pytest.raises(ValueError) as by_prefixed:
+        prefixed("skill://x", bad)
+    assert str(refused.value) == str(by_prefixed.value)
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["skill://lib/guide/SKILL.md", "prompts://lib/ask.md", "agents://lib/scout.md"],
+)
+@pytest.mark.parametrize("prefix", ["kb+", "a.b-c+"])
+def test_unprefixed_inverts_prefixed(address, prefix):
+    assert unprefixed(prefixed(address, prefix), prefix) == address

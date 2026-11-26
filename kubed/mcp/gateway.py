@@ -4,8 +4,8 @@ A gateway in front of this server rewrites the structured fields of what it rela
 (names, URIs), never the text of a skill or a prompt. So a skill that links to
 ``skill://lib/guide/SKILL.md`` would send the model to an address the gateway does
 not serve. A client names the gateway's prefix, and ``prefixed`` writes it into
-those addresses. ``_TakeThePrefix`` takes it off again from the addresses a client
-sends back, before any provider is asked.
+those addresses. ``unprefixed`` takes it off one address, and ``_TakeThePrefix`` does so
+for the addresses a client sends back, before any provider is asked.
 """
 
 from __future__ import annotations
@@ -35,11 +35,35 @@ def prefixed(text: str, prefix: str | None) -> str:
     """
     if prefix is None:
         return text
+    _valid(prefix)
+    return _ADDRESS.sub(lambda _: prefix, text)
+
+
+def unprefixed(uri: str, prefix: str | None = None) -> str:
+    """``uri`` less ``prefix``, the inverse of ``prefixed`` for one address.
+
+    ``uri`` is returned without ``prefix`` when it starts with ``prefix`` and a scheme
+    the plugins serve, and ``uri`` itself otherwise, or when ``prefix`` is None. It is
+    one address, not text, and it resolves no dot segment. A prefix that is not valid is
+    a ``ValueError``.
+    """
+    if prefix is None:
+        return uri
+    _valid(prefix)
+    if uri.startswith(prefix) and uri[len(prefix) :].startswith(
+        tuple(f"{scheme}://" for scheme in SCHEMES)
+    ):
+        return uri[len(prefix) :]
+    return uri
+
+
+def _valid(prefix: str) -> str:
+    """``prefix``, or a ``ValueError`` when it is not a valid one (GW-3)."""
     if not _PREFIX.fullmatch(prefix):
         raise ValueError(
             f"{prefix[:64]!r} is not a valid prefix: {_INPUTS['Resource-Prefix'].rule}"
         )
-    return _ADDRESS.sub(lambda _: prefix, text)
+    return prefix
 
 
 def prefix() -> str | None:
@@ -70,9 +94,8 @@ def _plain(uri: str, prefix: str | None) -> str:
     nowhere = f"{scheme}%2F"
     if "%2f" in uri.lower():
         return nowhere
-    if prefix and uri.startswith(prefix + scheme):
-        uri = uri[len(prefix) :]
-    elif not uri.startswith(scheme):
+    uri = unprefixed(uri, prefix)
+    if not uri.startswith(scheme):
         return uri
     rest = uri[len(scheme) :]
     # The path ends at the first "?" or "#": what follows is kept as sent.

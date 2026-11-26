@@ -500,7 +500,8 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
             root = _root(path)
             if uri != root and not uri.startswith(f"{root}/"):
                 continue
-            # Matched as sent: a URI is a folder's only when it is spelled as one.
+            # Matched exactly: GW-4 has taken off the prefix and resolved the dots,
+            # and a URI is a folder's only when it is spelled as one.
             for rel in _folders_of(manifest.files):
                 if _folder_uri(path, rel) == uri:
                     return path, manifest, rel
