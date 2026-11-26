@@ -28,6 +28,8 @@ dependencies = [
   "fastmcp>=4.2,<5",
   # The plugin layer reads command and agent frontmatter itself.
   "pyyaml>=6,<7",
+  # The config's sections and its schema are pydantic models.
+  "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]
