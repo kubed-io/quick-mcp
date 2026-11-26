@@ -199,8 +199,9 @@ class _Item(NamedTuple):
     ``loc`` is the keys its value is validated under, ``attrs`` the attribute names
     that read it back from the loaded config, and ``path`` the dotted ``loc``. A
     ``leaf`` is a field the walk doesn't descend into. ``env`` and ``arg`` are the names
-    that set it, as written, ``sensitive`` says a secret type is in its annotation, and
-    ``takes`` says how a raw value from an env var or a flag decodes.
+    that set it, as written, ``sensitive`` says a secret type is in its annotation or,
+    on a leaf, a model with a secret field at any depth, and ``takes`` says how a raw
+    value from an env var or a flag decodes.
     """
 
     loc: tuple[str, ...]
@@ -313,6 +314,26 @@ def _sensitive_fields(cls: type[BaseModel]) -> frozenset[str]:
         )
         _SENSITIVE[cls] = names
     return names
+
+
+def _holds_secret(annotation: object) -> bool:
+    """Whether an annotation reaches a model with a secret field, at any depth.
+
+    Such a model is dumped by its own serializer, which may write its secret as
+    anything, so a leaf holding it is shown as a secret.
+    """
+    queue = [m for m in _models_in(annotation) if issubclass(m, BaseModel)]
+    seen = set(queue)
+    while queue:
+        cls = queue.pop()
+        if _sensitive_fields(cls):
+            return True
+        for info in cls.model_fields.values():
+            for model in _models_in(info.annotation):
+                if issubclass(model, BaseModel) and model not in seen:
+                    seen.add(model)
+                    queue.append(model)
+    return False
 
 
 # The keywords ``Field`` writes that only mean something on the field itself.
@@ -522,7 +543,8 @@ def _walk_items(
                 leaf=leaf,
                 env=extra.get("env"),
                 arg=extra.get("arg"),
-                sensitive=name in _sensitive_fields(cls),
+                sensitive=name in _sensitive_fields(cls)
+                or (leaf and _holds_secret(info.annotation)),
                 takes=_takes(info),
             )
         )
@@ -896,10 +918,10 @@ def _by_alias(cls: type[BaseModel]) -> bool:
     return cls.model_config.get("validate_by_alias", True) is not False
 
 
-def _schema_key(name: str, info: FieldInfo) -> str:
-    """The property a field is under in pydantic's schema, which writes it by alias.
+def _alias_key(name: str, info: FieldInfo) -> str:
+    """The one top-level key a field's value is written under, to be read by alias.
 
-    That is its ``str`` alias, else the first of its ``AliasChoices`` that is a ``str``
+    That is its ``str`` alias, else the first of its alias choices that is a ``str``
     or an ``AliasPath`` of one ``str``, else its name.
     """
     alias = info.validation_alias
@@ -907,17 +929,34 @@ def _schema_key(name: str, info: FieldInfo) -> str:
     for choice in choices:
         if isinstance(choice, str):
             return choice
-        if isinstance(choice, AliasPath) and len(choice.path) == 1:
-            return str(choice.path[0])
+        if (
+            isinstance(choice, AliasPath)
+            and len(choice.path) == 1
+            and isinstance(choice.path[0], str)
+        ):
+            return choice.path[0]
     return name
 
 
+def _schema_key(name: str, info: FieldInfo) -> str:
+    """The property a field is under in pydantic's schema.
+
+    Pydantic's own rule: its ``str`` alias, else the first of its ``AliasChoices`` that
+    is a ``str`` or an ``AliasPath`` of one ``str``, else its name. A bare
+    ``AliasPath`` gives the name, even one of a single step.
+    """
+    alias = info.validation_alias
+    if isinstance(alias, AliasChoices):
+        return _alias_key(name, info)
+    return alias if isinstance(alias, str) else name
+
+
 def _key(cls: type[BaseModel], name: str, info: FieldInfo) -> str:
-    """The one key a field of ``cls`` is written under: its schema property's name.
+    """The one key a field of ``cls`` is written under, which it's read back from.
 
     A model that doesn't validate by alias takes the field's name.
     """
-    return _schema_key(name, info) if _by_alias(cls) else name
+    return _alias_key(name, info) if _by_alias(cls) else name
 
 
 def _accepts(cls: type[BaseModel], name: str, info: FieldInfo) -> tuple[str, ...]:

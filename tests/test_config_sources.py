@@ -14,11 +14,13 @@ import pytest
 from pydantic import (
     AliasChoices,
     AliasPath,
+    BaseModel,
     ConfigDict,
     Json,
     Secret,
     SecretStr,
     create_model,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -357,11 +359,12 @@ class Routes(Config):
         None, validation_alias=AliasChoices(AliasPath("bb", 0), "z")
     )
     c: Secret[dict[str, int]] | None = Field(None, validation_alias=AliasPath("cc", 0))
+    d: Secret[dict[str, int]] | None = Field(None, validation_alias=AliasPath("dd"))
 
 
 def test_the_schema_marks_a_secret_under_the_key_pydantic_writes() -> None:
     props = config_schema(Routes)["$defs"]["Routes"]["properties"]
-    assert list(props) == ["k", "z", "c"]
+    assert list(props) == ["k", "z", "c", "d"]
     for prop in props.values():
         assert prop["sensitive"] is True and "default" not in prop
 
@@ -919,6 +922,44 @@ def test_a_value_json_cannot_write_is_named_by_its_type(caplog) -> None:
         _load([[Loose]], values)
     assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
         'config: loose.thing="<SimpleNamespace>" (code), loose.blob="<bytes>" (code)'
+    ]
+
+
+class Login(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    token: SecretStr
+
+    @field_serializer("token", when_used="json")
+    def _reveal(self, token: SecretStr) -> str:
+        return token.get_secret_value()
+
+
+class Keyring(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    creds: list[Login] = []
+
+
+@config("logins")
+class Logins(Config):
+    creds: list[Login] = Field(default_factory=list, env="LOGINS_CREDS")
+    deep: dict[str, Keyring] = Field(default_factory=dict, env="LOGINS_DEEP")
+    one: Login | None = Field(None)
+
+
+def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth(caplog) -> None:
+    environ = {
+        "LOGINS_CREDS": '[{"name": "a", "token": "S3CRET-LIST"}]',
+        "LOGINS_DEEP": '{"x": {"creds": [{"name": "b", "token": "S3CRET-DEEP"}]}}',
+    }
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
+        loaded = load(Logins, environ=environ).config
+    assert loaded.logins.creds[0].token.get_secret_value() == "S3CRET-LIST"
+    assert "S3CRET" not in caplog.text
+    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+        "config: logins.creds=*** (env LOGINS_CREDS), logins.deep=*** (env LOGINS_DEEP)"
     ]
 
 
