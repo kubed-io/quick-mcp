@@ -6,10 +6,11 @@ import argparse
 import dataclasses
 import datetime
 import json
+import types
 import uuid
 import zoneinfo
 from types import MappingProxyType
-from typing import Annotated, Literal, NewType
+from typing import Annotated, Any, Literal, NewType
 
 import pytest
 from config_server import Duck
@@ -20,6 +21,7 @@ from pydantic import (
     EmailStr,
     ImportString,
     Json,
+    RootModel,
     ValidationError,
     field_validator,
     model_serializer,
@@ -645,7 +647,6 @@ def test_a_list_index_is_written_in_brackets() -> None:
 
 
 def test_an_email_error_never_holds_the_input() -> None:
-    pytest.importorskip("email_validator")
     for mail in ("a@s3cr\u00e9t\u0661\u06f1.com", "a@s3cr_t.com"):
         with pytest.raises(ValueError) as caught:
             _load([[Leaky]], {"leaky": {"mail": mail}})
@@ -942,3 +943,81 @@ def test_the_composed_class_is_not_a_key() -> None:
     mcp = QuickMCP("t", sections=[Duck])
     assert mcp._container.knows(Duck) and mcp._container.knows(Config)
     assert not mcp._container.knows(type(mcp.config))
+
+
+@config("hushed")
+class Hushed(Config):
+    token: str = Field("hunter2", sensitive=True)
+    shown: str = Field("visible", sensitive=True, repr=True)
+
+
+def test_a_sensitive_field_is_kept_out_of_every_repr() -> None:
+    loaded = _load([[Root, Hushed]], {"hushed": {"token": "s3cret"}}).config
+    for text in (repr(loaded), str(loaded), repr(loaded.hushed), str(loaded.hushed)):
+        assert "s3cret" not in text
+        assert "hunter2" not in text
+    assert "visible" in repr(loaded.hushed)  # the caller's own repr= wins
+
+
+@config("tagged")
+class Tagged(Config):
+    tags: Tags
+
+
+class Tags(RootModel[list[str]]):
+    pass
+
+
+def test_a_root_model_is_refused_with_advice_it_can_follow() -> None:
+    with pytest.raises(
+        TypeError, match=r"RootModel, which can't forbid unknown keys.*named fields"
+    ) as c:
+        _compose([[Tagged]])
+    assert "extra=" not in str(c.value)
+
+
+def test_sections_must_be_an_iterable() -> None:
+    with pytest.raises(
+        TypeError, match=r"sections= takes an iterable of section classes"
+    ):
+        QuickMCP("t", sections=None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"sections= takes an iterable"):
+        _compose([None])  # type: ignore[list-item]
+
+
+class Opaque:
+    def __repr__(self) -> str:
+        return "Opaque(TOPSECRET)"
+
+
+@config("opaque")
+class HoldsOpaque(Config):
+    thing: Any = Field(Opaque(), sensitive=True)
+
+
+def test_the_schema_warns_nothing_about_a_sensitive_default(recwarn) -> None:
+    schema = config_schema(HoldsOpaque)
+    assert "TOPSECRET" not in json.dumps(schema)
+    assert not [w for w in recwarn if "TOPSECRET" in str(w.message)]
+
+
+@pytest.mark.parametrize(
+    "values, match",
+    [
+        (Settings(), "sections="),
+        (argparse.Namespace(port=1), "sections="),
+        (types.SimpleNamespace(delivery=None), "sections="),
+        (Unregistered(), "sections="),
+        ([Recording], "sections="),
+    ],
+)
+def test_old_call_shapes_are_type_errors_through_the_server(values, match) -> None:
+    with pytest.raises(TypeError, match=match):
+        QuickMCP("t", sections=[Root, Recording], config=values)
+
+
+def test_an_instance_in_sections_is_a_type_error_through_the_server() -> None:
+    with pytest.raises(
+        TypeError, match="Sections are classes, got an instance of Root"
+    ):
+        QuickMCP("t", sections=[Root()])

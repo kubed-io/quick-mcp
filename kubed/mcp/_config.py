@@ -10,12 +10,14 @@ from __future__ import annotations
 import dataclasses
 import keyword
 import typing
+import warnings
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple, TypeVar
 
-from pydantic import BaseModel, ConfigDict, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, RootModel, ValidationError, create_model
 from pydantic import Field as _PydanticField
 from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
+from pydantic.json_schema import PydanticJsonSchemaWarning
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -31,7 +33,10 @@ _BUILTINS: tuple[type[BaseModel], ...] = ()
 
 
 class Config(BaseModel):
-    """The base a section may subclass. It refuses unknown keys."""
+    """The base a section may subclass. It refuses unknown keys.
+
+    ``Inject[Config]`` resolves to the whole loaded config.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -117,9 +122,11 @@ def Field(
 
     ``doc`` is the field's description. ``env`` is the environment variable and ``arg``
     the command-line flag that set it, taken literally: nothing derives or prefixes
-    them. ``sensitive=True`` marks a value that is never printed. They are written to
-    the field's ``json_schema_extra``, and only the ones given. Every other keyword goes
-    to pydantic.
+    them. ``sensitive=True`` marks a value that is kept out of the schema, which never
+    writes its default, and out of ``repr`` and ``str``, unless ``repr=`` says
+    otherwise. A dump still holds it. They are written to the field's
+    ``json_schema_extra``, and only the ones given. Every other keyword goes to
+    pydantic.
 
     Raises:
         TypeError: ``env`` or ``arg`` isn't a non-empty ``str``, or ``description``
@@ -143,6 +150,7 @@ def Field(
         extra[name] = value
     if sensitive:
         extra["sensitive"] = True
+        kwargs.setdefault("repr", False)
     if doc is not None:
         kwargs["description"] = doc
     if extra:
@@ -233,6 +241,11 @@ def _check_strict(
         return
     seen.add(cls)
     if isinstance(cls, type) and issubclass(cls, BaseModel):
+        if issubclass(cls, RootModel):
+            raise TypeError(
+                f"{cls.__qualname__} at {path} is a RootModel, which can't forbid "
+                "unknown keys: use a model with named fields"
+            )
         if cls.model_config.get("extra") != "forbid":
             raise TypeError(
                 f"{cls.__qualname__} at {path} allows unknown keys: "
@@ -257,6 +270,9 @@ def _check_strict(
         )
 
 
+_NOT_ITERABLE = "sections= takes an iterable of section classes, such as a list"
+
+
 def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     """Register the sections of every source and compose them into one config model.
 
@@ -265,6 +281,8 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     """
     held: dict[str | None, type[BaseModel]] = {}
     replaced: dict[str | None, list[type[BaseModel]]] = {}
+    if not isinstance(sources, Iterable):
+        raise TypeError(_NOT_ITERABLE)
     for source in (_BUILTINS, *sources):
         if isinstance(source, BaseModel):
             raise TypeError(
@@ -276,6 +294,8 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
                 "sections= takes classes in a sequence: write "
                 f"sections=({source.__qualname__},)"
             )
+        if not isinstance(source, Iterable):
+            raise TypeError(_NOT_ITERABLE)
         for cls in source:
             _register(cls, held, replaced)
 
@@ -438,7 +458,8 @@ def _load(
 
     ``values`` is a mapping, one section instance, or an iterable of them. Given values
     are never read from a file, an env var or argv. A load error names each path and
-    its source, and never a value.
+    its source. Pydantic's own texts never carry the input, but a server's own validator
+    text is kept as written, so a validator should not put the value in it.
 
     A root instance's fields are spread into the mapping and validated again with the
     rest, so a root validator that isn't idempotent runs twice on them.
@@ -552,6 +573,10 @@ def config_schema(*sections: type[BaseModel]) -> dict[str, Any]:
         TypeError: A section isn't a marked, strict pydantic model.
         ValueError: Two sections claim one key, or a key clashes with the root.
     """
-    schema = _compose([sections]).model.model_json_schema()
+    with warnings.catch_warnings():
+        # Pydantic's warning about a default it can't write prints the default, and
+        # the scrub leaves every such default out of the schema anyway.
+        warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
+        schema = _compose([sections]).model.model_json_schema()
     _scrub(schema)
     return schema

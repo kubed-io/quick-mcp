@@ -29,7 +29,7 @@ dependencies = [
   # The plugin layer reads command and agent frontmatter itself.
   "pyyaml>=6,<7",
   # The config's sections and its schema are pydantic models.
-  "pydantic>=2,<3",
+  "pydantic>=2.12,<3",
 ]
 
 [project.optional-dependencies]
