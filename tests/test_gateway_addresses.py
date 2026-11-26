@@ -16,7 +16,7 @@ from fastmcp.exceptions import NotFoundError
 from gateway_server import kit, over_http
 from skill_server import DIRECTORY, request
 
-from kubed.mcp.gateway import _as_sent, _plain, _TakeThePrefix
+from kubed.mcp.gateway import _as_sent, _plain, _TakeThePrefix, prefixed, unprefixed
 from kubed.mcp.protocol import MCPError, Middleware
 from kubed.mcp.skills import FolderNotFound
 
@@ -24,51 +24,48 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize(
-    ("uri", "prefix", "dots", "expected"),
+    ("uri", "prefix", "expected"),
     [
-        ("kb+skill://lib/guide/SKILL.md", "kb+", True, "skill://lib/guide/SKILL.md"),
-        ("kb+prompts://lib/ask.md", "kb+", True, "prompts://lib/ask.md"),
-        ("kb+agents://lib/scout.md", "kb+", False, "agents://lib/scout.md"),
-        ("xx+skill://lib/guide/SKILL.md", "kb+", True, "xx+skill://lib/guide/SKILL.md"),
-        ("kb+skill://lib/guide/SKILL.md", None, True, "kb+skill://lib/guide/SKILL.md"),
+        ("kb+skill://lib/guide/SKILL.md", "kb+", "skill://lib/guide/SKILL.md"),
+        ("kb+prompts://lib/ask.md", "kb+", "prompts://lib/ask.md"),
+        ("kb+agents://lib/scout.md", "kb+", "agents://lib/scout.md"),
+        ("xx+skill://lib/guide/SKILL.md", "kb+", "xx+skill://lib/guide/SKILL.md"),
+        ("kb+skill://lib/guide/SKILL.md", None, "kb+skill://lib/guide/SKILL.md"),
         (
             "kb+skill://lib/guide/references/../SKILL.md",
             "kb+",
-            True,
             "skill://lib/guide/SKILL.md",
         ),
-        ("skill://lib/guide/references/..", None, True, "skill://lib/guide"),
+        ("skill://lib/guide/references/..", None, "skill://lib/guide"),
         (
             "skill://lib/guide/references/../SKILL.md",
             None,
-            False,
-            "skill://lib/guide/references/../SKILL.md",
+            "skill://lib/guide/SKILL.md",
         ),
-        ("skill://lib/../..", None, True, "skill://%2F"),
-        ("skill://lib/guide/references%2Fa.md", None, True, "skill://%2F"),
-        ("kb+skill://lib/guide%2fSKILL.md", "kb+", False, "skill://%2F"),
+        ("skill://lib/../..", None, "skill://%2F"),
+        ("skill://lib/guide/references%2Fa.md", None, "skill://%2F"),
+        ("kb+skill://lib/guide%2fSKILL.md", "kb+", "skill://%2F"),
         (
             "kb+skill://lib/guide/./SKILL.md#top",
             "kb+",
-            True,
             "skill://lib/guide/SKILL.md#top",
         ),
         (
             "kb+skill://lib/guide/SKILL.md?v=../x",
             "kb+",
-            True,
             "skill://lib/guide/SKILL.md?v=../x",
         ),
-        ("workspace://a%2Fb/../c", "kb+", True, "workspace://a%2Fb/../c"),
+        ("workspace://a%2Fb/../c", "kb+", "workspace://a%2Fb/../c"),
+        ("kb+kb+skill://lib/guide/SKILL.md", "kb+", "kb+kb+skill://lib/guide/SKILL.md"),
         # Not in the brief: a trailing slash names no folder, so it stays a plain miss
         # (test_skill_folders.py::test_a_trailing_slash_is_a_plain_miss).
-        ("skill://lib/guide/references/", None, True, "skill://lib/guide/references/"),
-        ("kb+skill://lib/guide/./", "kb+", True, "skill://lib/guide/"),
-        ("skill://lib//guide/SKILL.md", None, True, "skill://lib/guide/SKILL.md"),
+        ("skill://lib/guide/references/", None, "skill://lib/guide/references/"),
+        ("kb+skill://lib/guide/./", "kb+", "skill://lib/guide/"),
+        ("skill://lib//guide/SKILL.md", None, "skill://lib/guide/SKILL.md"),
     ],
 )
-def test_the_plain_address(uri, prefix, dots, expected):  # Review Focus 3: the #/? rows
-    assert _plain(uri, prefix, dots=dots) == expected
+def test_the_plain_address(uri, prefix, expected):  # Review Focus 3: the #/? rows
+    assert _plain(uri, prefix) == expected
 
 
 READS_BACK = [  # (method, sent under "kb+", the plain address read for comparison)
@@ -87,6 +84,16 @@ READS_BACK = [  # (method, sent under "kb+", the plain address read for comparis
     ("resources/read", "kb+skill://lib/guide/_manifest", "skill://lib/guide/_manifest"),
     ("skills/get", "kb+skill://lib/guide/SKILL.md", "skill://lib/guide/SKILL.md"),
     ("resources/directory/read", "kb+skill://lib/guide", "skill://lib/guide"),
+    (
+        "skills/get",
+        "kb+skill://lib/guide/references/../SKILL.md",
+        "skill://lib/guide/SKILL.md",
+    ),
+    (
+        "resources/directory/read",
+        "kb+skill://lib/guide/references/..",
+        "skill://lib/guide",
+    ),
 ]
 
 
@@ -140,6 +147,30 @@ SEEN = [  # (header, method, sent, what the providers are asked)
         "resources/read",
         "skill://lib/guide/SKILL.md",
         "skill://lib/guide/SKILL.md",
+    ),
+    (
+        "kb+",
+        "skills/get",
+        "kb+skill://lib/guide/references/../SKILL.md",
+        "skill://lib/guide/SKILL.md",
+    ),
+    (
+        "kb+",
+        "resources/directory/read",
+        "kb+skill://lib/guide/./references",
+        "skill://lib/guide/references",
+    ),
+    (
+        None,
+        "skills/get",
+        "skill://lib/guide/./SKILL.md",
+        "skill://lib/guide/SKILL.md",
+    ),
+    (
+        None,
+        "resources/directory/read",
+        "skill://lib/guide/references/..",
+        "skill://lib/guide",
     ),
 ]
 
@@ -225,6 +256,15 @@ MISSES = [  # (method, header, sent)
             ("resources/read", f"{h or ''}skill://lib/guide/references%2fa.md"),
             ("skills/get", f"{h or ''}skill://lib%2Fguide/SKILL.md"),
             ("resources/directory/read", f"{h or ''}skill://lib/guide%2Freferences"),
+            ("skills/get", f"{h or ''}skill://lib/../.."),
+            ("resources/directory/read", f"{h or ''}skill://lib/../.."),
+            # Review Focus 2: a trailing slash misses as undotted, naming the sent one.
+            (
+                "resources/directory/read",
+                f"{h or ''}skill://lib/guide/references/../",
+            ),
+            # Review Focus 3: resolves to a file other than SKILL.md.
+            ("skills/get", f"{h or ''}skill://lib/guide/SKILL.md/../references/a.md"),
         ]
     ],
 ]
@@ -312,3 +352,46 @@ def test_any_other_error_names_the_address_as_sent():
         {"uri": sent, "x": 1},
     )
     assert _as_sent(ValueError(passed), passed, sent) is None
+
+
+@pytest.mark.parametrize(
+    ("uri", "prefix", "expected"),
+    [
+        ("kb+skill://lib/guide/SKILL.md", "kb+", "skill://lib/guide/SKILL.md"),
+        ("kb+prompts://lib/ask.md", "kb+", "prompts://lib/ask.md"),
+        ("kb+agents://lib/scout.md", "kb+", "agents://lib/scout.md"),
+        ("a.b-c+skill://x", "a.b-c+", "skill://x"),
+        ("xx+skill://lib/guide/SKILL.md", "kb+", "xx+skill://lib/guide/SKILL.md"),
+        ("kb+skill://lib/guide/SKILL.md", None, "kb+skill://lib/guide/SKILL.md"),
+        ("skill://lib/guide/SKILL.md", "kb+", "skill://lib/guide/SKILL.md"),
+        ("kb+kb+skill://lib/guide/SKILL.md", "kb+", "kb+kb+skill://lib/guide/SKILL.md"),
+        ("KB+skill://lib/guide/SKILL.md", "kb+", "KB+skill://lib/guide/SKILL.md"),
+        ("kb+workspace://a", "kb+", "kb+workspace://a"),
+        ("kb+skill://lib/a/../b%2Fc", "kb+", "skill://lib/a/../b%2Fc"),
+        ("", "kb+", ""),
+    ],
+)
+def test_unprefixed(uri, prefix, expected):
+    assert unprefixed(uri, prefix) == expected
+
+
+def test_unprefixed_defaults_to_no_prefix():
+    assert unprefixed("kb+skill://x") == "kb+skill://x"
+
+
+@pytest.mark.parametrize("bad", ["", "kb", "1b+", "k" * 64 + "+", "kb +"])
+def test_unprefixed_refuses_an_invalid_prefix(bad):
+    with pytest.raises(ValueError) as refused:
+        unprefixed("skill://x", bad)
+    with pytest.raises(ValueError) as by_prefixed:
+        prefixed("skill://x", bad)
+    assert str(refused.value) == str(by_prefixed.value)
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["skill://lib/guide/SKILL.md", "prompts://lib/ask.md", "agents://lib/scout.md"],
+)
+@pytest.mark.parametrize("prefix", ["kb+", "a.b-c+"])
+def test_unprefixed_inverts_prefixed(address, prefix):
+    assert unprefixed(prefixed(address, prefix), prefix) == address

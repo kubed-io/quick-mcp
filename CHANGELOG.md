@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kubed.mcp.gateway.unprefixed(uri, prefix)` takes a gateway prefix off an address.
+
+### Changed
+
+- `skills/get` and `resources/directory/read` resolve `.` and `..` segments as `resources/read` does, on a direct connection as well as behind a gateway.
+
 ## [0.4.0] - 2026-11-26
 
 ### Added
