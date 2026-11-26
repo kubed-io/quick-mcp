@@ -4,8 +4,8 @@ A gateway in front of this server rewrites the structured fields of what it rela
 (names, URIs), never the text of a skill or a prompt. So a skill that links to
 ``skill://lib/guide/SKILL.md`` would send the model to an address the gateway does
 not serve. A client names the gateway's prefix, and ``prefixed`` writes it into
-those addresses. ``_TakeThePrefix`` takes it off again from the addresses a client
-sends back, before any provider is asked.
+those addresses. ``unprefixed`` takes it off one address, and ``_TakeThePrefix`` does so
+for the addresses a client sends back, before any provider is asked.
 """
 
 from __future__ import annotations
@@ -35,11 +35,35 @@ def prefixed(text: str, prefix: str | None) -> str:
     """
     if prefix is None:
         return text
+    _valid(prefix)
+    return _ADDRESS.sub(lambda _: prefix, text)
+
+
+def unprefixed(uri: str, prefix: str | None = None) -> str:
+    """``uri`` less ``prefix``, the inverse of ``prefixed`` for one address.
+
+    ``uri`` is returned without ``prefix`` when it starts with ``prefix`` and a scheme
+    the plugins serve, and ``uri`` itself otherwise, or when ``prefix`` is None. It is
+    one address, not text, and it resolves no dot segment. A prefix that is not valid is
+    a ``ValueError``.
+    """
+    if prefix is None:
+        return uri
+    _valid(prefix)
+    if uri.startswith(prefix) and uri[len(prefix) :].startswith(
+        tuple(f"{scheme}://" for scheme in SCHEMES)
+    ):
+        return uri[len(prefix) :]
+    return uri
+
+
+def _valid(prefix: str) -> str:
+    """``prefix``, or a ``ValueError`` when it is not a valid one (GW-3)."""
     if not _PREFIX.fullmatch(prefix):
         raise ValueError(
             f"{prefix[:64]!r} is not a valid prefix: {_INPUTS['Resource-Prefix'].rule}"
         )
-    return _ADDRESS.sub(lambda _: prefix, text)
+    return prefix
 
 
 def prefix() -> str | None:
@@ -51,17 +75,17 @@ def prefix() -> str | None:
 
 # An address of a served scheme, with or without a prefix before it.
 _SERVED = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*\+)?(skill|prompts|agents)://")
-# The methods besides resources/read that name a plugin address, matched as sent.
-_AS_SENT = ("skills/get", "resources/directory/read")
+# The methods besides resources/read that name a plugin address.
+_EXTENSION_METHODS = ("skills/get", "resources/directory/read")
 
 
-def _plain(uri: str, prefix: str | None, *, dots: bool) -> str:
+def _plain(uri: str, prefix: str | None) -> str:
     """The address the providers are asked for ``uri``, by GW-4's steps.
 
     An address of another scheme, of another prefix, or prefixed on a request with
     none, is ``uri`` as sent. One that resolves to nothing is ``<scheme>://%2F``, an
-    address no provider serves. ``dots`` resolves dot segments in the path, keeping a
-    query or fragment as sent.
+    address no provider serves. Dot segments are resolved in the path, keeping a query
+    or fragment as sent.
     """
     served = _SERVED.match(uri)
     if served is None:
@@ -70,11 +94,8 @@ def _plain(uri: str, prefix: str | None, *, dots: bool) -> str:
     nowhere = f"{scheme}%2F"
     if "%2f" in uri.lower():
         return nowhere
-    if prefix and uri.startswith(prefix + scheme):
-        uri = uri[len(prefix) :]
-    elif not uri.startswith(scheme):
-        return uri
-    if not dots:
+    uri = unprefixed(uri, prefix)
+    if not uri.startswith(scheme):
         return uri
     rest = uri[len(scheme) :]
     # The path ends at the first "?" or "#": what follows is kept as sent.
@@ -122,14 +143,14 @@ class _TakeThePrefix(Middleware):
 
     async def on_read_resource(self, context: Any, call_next: Any) -> Any:
         sent = str(context.message.uri)
-        passed = _plain(sent, prefix(), dots=True)
+        passed = _plain(sent, prefix())
         if passed == sent:
             return await call_next(context)
         message = context.message.model_copy(update={"uri": passed})
         return await self._ask(context.copy(message=message), call_next, passed, sent)
 
     async def on_request(self, context: Any, call_next: Any) -> Any:
-        if context.method not in _AS_SENT:
+        if context.method not in _EXTENSION_METHODS:
             return await call_next(context)
         # FastMCP hands an extension method its raw params as a dict, and folds back
         # only a Mapping.
@@ -137,7 +158,7 @@ class _TakeThePrefix(Middleware):
         sent = message.get("uri") if isinstance(message, Mapping) else None
         if not isinstance(sent, str):
             return await call_next(context)
-        passed = _plain(sent, prefix(), dots=False)
+        passed = _plain(sent, prefix())
         if passed == sent:
             return await call_next(context)
         message = {**message, "uri": passed}

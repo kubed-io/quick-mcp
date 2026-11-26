@@ -478,14 +478,21 @@ async def test_pages_join_to_the_whole_folder(tmp_path, monkeypatch):
     assert len(index) == 5
 
 
-async def test_the_method_matches_the_uri_as_sent_while_a_read_normalises():
+async def test_a_dotted_folder_lists_as_its_index_reads():  # SKL-16
     dotted = f"{ROOT}/x/../references"
     async with Client(demo().server) as client:
-        with pytest.raises(MCPError) as caught:
-            await read_directory(client, uri=dotted)
+        listed = await read_directory(client, uri=dotted)
         index = await read_json(client, f"{dotted}/_index.json")
-    assert caught.value.error.code == INVALID_PARAMS
+    assert [r["uri"] for r in listed["resources"]] == REFERENCE_URIS
     assert [r["uri"] for r in index] == REFERENCE_URIS
+
+
+async def test_a_dotted_folder_pages_as_the_plain_one():  # Review Focus 4
+    async with Client(demo().server) as client:
+        plain = await read_directory(client, uri=ROOT, cursor="1")
+        dotted = await read_directory(client, uri=f"{REFERENCES}/..", cursor="1")
+    assert plain["resources"]
+    assert dotted == plain
 
 
 # ---- a folder serves no content -------------------------------------------------------
