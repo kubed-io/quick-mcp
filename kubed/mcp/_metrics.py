@@ -16,6 +16,7 @@ resource whose URI also matches a template is labelled by that template.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -75,20 +76,34 @@ class _Labelled:
         return getattr(histogram, name)
 
 
+def _takes_the_reads(record: Any) -> bool:
+    """Whether ``record`` is callable as ``on_read_resource`` calls it."""
+    if not callable(record):
+        return False
+    try:
+        inspect.signature(record).bind(
+            None, None, None, method="", name_attribute="", name=""
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class _CallMetrics(UsageMiddleware):
     """FastMCP's call metrics, with ``resources/read`` recorded too.
 
     It uses two private names of FastMCP's UsageMiddleware, ``_record`` and
-    ``_duration``. Without them it logs one warning and reads pass straight through:
-    tools and prompts are still recorded.
+    ``_duration``. Without them, or with a ``_record`` that no longer takes the keywords
+    the reads pass, it logs one warning and reads pass straight through: tools and
+    prompts are still recorded.
     """
 
     def __init__(self, **options: Any) -> None:
         super().__init__(**options)
         duration = getattr(self, "_duration", None)
-        self._reads = callable(getattr(UsageMiddleware, "_record", None)) and callable(
-            getattr(duration, "record", None)
-        )
+        self._reads = _takes_the_reads(
+            getattr(UsageMiddleware, "_record", None)
+        ) and callable(getattr(duration, "record", None))
         if self._reads:
             self._duration = _Labelled(duration)
         else:

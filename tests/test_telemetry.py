@@ -8,6 +8,7 @@ import http.client
 import http.server
 import importlib
 import inspect
+import io
 import json
 import logging
 import logging.handlers
@@ -1444,6 +1445,28 @@ def test_remove_after_another_factory_leaves_it_and_goes_quiet(traced) -> None:
         logging.setLogRecordFactory(before)
 
 
+class Special(logging.LogRecord):
+    """A record class some other library makes."""
+
+
+def test_a_record_of_another_class_is_left_alone(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(Special)
+    text = _TraceText()
+    text.install()
+    try:
+        with provider.get_tracer("t").start_as_current_span("special"):
+            record = logging.getLogger("tests").makeRecord(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+        assert type(record) is Special
+        assert record.getMessage() == "m"
+    finally:
+        text.remove()
+        logging.setLogRecordFactory(before)
+
+
 async def test_otel_off_installs_no_factory(traced) -> None:
     provider, _ = traced
     before = logging.getLogRecordFactory()
@@ -2086,6 +2109,47 @@ async def test_a_plugin_skill_read_under_a_prefix_is_labelled_without_it(
     ]
 
 
+@pytest.mark.parametrize("uri", ["prompts://lib/ask.md", "agents://lib/scout.md"])
+async def test_a_plugin_file_read_under_a_prefix_is_labelled_without_it(
+    metered, tmp_path, uri
+) -> None:
+    name = f"kit-files-{uri.partition(':')[0]}"
+    mcp = QuickMCP(
+        name, header_prefix="Kb", config={"telemetry": TelemetrySettings(otel=True)}
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
+        await client.read_resource(f"kb+{uri}")
+    assert reads(duration_points(metered, name)) == [(uri, 1)]
+
+
+async def test_a_read_through_the_tool_is_a_call_and_a_read(metered, tmp_path) -> None:
+    from kubed.mcp import DeliverySettings
+
+    mcp = QuickMCP(
+        "tool-reads",
+        config={
+            "telemetry": TelemetrySettings(otel=True),
+            "delivery": DeliverySettings(resources="off"),
+        },
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+
+    @mcp.resource("data://items/{id}")
+    def item(id: str) -> str:
+        return id
+
+    async with Client(mcp.server) as client:
+        assert "read_resource" in {tool.name for tool in await client.list_tools()}
+        await client.call_tool("read_resource", {"uri": "data://items/1"})
+    points = duration_points(metered, "tool-reads")
+    assert sorted(
+        (p.attributes["mcp.method.name"], p.attributes.get("gen_ai.tool.name"))
+        for p in points
+    ) == [("resources/read", None), ("tools/call", "read_resource")]
+    assert reads(points) == [("data://items/{id}", 1)]
+
+
 async def test_overlapping_reads_keep_their_own_templates(metered) -> None:
     mcp = resourced("overlap")
 
@@ -2126,6 +2190,10 @@ def test_usage_middleware_still_has_what_the_reads_use() -> None:
     from kubed.mcp._metrics import _CallMetrics, _Labelled
 
     assert callable(getattr(UsageMiddleware, "_record", None))
+    # The reads call it by these keywords: a rename or a positional one would raise.
+    inspect.signature(UsageMiddleware._record).bind(
+        None, None, None, method="", name_attribute="", name=""
+    )
     assert isinstance(_CallMetrics(user_id="omit")._duration, _Labelled)
 
 
@@ -2185,7 +2253,18 @@ def _without_duration(monkeypatch) -> None:
     monkeypatch.setattr(UsageMiddleware, "__init__", init)
 
 
-@pytest.mark.parametrize("change", [_without_record, _without_duration])
+def _with_another_record(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    async def record(self, context, call_next, *, method, attribute, label):
+        return await call_next(context)
+
+    monkeypatch.setattr(UsageMiddleware, "_record", record)
+
+
+@pytest.mark.parametrize(
+    "change", [_without_record, _without_duration, _with_another_record]
+)
 async def test_a_changed_usage_middleware_is_one_warning_and_reads_pass_through(
     change, monkeypatch, caplog
 ) -> None:
@@ -2508,6 +2587,68 @@ def test_an_ambiguous_userinfo_is_never_probed(monkeypatch, caplog, address) -> 
         assert_safe(caplog.records, secret)
 
 
+class Body(io.BytesIO):
+    """An error's response body that can fail to close."""
+
+    fail = False
+
+    def close(self) -> None:
+        super().close()
+        if self.fail:
+            raise OSError("s3cret")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_an_http_error_s_response_is_closed(
+    monkeypatch, no_proxies, caplog, fail
+) -> None:
+    body = Body()
+    body.fail = fail
+    # Held here, so the error's own finaliser can't be what closes it.
+    raised: list[urllib.error.HTTPError] = []
+
+    def answer(*args, **kwargs):
+        raised.append(urllib.error.HTTPError("http://h/ready", 503, "no", {}, body))
+        raise raised[-1]
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", answer)
+    _Probe("http://127.0.0.1:1", timeout=1).check()
+    assert body.closed
+    assert probe_lines(caplog)[0][1].endswith("unreachable: server error (HTTP 503)")
+    assert_safe(caplog.records, "s3cret")
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["http://u:p@host:4040/t@evil.example", "http://u:p@host:4040\\t@evil.example"],
+)
+def test_a_userinfo_with_a_slash_is_never_probed(
+    monkeypatch, no_proxies, caplog, address
+) -> None:
+    # The agent ends an http host at the first / or \, so the credentials would go
+    # elsewhere.
+    opened: list[object] = []
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **kw: opened.append(a)
+    )
+    _Probe(address, timeout=1).check()
+    assert opened == []
+    ((_, line),) = probe_lines(caplog)
+    assert line.endswith("unreachable: invalid address")
+    assert_safe(caplog.records, "u:p")
+
+
+def test_an_empty_userinfo_sends_no_authorization(stub, no_proxies, caplog) -> None:
+    _Probe(f"http://@127.0.0.1:{stub.port}", timeout=1).check()
+    assert stub.seen == [("/ready", None)]
+    assert probe_lines(caplog) == []
+
+
+def test_an_unknown_scheme_is_an_invalid_address(no_proxies, caplog) -> None:
+    _Probe("htp://127.0.0.1:1", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: invalid address")
+
+
 def test_a_port_that_is_not_a_number_is_an_invalid_address(no_proxies, caplog) -> None:
     _Probe("http://127.0.0.1:abc", timeout=1).check()
     assert probe_lines(caplog)[0][1].endswith("unreachable: invalid address")
@@ -2526,9 +2667,28 @@ def test_a_started_probe_is_stopped_when_the_start_then_fails(
         raise RuntimeError("s3cret")
 
     monkeypatch.setattr(kubed.mcp.telemetry, "_start_probe", lambda address: Fake())
-    monkeypatch.setattr(kubed.mcp.telemetry, "_start_otel", fail)
+    monkeypatch.setattr(kubed.mcp.telemetry, "_Signals", fail)
     assert _start_signals("t", TelemetrySettings(profiles=ADDRESS)) is None
     assert stopped == ["probe"]
+
+
+def test_the_probe_starts_after_otel(monkeypatch, pyroscope) -> None:
+    # So an OTLP log handler is attached before the probe's first warning.
+    started: list[str] = []
+
+    def otel(*args, **kwargs):
+        started.append("otel")
+
+    def probe(address):
+        started.append("probe")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_otel", otel)
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_probe", probe)
+    signals = _start_signals("t", TelemetrySettings(profiles=ADDRESS))
+    try:
+        assert started == ["otel", "probe"]
+    finally:
+        signals.stop()
 
 
 @pytest.mark.parametrize(
@@ -2543,6 +2703,7 @@ def test_a_started_probe_is_stopped_when_the_start_then_fails(
         (http.client.InvalidURL(), "invalid address"),
         (http.client.BadStatusLine(""), "connection error"),
         (urllib.error.URLError(socket.gaierror()), "DNS"),
+        (urllib.error.URLError("unknown url type: htp"), "invalid address"),
         (KeyError(), "KeyError"),
     ],
 )

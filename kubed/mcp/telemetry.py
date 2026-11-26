@@ -136,11 +136,12 @@ def _start_signals(name: str, settings: TelemetrySettings | None) -> _Signals | 
         if _running is not None or settings is None:
             return None
         profiles = _start_profiles(name, settings)
+        otel = _start_otel(name, settings, profiles)
         probe = None
         try:
+            # After OpenTelemetry, so its log handler sees the probe's first warning.
             if profiles is not None and settings.profiles:
                 probe = _start_probe(settings.profiles.get_secret_value())
-            otel = _start_otel(name, settings, profiles)
             if profiles is None and otel is None:
                 return None
             _running = _Signals(profiles, otel, probe)
@@ -334,9 +335,12 @@ def _ready(address: str) -> tuple[str, str | None]:
     """The URL to probe and the ``Authorization`` header to send, or ``None`` for none.
 
     An address without ``://`` gets ``http://``. Userinfo is split as ``_where`` splits
-    it and sent as Basic auth. An address that can't be split that way raises
-    ``ValueError``, so nothing is probed. The URL is the host and port, the path without
-    trailing slashes, then ``/ready``: the query and fragment are dropped.
+    it and sent as Basic auth; an empty one sends none. An address that can't be split
+    that way raises ``ValueError``, so nothing is probed. So does a userinfo holding a
+    ``/`` or ``\\``: the agent ends an http host at the first of either, so it would
+    send the credentials to the host after the last ``@``. The URL is the host and port,
+    the path without trailing slashes, then ``/ready``: the query and fragment are
+    dropped.
     """
     scheme, _, rest = (
         address.partition("://") if "://" in address else ("http", "", address)
@@ -345,10 +349,12 @@ def _ready(address: str) -> tuple[str, str | None]:
     if split is None:
         raise ValueError("ambiguous userinfo")
     userinfo, rest = split
+    if userinfo is not None and ("/" in userinfo or "\\" in userinfo):
+        raise ValueError("ambiguous userinfo")
     rest = re.split(r"[?#]", rest, maxsplit=1)[0]
     authority, slash, path = rest.partition("/")
     url = f"{scheme}://{authority}{(slash + path).rstrip('/')}/ready"
-    if userinfo is None:
+    if not userinfo:
         return url, None
     from base64 import b64encode
 
@@ -371,8 +377,11 @@ def _kind(error: BaseException) -> str:
         if 500 <= code < 600:
             return f"server error (HTTP {code})"
         return ""
-    if isinstance(error, URLError) and isinstance(error.reason, Exception):
-        return _kind(error.reason)
+    if isinstance(error, URLError):
+        # A reason that is not an exception is urllib's own, such as an unknown scheme.
+        if isinstance(error.reason, Exception):
+            return _kind(error.reason)
+        return "invalid address"
     if isinstance(error, ConnectionRefusedError):
         return "connection refused"
     if isinstance(error, socket.gaierror):
@@ -411,8 +420,20 @@ def _outcome(address: str, timeout: float) -> str | None:
         with opener.open(request, timeout=timeout):
             pass
     except Exception as error:  # noqa: BLE001  # TEL-6: classified by type only, never its text
+        _close(error)
         return _kind(error) or None
     return None
+
+
+def _close(error: BaseException) -> None:
+    """Close the response an ``HTTPError`` holds, freeing its socket. Never raises."""
+    from urllib.error import HTTPError
+
+    try:
+        if isinstance(error, HTTPError):
+            error.close()
+    except Exception:  # noqa: BLE001  # a close that fails changes no outcome
+        pass
 
 
 class _Probe:

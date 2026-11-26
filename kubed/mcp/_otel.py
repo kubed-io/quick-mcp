@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from types import ModuleType
 from urllib.parse import quote
@@ -246,7 +246,7 @@ class _TraceText:
     """
 
     def __init__(self) -> None:
-        self._previous: object = logging.LogRecord
+        self._previous: Callable[..., logging.LogRecord] = logging.LogRecord
         self._quiet = False
         # Stored once, so "still ours" is an identity check.
         self._factory = self._make
