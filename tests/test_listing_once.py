@@ -28,7 +28,8 @@ async def build(mcp):
     return (await mcp._plugins.pinned()).build
 
 
-async def test_listing_builds_no_row(monkeypatch):
+@pytest.mark.parametrize("rewritten", [False, True])
+async def test_listing_builds_no_row(monkeypatch, rewritten):
     made = []
     plain = skills._file_resource
 
@@ -38,8 +39,11 @@ async def test_listing_builds_no_row(monkeypatch):
 
     monkeypatch.setattr(skills, "_file_resource", counted)
     mcp = served((DEMO, None))
+    if rewritten:
+        mcp.add_rewriter(lambda site, text: text + "\n<!-- r -->\n")
     for _ in range(3):
         assert (await listed(mcp))[2] == [ENTRY]
+    assert (await build(mcp)).rewritten is rewritten
     assert made == ["SKILL.md"]  # once, with the build, not once per listing
 
 
@@ -117,6 +121,7 @@ async def test_each_prefix_lists_its_own_rows(tmp_path):
         assert [r["description"] for r in await skill_rows(kb)] == [
             about.replace("skill://", "kb+skill://")
         ]
+        assert [r["description"] for r in await skill_rows(plain)] == [about]
     assert len(mcp._plugins._memo.builds) == 2
 
 

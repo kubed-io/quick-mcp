@@ -49,7 +49,7 @@ from fastmcp.skills.provider import (
     SkillCatalogProvider,
     SkillFileResource,
     SkillManifestProvider,
-    # FastMCP 4.2.6's private row builder, imported so that a row is exactly FastMCP's.
+    # FastMCP 4.2's private row builder, imported so that a row is exactly FastMCP's.
     _file_resource,
 )
 from fastmcp.utilities.versions import VersionSpec
