@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
 ### Added
 
 - **Config sections:** declare pydantic sections with `@config("key")`, register them with `QuickMCP(sections=...)`, inject each with `Inject[Section]`, and write the whole config's JSON Schema with `config_schema()`.
