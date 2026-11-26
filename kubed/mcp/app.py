@@ -6,6 +6,7 @@ for what this class does not cover.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import os
@@ -98,7 +99,9 @@ def _signed_as(
 
 _BOOT = logging.getLogger("kubed.mcp.config")
 
-_AUTH_FIXED = "auth is fixed once serving starts: set mcp.auth before run()"
+_AUTH_FIXED = (
+    "auth is fixed once serving starts: set mcp.auth before run() or http_app()"
+)
 
 
 def _with_teardown(
@@ -319,9 +322,21 @@ class QuickMCP:
         # by their index: the built-ins first, then the server's, in order.
         for component, section in parts:
             component.register(self, section)
+        # FastMCP reads auth when it builds the HTTP app, and its own HTTP run builds
+        # it through this method: from then on auth is fixed. The instance's method is
+        # wrapped, so QuickMCP still never subclasses FastMCP (APP-2).
+        build = self.server.http_app
+
+        @functools.wraps(build)
+        def http_app(*args: Any, **kwargs: Any) -> Any:
+            self._serving_starts()
+            return build(*args, **kwargs)
+
+        self.server.http_app = http_app  # type: ignore[method-assign]
 
     def _serving_starts(self) -> None:
-        """Serving has started: ``run()`` was called, or the lifespan entered."""
+        """Serving has started: ``run()`` was called, the HTTP app built
+        (``mcp.server.http_app()``), or the lifespan entered."""
         self._serving = True
 
     @property
@@ -330,7 +345,8 @@ class QuickMCP:
 
         Set it before serving starts, from the server's build code or a component's
         ``register``: FastMCP reads it when it builds the HTTP app. Once ``run()`` is
-        called or the lifespan entered, setting it raises ``RuntimeError``.
+        called, the HTTP app built (``mcp.server.http_app()``) or the lifespan
+        entered, setting it raises ``RuntimeError``.
         """
         return self.server.auth
 

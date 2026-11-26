@@ -655,6 +655,35 @@ def test_auth_is_fixed_once_run_is_called(ran) -> None:
         mcp.auth = Refuse()
 
 
+def test_auth_is_fixed_once_the_http_app_is_built() -> None:
+    mcp = QuickMCP("t", environ={})
+    mcp.server.http_app()
+    with pytest.raises(RuntimeError, match=r"auth is fixed once serving starts"):
+        mcp.auth = Refuse()
+    assert mcp.auth is None
+
+
+async def test_auth_is_fixed_once_fastmcps_own_http_run_builds_the_app(
+    monkeypatch,
+) -> None:
+    import uvicorn
+
+    async def serve(self, *args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(uvicorn.Server, "serve", serve)
+    mcp = QuickMCP("t", environ={})
+    await mcp.server.run_http_async(show_banner=False)
+    with pytest.raises(RuntimeError, match=r"auth is fixed once serving starts"):
+        mcp.auth = Refuse()
+
+
+def test_building_the_http_app_still_builds_fastmcps() -> None:
+    mcp = QuickMCP("t", environ={})
+    app = mcp.server.http_app(path="/elsewhere")
+    assert any(getattr(r, "path", None) == "/elsewhere" for r in app.routes)
+
+
 async def test_auth_is_fixed_inside_the_lifespan() -> None:
     mcp = QuickMCP("t", environ={})
     async with Client(mcp.server):
