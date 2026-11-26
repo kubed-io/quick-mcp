@@ -1750,14 +1750,26 @@ class LoadedConfig:
 
     Made by ``load_config()``, never directly, and passed to ``QuickMCP(name,
     loaded=...)``. ``config`` is the validated config and ``sources`` says where each
-    of its values came from, by dotted path. Both are read-only.
+    of its values came from, by dotted path. Both are read-only. It builds one server:
+    a second ``QuickMCP(loaded=...)`` given the same one raises ``TypeError``, as the
+    two would share its component instances.
     """
 
-    __slots__ = ("_components", "_loaded")
+    __slots__ = ("_built", "_components", "_loaded")
 
     def __init__(self, loaded: _Loaded, components: tuple[Component, ...]) -> None:
         self._loaded = loaded
         self._components = components
+        self._built = False
+
+    def _claim(self) -> None:
+        """Marks this load as building a server, or raises if it already built one."""
+        if self._built:
+            raise TypeError(
+                "loaded= builds one server, and this one already built a server: "
+                "call load_config() again for another"
+            )
+        self._built = True
 
     @property
     def config(self) -> Config:

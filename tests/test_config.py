@@ -988,7 +988,7 @@ def test_sections_must_be_an_iterable() -> None:
     with pytest.raises(
         TypeError, match=r"sections= takes an iterable of section classes"
     ):
-        QuickMCP("t", sections=None, environ={})  # type: ignore[arg-type]
+        QuickMCP("t", sections=5, environ={})  # type: ignore[arg-type]
     with pytest.raises(TypeError, match=r"sections= takes an iterable"):
         _compose([None])  # type: ignore[list-item]
 
