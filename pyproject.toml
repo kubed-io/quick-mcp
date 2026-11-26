@@ -28,6 +28,8 @@ dependencies = [
   "fastmcp>=4.2,<5",
   # The plugin layer reads command and agent frontmatter itself.
   "pyyaml>=6,<7",
+  # The config's sections and its schema are pydantic models.
+  "pydantic>=2.12,<3",
 ]
 
 [project.optional-dependencies]
@@ -100,6 +102,7 @@ markers = [
   "unit: mark a test as a unit test",
   "integration: mark a test as an integration test",
   "real_initialize: let the test run OpenTelemetry's real initialize() in-process",
+  "probe: let the test start the real Pyroscope probe",
 ]
 
 [tool.ruff]

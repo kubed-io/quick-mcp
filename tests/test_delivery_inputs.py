@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-from types import SimpleNamespace
 
 import pytest
 from fastmcp import Client, Context
 from gateway_server import over_http
 
-from kubed.mcp import Middleware, QuickMCP
+from kubed.mcp import DeliverySettings, Middleware, QuickMCP
 from kubed.mcp import request as request_module
 from kubed.mcp.delivery import _resolved
 
@@ -31,7 +30,9 @@ def snapshot() -> dict:
 
 def server(delivery=None, header_prefix=None) -> QuickMCP:
     mcp = QuickMCP(
-        "t", config=SimpleNamespace(delivery=delivery), header_prefix=header_prefix
+        "t",
+        config={} if delivery is None else {"delivery": delivery},
+        header_prefix=header_prefix,
     )
 
     @mcp.tool
@@ -50,8 +51,11 @@ def server(delivery=None, header_prefix=None) -> QuickMCP:
     return mcp
 
 
-def config(resources=None, listed=None):
-    return SimpleNamespace(resources=resources, listed=listed, via=None)
+def config(resources=None, listed=None, via=None) -> DeliverySettings:
+    """The config's delivery: a list for ``listed`` is joined with ``,``."""
+    if listed is not None and not isinstance(listed, str):
+        listed = ",".join(listed)
+    return DeliverySettings(resources=resources, listed=listed, via=via)
 
 
 async def seen(client: Client) -> dict:

@@ -26,6 +26,7 @@ from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 from mcp_types import Implementation
 
+from kubed.mcp._builtins import DeliverySettings
 from kubed.mcp.request import (
     Values,
     _warn_once,
@@ -79,7 +80,8 @@ BinaryPointer = Callable[[str], str | None]
 
 
 class Delivery(Protocol):
-    """The defaults a config may give the inputs (DLV-4): None is the built-in one."""
+    """A partial set of defaults, as ``delivery_default`` answers (DLV-14): None
+    leaves an input to the next level."""
 
     @property
     def resources(self) -> str | None: ...
@@ -296,7 +298,7 @@ def _raw(entry: _Input, value: object) -> str | None:
     return None
 
 
-def _config_level(entry: _Input, delivery: object | None) -> Level | None:
+def _config_level(entry: _Input, delivery: DeliverySettings | None) -> Level | None:
     """The level for what the config gives ``entry``, checked now, once.
 
     A value the input does not take is warned here, naming the attribute, and gives no
@@ -449,7 +451,9 @@ class _Resolver:
     """Walks each input's levels, in order, for one request."""
 
     def __init__(
-        self, header_prefix: str | None = None, delivery: object | None = None
+        self,
+        header_prefix: str | None = None,
+        delivery: DeliverySettings | None = None,
     ) -> None:
         self.header_prefix = header_prefix
         self.default: DeliveryDefault | None = None

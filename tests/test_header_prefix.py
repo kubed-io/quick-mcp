@@ -29,9 +29,7 @@ def norm(key, value):
 
 
 @pytest.mark.parametrize(("name", "query", "a", "b", "key"), INPUTS)
-async def test_the_servers_name_beats_the_alias_beats_the_query(
-    name, query, a, b, key
-):
+async def test_the_servers_name_beats_the_alias_beats_the_query(name, query, a, b, key):
     async with over_http(
         server(header_prefix="Kb"),
         headers={f"Kb-{name}": a, f"X-MCP-{name}": b},

@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
 
 import pytest
 from fastmcp import Client
 from gateway_server import over_http
 from plugin_server import ENTRY, copy
 from skill_server import load_skill, make_skill, request
-from test_delivery_inputs import seen, server, warnings
+from test_delivery_inputs import config, seen, server, warnings
 
 from kubed.mcp import QuickMCP, skills
 
@@ -28,14 +27,12 @@ AGENT_FILE = "agents://t/helper.md"
 PLUGIN_SCHEMES = ("skill://t/", "prompts://", "agents://")
 
 
-def config(resources=None, listed=None, via=None):
-    return SimpleNamespace(resources=resources, listed=listed, via=via)
-
-
 def make(tmp_path, delivery=None, header_prefix=None) -> QuickMCP:
     """The demo plugin, beside a prompt, a resource and a catalogue of the server's own."""
     mcp = QuickMCP(
-        "t", config=SimpleNamespace(delivery=delivery), header_prefix=header_prefix
+        "t",
+        config={} if delivery is None else {"delivery": delivery},
+        header_prefix=header_prefix,
     )
     mcp.add_plugin(copy(tmp_path))
 
