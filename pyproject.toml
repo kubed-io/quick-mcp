@@ -102,6 +102,7 @@ markers = [
   "unit: mark a test as a unit test",
   "integration: mark a test as an integration test",
   "real_initialize: let the test run OpenTelemetry's real initialize() in-process",
+  "probe: let the test start the real Pyroscope probe",
 ]
 
 [tool.ruff]

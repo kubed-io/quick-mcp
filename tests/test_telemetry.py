@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import http.client
+import http.server
 import importlib
 import inspect
 import json
@@ -12,11 +15,14 @@ import os
 import queue
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +38,7 @@ from kubed.mcp._builtins import _TelemetryComponent
 from kubed.mcp._otel import _TraceText
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
+from kubed.mcp.telemetry import _kind, _Probe, _start_signals
 
 ADDRESS = "http://pyroscope.example.com:4040"
 CHILD = Path(__file__).with_name("otel_child.py")
@@ -241,6 +248,7 @@ async def test_profiles_start_before_the_lifespan_and_stop_before_the_container(
             "cpu_enabled": True,
             "mem_enabled": True,
             "tags": {},
+            "upload_interval": 10,
         }
     ]
     assert EVENTS[:2] == ["profiles started", "lifespan up"]
@@ -554,6 +562,7 @@ async def test_every_keyword_passed_is_one_configure_takes(request) -> None:
         "cpu_enabled",
         "mem_enabled",
         "tags",
+        "upload_interval",
     }
 
 
@@ -2013,3 +2022,284 @@ async def test_profiles_that_fail_to_start_are_not_named(monkeypatch, caplog) ->
         ):
             pass
     assert start_lines(caplog) == ["telemetry: off"]
+
+
+# -- the probe (TEL-19) -------------------------------------------------------
+
+
+class _Stub(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    status = 200
+    delay = 0.0
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str | None]] = []
+        super().__init__(("127.0.0.1", 0), _StubHandler)
+
+    @property
+    def port(self) -> int:
+        return self.server_address[1]
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.server.seen.append((self.path, self.headers.get("Authorization")))
+        time.sleep(self.server.delay)
+        self.send_response(self.server.status)
+        if 300 <= self.server.status < 400:
+            self.send_header("Location", "/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+
+@pytest.fixture
+def stub() -> Iterator[_Stub]:
+    server = _Stub()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+@pytest.fixture
+def refused() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def no_proxies(monkeypatch, caplog) -> None:
+    """No proxy variable, so a probe of localhost goes direct; the probe's lines are kept."""
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+
+
+def probe_lines(caplog) -> list[tuple[int, str]]:
+    return [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.name == "kubed.mcp.telemetry" and "pyroscope at" in r.getMessage()
+    ]
+
+
+def probe_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "pyroscope-probe"]
+
+
+def test_a_pyroscope_down_at_boot_is_one_warning_in_the_first_interval(
+    refused, no_proxies, caplog
+) -> None:
+    probe = _Probe(f"http://127.0.0.1:{refused}", interval=0.05, timeout=1)
+    probe.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not probe_lines(caplog) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)  # several more intervals
+    finally:
+        probe.stop()
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at 127.0.0.1:{refused} unreachable: connection refused",
+        )
+    ]
+    assert probe_threads() == []
+
+
+def test_down_then_up_is_one_warning_then_one_info(stub, no_proxies, caplog) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", timeout=1)
+    stub.status = 503
+    probe.check()
+    probe.check()
+    stub.status = 200
+    probe.check()
+    probe.check()
+    host = f"127.0.0.1:{stub.port}"
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at {host} unreachable: server error (HTTP 503)",
+        ),
+        (logging.INFO, f"profiles: pyroscope at {host} reachable again"),
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refused_login_is_an_auth_warning(stub, no_proxies, caplog, status) -> None:
+    stub.status = status
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith(f"unreachable: auth (HTTP {status})")
+
+
+def test_a_404_is_reachable(stub, no_proxies, caplog) -> None:
+    stub.status = 404
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog) == []
+
+
+def test_a_redirect_is_reachable_and_not_followed(stub, no_proxies, caplog) -> None:
+    stub.status = 302
+    _Probe(f"http://u:s3cret@127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog) == []
+    assert [path for path, _ in stub.seen] == ["/ready"]
+
+
+def test_a_timeout_is_its_own_kind(stub, no_proxies, caplog) -> None:
+    stub.delay = 1
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=0.2).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: timeout")
+
+
+def test_the_probe_sends_basic_auth_and_shows_none_of_it(
+    stub, no_proxies, caplog
+) -> None:
+    stub.status = 401
+    address = f"http://us%40er:s3cret@127.0.0.1:{stub.port}/base/?token=t0ken"
+    _Probe(address, timeout=1).check()
+    sent = "Basic " + base64.b64encode(b"us@er:s3cret").decode()
+    assert stub.seen == [("/base/ready", sent)]
+    for secret in ("s3cret", "us@er", "us%40er", "t0ken", "base"):
+        assert_safe(caplog.records, secret)
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at 127.0.0.1:{stub.port} unreachable: auth (HTTP 401)",
+        )
+    ]
+
+
+def test_a_probe_that_fails_oddly_never_raises(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("https://u:s3cret@x")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", boom)
+    _Probe("http://127.0.0.1:1", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: RuntimeError")
+    assert_safe(caplog.records, "s3cret")
+
+
+def test_stop_ends_the_thread_within_the_timeout(stub, no_proxies) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", interval=60, timeout=1)
+    probe.start()
+    started = time.monotonic()
+    probe.stop()
+    assert time.monotonic() - started < 1.5
+    assert probe_threads() == []
+
+
+@pytest.mark.probe
+def test_profiles_start_the_probe_on_the_push_interval_and_stop_ends_it(
+    pyroscope, stub, no_proxies
+) -> None:
+    signals = _start_signals(
+        "t", TelemetrySettings(profiles=f"http://127.0.0.1:{stub.port}")
+    )
+    try:
+        (thread,) = probe_threads()
+        assert thread.daemon
+        assert pyroscope[0]["upload_interval"] == 10
+    finally:
+        signals.stop()
+    assert not thread.is_alive()
+
+
+@pytest.mark.probe
+def test_profiles_off_start_no_probe(monkeypatch, refused) -> None:
+    assert _start_signals("t", TelemetrySettings()) is None
+    assert probe_threads() == []
+    monkeypatch.setitem(sys.modules, "pyroscope", None)  # not installed
+    assert (
+        _start_signals("t", TelemetrySettings(profiles=f"http://127.0.0.1:{refused}"))
+        is None
+    )
+    assert probe_threads() == []
+
+
+@pytest.mark.parametrize(
+    "address", ["http://tok?en@host:4040", "http://u:p@host/?e=a@b"]
+)
+def test_an_ambiguous_userinfo_is_never_probed(monkeypatch, caplog, address) -> None:
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+    opened: list[object] = []
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **kw: opened.append(a)
+    )
+    _Probe(address, timeout=1).check()
+    assert opened == []
+    assert [m for _, m in probe_lines(caplog)] == [
+        "profiles: pyroscope at an address with no host unreachable: invalid address"
+    ]
+    for secret in ("tok", "en", "u:p", "a@b", "e=a"):
+        assert_safe(caplog.records, secret)
+
+
+def test_a_port_that_is_not_a_number_is_an_invalid_address(no_proxies, caplog) -> None:
+    _Probe("http://127.0.0.1:abc", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: invalid address")
+
+
+def test_a_started_probe_is_stopped_when_the_start_then_fails(
+    monkeypatch, pyroscope
+) -> None:
+    stopped: list[str] = []
+
+    class Fake:
+        def stop(self) -> None:
+            stopped.append("probe")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("s3cret")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_probe", lambda address: Fake())
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_otel", fail)
+    assert _start_signals("t", TelemetrySettings(profiles=ADDRESS)) is None
+    assert stopped == ["probe"]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (ConnectionRefusedError(), "connection refused"),
+        (socket.gaierror(), "DNS"),
+        (ssl.SSLCertVerificationError(), "TLS"),
+        (TimeoutError(), "timeout"),
+        (OSError(), "connection error"),
+        (ValueError(), "invalid address"),
+        (http.client.InvalidURL(), "invalid address"),
+        (http.client.BadStatusLine(""), "connection error"),
+        (urllib.error.URLError(socket.gaierror()), "DNS"),
+        (KeyError(), "KeyError"),
+    ],
+)
+def test_the_kind_of_a_failure(error, kind) -> None:
+    assert _kind(error) == kind
+
+
+def test_an_address_without_a_scheme_is_probed_over_http(
+    stub, no_proxies, caplog
+) -> None:
+    _Probe(f"127.0.0.1:{stub.port}", timeout=1).check()
+    assert [p for p, _ in stub.seen] == ["/ready"]
+    assert probe_lines(caplog) == []
+
+
+def test_fail_recover_fail_warns_twice(stub, no_proxies, caplog) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", timeout=1)
+    for status in (503, 200, 503):
+        stub.status = status
+        probe.check()
+    assert [level for level, _ in probe_lines(caplog)] == [
+        logging.WARNING,
+        logging.INFO,
+        logging.WARNING,
+    ]
