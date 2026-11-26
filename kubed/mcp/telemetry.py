@@ -6,11 +6,14 @@ imported until then. The ``telemetry`` extra installs what the signals use.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 from collections.abc import Mapping
 from types import ModuleType
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
@@ -20,6 +23,8 @@ if TYPE_CHECKING:
     from fastmcp.server.middleware import Middleware
 
 log = logging.getLogger(__name__)
+
+_HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
 
 
 @config("telemetry")
@@ -223,3 +228,66 @@ def _call_metrics(settings: TelemetrySettings | None) -> Middleware | None:
             type(error).__name__,
         )
         return None
+
+
+def _where(address: str) -> str:
+    """The host a Pyroscope address names, with its port: never userinfo, path or query.
+
+    An address without ``://`` is read as ``//<address>``. A host is shown only when
+    it is an IP address or looks like a hostname (letters, digits, dots and hyphens,
+    starting and ending with a letter or digit) and the address gave a scheme, a valid
+    port, or a host with a dot. Otherwise a bare token, or ``user:pw`` with no ``@``,
+    could print a credential, so it shows ``an address with no host``. Never raises.
+    """
+    nothing = "an address with no host"
+    schemed = "://" in address
+    try:
+        parts = urlsplit(address if schemed else f"//{address}")
+        host = parts.hostname
+    except ValueError:
+        return nothing
+    if not host:
+        return nothing
+    try:
+        port: int | None = parts.port
+        port_ok = True
+    except ValueError:
+        port, port_ok = None, False
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if not is_ip and not _HOSTNAME.fullmatch(host):
+        return nothing
+    if not (schemed or (port_ok and port is not None) or "." in host):
+        return nothing
+    shown = f"[{host}]" if ":" in host else host
+    return f"{shown}:{port}" if port is not None else shown
+
+
+def _start_line(signals: _Signals | None, settings: TelemetrySettings | None) -> str:
+    """The one line a start logs: which signals started and where they go.
+
+    Reads only the handle, the settings and ``os.environ``. Never shows a credential:
+    profiles are named by host and port alone.
+    """
+    parts: list[str] = []
+    if (
+        signals is not None
+        and signals._profiles is not None
+        and settings
+        and settings.profiles
+    ):
+        parts.append(f"profiles \u2192 {_where(settings.profiles.get_secret_value())}")
+    if signals is not None and signals._otel is not None:
+        exporters = ", ".join(
+            f"{kind} {(os.environ.get(variable) or '').strip() or default}"
+            for kind, variable, default in (
+                ("traces", "OTEL_TRACES_EXPORTER", "otlp"),
+                ("metrics", "OTEL_METRICS_EXPORTER", "otlp"),
+                ("logs", "OTEL_LOGS_EXPORTER", "none"),
+            )
+        )
+        parts.append(f"otel \u2192 {exporters}")
+    return "telemetry: " + ("; ".join(parts) if parts else "off")

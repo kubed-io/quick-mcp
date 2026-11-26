@@ -519,7 +519,7 @@ def test_a_component_with_no_section_gets_none() -> None:
 # -- order
 
 
-async def test_the_boot_line_is_logged_at_each_start_before_the_components(
+async def test_the_start_lines_are_the_boot_line_then_telemetry_then_the_components(
     caplog,
 ) -> None:
     with caplog.at_level(logging.INFO):
@@ -529,9 +529,17 @@ async def test_the_boot_line_is_logged_at_each_start_before_the_components(
         for _ in range(2):
             async with Client(mcp.server):
                 pass
-    names = ("kubed.mcp.config", "tests.components")
+    names = ("kubed.mcp.config", "kubed.mcp.telemetry", "tests.components")
     lines = [r.getMessage() for r in caplog.records if r.name in names]
-    assert lines == ["config: serving.port=9000 (env PORT)", "start a"] * 2
+    assert (
+        lines
+        == [
+            "config: serving.port=9000 (env PORT)",
+            "telemetry: off",
+            "start a",
+        ]
+        * 2
+    )
 
 
 # -- auth

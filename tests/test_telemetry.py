@@ -1754,3 +1754,72 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
         )
     ]
     assert_safe(caplog.records, "s3cret")
+
+
+# -- the start line -----------------------------------------------------------
+
+
+def start_lines(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "kubed.mcp.telemetry" and r.getMessage().startswith("telemetry: ")
+    ]
+
+
+async def test_the_start_line_says_off_with_nothing_on(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("off", TelemetrySettings()).server):
+            pass
+    assert start_lines(caplog) == ["telemetry: off"]
+
+
+async def test_the_start_line_names_profiles_and_the_host(pyroscope, caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("p", TelemetrySettings(profiles=ADDRESS)).server):
+            pass
+    assert start_lines(caplog) == ["telemetry: profiles → pyroscope.example.com:4040"]
+
+
+async def test_the_start_line_names_otels_exporters(
+    traced, pyroscope, monkeypatch, caplog
+) -> None:
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", " console ")
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("o", settings).server):
+            pass
+    assert start_lines(caplog) == [
+        "telemetry: profiles → pyroscope.example.com:4040; "
+        "otel → traces console, metrics otlp, logs none"
+    ]
+
+
+@pytest.mark.parametrize(
+    "address, shown",
+    [
+        (
+            "https://user:s3cret@pyroscope.example:4040/push?token=s3cret",
+            "pyroscope.example:4040",
+        ),
+        ("user:s3cret@pyroscope:4040", "pyroscope:4040"),
+        ("http://[::1]:4040", "[::1]:4040"),
+        ("http://host:notaport", "host"),
+        ("http://", "an address with no host"),
+        ("s3cret", "an address with no host"),
+        ("user:s3cret", "an address with no host"),
+        ("a b c:1", "an address with no host"),
+    ],
+)
+def test_the_start_line_never_shows_a_credential(address, shown) -> None:
+    assert kubed.mcp.telemetry._where(address) == shown and "s3cret" not in shown
+
+
+async def test_profiles_that_fail_to_start_are_not_named(monkeypatch, caplog) -> None:
+    monkeypatch.setitem(sys.modules, "pyroscope", None)  # not installed
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(
+            served("missing", TelemetrySettings(profiles=ADDRESS)).server
+        ):
+            pass
+    assert start_lines(caplog) == ["telemetry: off"]

@@ -16,7 +16,14 @@ from pydantic import BaseModel
 
 from ._config import Config, Field, config
 from .components import Component
-from .telemetry import TelemetrySettings, _call_metrics, _Signals, _start_signals
+from .telemetry import (
+    TelemetrySettings,
+    _call_metrics,
+    _Signals,
+    _start_line,
+    _start_signals,
+    log,
+)
 
 if TYPE_CHECKING:
     from .app import QuickMCP
@@ -124,9 +131,10 @@ class _TelemetryComponent(Component):
 
     async def start(self, section: BaseModel | None) -> None:
         # Never raises (TEL-6). None when another start owns the process's signals.
-        self._signals.append(
-            _start_signals(self._name, cast("TelemetrySettings | None", section))
-        )
+        settings = cast("TelemetrySettings | None", section)
+        signals = _start_signals(self._name, settings)
+        self._signals.append(signals)
+        log.info("%s", _start_line(signals, settings))
 
     async def stop(self) -> None:
         signals = self._signals.pop() if self._signals else None
