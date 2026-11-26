@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-26
+
 ### Fixed
 
 - A `subscriptions/listen` stream no longer shows as a server span lasting as long as the stream.
