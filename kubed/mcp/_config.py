@@ -42,6 +42,8 @@ from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
 from pydantic.fields import FieldInfo
 from pydantic.json_schema import GenerateJsonSchema, PydanticJsonSchemaWarning
 
+from .components import Component, _components
+
 M = TypeVar("M", bound=BaseModel)
 
 # The stamp ``config`` leaves on a class. A dunder name, so pydantic leaves it alone,
@@ -1741,6 +1743,58 @@ def _load(
         {item.path: _source(item.loc, layers) for item in leaves}
     )
     return _Loaded(loaded, provided, record, _boot_line(leaves, loaded, record))
+
+
+class LoadedConfig:
+    """A server's loaded config, as ``load_config()`` returns it.
+
+    Made by ``load_config()``, never directly, and passed to ``QuickMCP(name,
+    loaded=...)``. ``config`` is the validated config and ``sources`` says where each
+    of its values came from, by dotted path. Both are read-only.
+    """
+
+    __slots__ = ("_components", "_loaded")
+
+    def __init__(self, loaded: _Loaded, components: tuple[Component, ...]) -> None:
+        self._loaded = loaded
+        self._components = components
+
+    @property
+    def config(self) -> Config:
+        """The loaded config: the root, with each section under its key."""
+        return self._loaded.config
+
+    @property
+    def sources(self) -> Mapping[str, Source]:
+        """Where each value came from, by dotted path. Read-only."""
+        return self._loaded.sources
+
+
+def load_config(
+    *,
+    sections: Iterable[type[BaseModel]] = (),
+    components: Iterable[Component] = (),
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+    config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
+    hooks: Mapping[str, Callable[[Config], BaseModel]] | None = None,
+) -> LoadedConfig:
+    """Loads a server's config before the server is built.
+
+    Loads as ``QuickMCP(...)`` does with the same arguments, the built-in sections
+    included, and raises what it raises, with the same text. It logs nothing and
+    imports no FastMCP. Its result goes to ``QuickMCP(name, loaded=...)``, which
+    reads no source again.
+    """
+    checked = _components(components)
+    loaded = _load(
+        [[c.section for c in checked if c.section is not None], sections],
+        config,
+        argv=argv,
+        environ=environ,
+        hooks=hooks,
+    )
+    return LoadedConfig(loaded, checked)
 
 
 # Schema keywords whose value maps a name to a schema, so a name there is data.

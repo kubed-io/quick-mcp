@@ -23,7 +23,7 @@ from starlette.routing import WebSocketRoute
 from ._builtins import DeliverySettings, ServingSettings, _builtin_components
 from ._config import Config, Source, _load
 from ._handshake import _Describe
-from .components import Component, _start_all, _stop_all
+from .components import Component, _components, _start_all, _stop_all
 from .container import (
     _CALL,
     SERVING,
@@ -150,28 +150,6 @@ def quiet_fastmcp_logging() -> None:
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
     logger.propagate = True
-
-
-def _components(components: Iterable[Component]) -> tuple[Component, ...]:
-    """``components=`` as a tuple, each one checked to be a ``Component`` instance."""
-    if isinstance(components, (Component, type)) or not isinstance(
-        components, Iterable
-    ):
-        raise TypeError(
-            "components= takes Component instances in a sequence, got "
-            + _what(components)
-        )
-    checked = tuple(components)
-    for each in checked:
-        if not isinstance(each, Component):
-            raise TypeError(f"components= takes Component instances, got {_what(each)}")
-    return checked
-
-
-def _what(value: object) -> str:
-    if isinstance(value, type):
-        return f"the class {value.__qualname__}"
-    return f"an instance of {type(value).__qualname__}"
 
 
 def _refuse_serving_options(
