@@ -51,17 +51,17 @@ def prefix() -> str | None:
 
 # An address of a served scheme, with or without a prefix before it.
 _SERVED = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*\+)?(skill|prompts|agents)://")
-# The methods besides resources/read that name a plugin address, matched as sent.
-_AS_SENT = ("skills/get", "resources/directory/read")
+# The methods besides resources/read that name a plugin address.
+_EXTENSION_METHODS = ("skills/get", "resources/directory/read")
 
 
-def _plain(uri: str, prefix: str | None, *, dots: bool) -> str:
+def _plain(uri: str, prefix: str | None) -> str:
     """The address the providers are asked for ``uri``, by GW-4's steps.
 
     An address of another scheme, of another prefix, or prefixed on a request with
     none, is ``uri`` as sent. One that resolves to nothing is ``<scheme>://%2F``, an
-    address no provider serves. ``dots`` resolves dot segments in the path, keeping a
-    query or fragment as sent.
+    address no provider serves. Dot segments are resolved in the path, keeping a query
+    or fragment as sent.
     """
     served = _SERVED.match(uri)
     if served is None:
@@ -73,8 +73,6 @@ def _plain(uri: str, prefix: str | None, *, dots: bool) -> str:
     if prefix and uri.startswith(prefix + scheme):
         uri = uri[len(prefix) :]
     elif not uri.startswith(scheme):
-        return uri
-    if not dots:
         return uri
     rest = uri[len(scheme) :]
     # The path ends at the first "?" or "#": what follows is kept as sent.
@@ -122,14 +120,14 @@ class _TakeThePrefix(Middleware):
 
     async def on_read_resource(self, context: Any, call_next: Any) -> Any:
         sent = str(context.message.uri)
-        passed = _plain(sent, prefix(), dots=True)
+        passed = _plain(sent, prefix())
         if passed == sent:
             return await call_next(context)
         message = context.message.model_copy(update={"uri": passed})
         return await self._ask(context.copy(message=message), call_next, passed, sent)
 
     async def on_request(self, context: Any, call_next: Any) -> Any:
-        if context.method not in _AS_SENT:
+        if context.method not in _EXTENSION_METHODS:
             return await call_next(context)
         # FastMCP hands an extension method its raw params as a dict, and folds back
         # only a Mapping.
@@ -137,7 +135,7 @@ class _TakeThePrefix(Middleware):
         sent = message.get("uri") if isinstance(message, Mapping) else None
         if not isinstance(sent, str):
             return await call_next(context)
-        passed = _plain(sent, prefix(), dots=False)
+        passed = _plain(sent, prefix())
         if passed == sent:
             return await call_next(context)
         message = {**message, "uri": passed}

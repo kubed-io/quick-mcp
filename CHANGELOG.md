@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `skills/get` and `resources/directory/read` resolve `.` and `..` segments as `resources/read` does, on a direct connection as well as behind a gateway.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
