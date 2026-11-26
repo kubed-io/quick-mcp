@@ -576,14 +576,14 @@ class Settings:
 
 
 def test_no_sections_load_an_empty_config() -> None:
-    loaded = _load([[]], None)
+    loaded = _load([[]], None, environ={})
     assert type(loaded.config).model_fields == {}
     assert isinstance(loaded.config, Config)
     assert loaded.provided == {Config: loaded.config}
 
 
 def test_defaults_load_and_properties_and_validators_run() -> None:
-    loaded = _load([[Root, Recording, Nest]], None)
+    loaded = _load([[Root, Recording, Nest]], None, environ={})
     assert loaded.config.name == "flow" and loaded.config.shout == "FLOW"
     assert loaded.config.recording.enabled is False
     # a section's assigning validator still works
@@ -619,7 +619,7 @@ def test_a_non_dict_mapping_is_accepted() -> None:
 
 
 def test_the_provided_values_cover_every_class() -> None:
-    loaded = _load([[Root, Base, Sub]], None)
+    loaded = _load([[Root, Base, Sub]], None, environ={})
     assert loaded.provided[Sub] is loaded.provided[Base] is loaded.config.base
     assert loaded.provided[Config] is loaded.provided[Root] is loaded.config
 
@@ -640,7 +640,7 @@ def test_an_unknown_key_names_its_path_and_source(values, path) -> None:
 
 def test_a_missing_required_section_is_from_default() -> None:
     with pytest.raises(ValueError, match=r"required \(default\): Field required"):
-        _load([[Required]], None)
+        _load([[Required]], None, environ={})
 
 
 def test_a_list_index_is_written_in_brackets() -> None:
@@ -664,7 +664,7 @@ def test_a_dict_key_error_has_no_stray_dot() -> None:
 
 def test_an_error_with_no_path_names_the_root_section() -> None:
     with pytest.raises(ValueError, match=r"  the root section \(default\): .*no way"):
-        _load([[Failing]], None)
+        _load([[Failing]], None, environ={})
 
 
 def test_a_load_error_never_holds_a_value() -> None:
@@ -754,12 +754,12 @@ def test_the_servers_own_validator_text_is_kept() -> None:
 
 def test_a_keyed_section_that_refuses_its_defaults_names_its_key() -> None:
     with pytest.raises(ValueError, match=r"  keyfail \(default\): .*nope keyed"):
-        _load([[KeyFail]], None)
+        _load([[KeyFail]], None, environ={})
 
 
 def test_a_nested_default_failure_names_the_full_path() -> None:
     with pytest.raises(ValueError, match=r"  outer\.inner\.x \(default\)"):
-        _load([[Outer]], None)
+        _load([[Outer]], None, environ={})
 
 
 def test_a_root_error_with_values_given_is_from_code() -> None:

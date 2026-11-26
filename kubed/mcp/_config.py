@@ -7,8 +7,11 @@ model. It imports no FastMCP, so a config can be loaded and described without a 
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
+import json
 import keyword
+import os
 import re
 import types
 import typing
@@ -16,11 +19,14 @@ import warnings
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, TypeVar
 
+import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Json,
     RootModel,
     Secret,
     SecretBytes,
@@ -454,9 +460,13 @@ def _kind(annotation: object) -> Literal["string", "array", "object"]:
 
 
 def _takes(info: FieldInfo) -> Literal["string", "array", "object"]:
-    """How a field's raw value decodes. ``NoDecode`` anywhere on it makes it text."""
+    """How a field's raw value decodes. ``NoDecode`` anywhere on it makes it text.
+
+    So does pydantic's ``Json``, whose validator parses the raw string itself and
+    refuses one already decoded.
+    """
     marks = (*info.metadata, *_parts(info.annotation))
-    if any(m is NoDecode or isinstance(m, NoDecode) for m in marks):
+    if any(m in (NoDecode, Json) or isinstance(m, (NoDecode, Json)) for m in marks):
         return "string"
     return _kind(info.annotation)
 
@@ -657,11 +667,31 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     )
 
 
+class Source(NamedTuple):
+    """Where a config item's value came from.
+
+    ``kind`` is an open set: ``"default"``, ``"file"``, ``"env"``, ``"arg"`` and
+    ``"code"`` today. ``name`` is the file's path, the env var or the flag, else
+    ``None``. As a string it is the kind, then the name when there is one:
+    ``default``, ``file /etc/kb.yaml``, ``env PORT``, ``arg --port``.
+    """
+
+    kind: str
+    name: str | None = None
+
+    def __str__(self) -> str:
+        return self.kind if self.name is None else f"{self.kind} {self.name}"
+
+
 class _Loaded(NamedTuple):
-    """What ``_load`` returns: the config, and what to inject for each class."""
+    """What ``_load`` returns: the config, what to inject for each class, its sources.
+
+    ``sources`` maps each leaf item's path to where its value came from.
+    """
 
     config: Config
     provided: dict[type, object]
+    sources: Mapping[str, Source]
 
 
 def _bad_values(what: str) -> TypeError:
@@ -726,13 +756,296 @@ def _path(loc: tuple[int | str, ...]) -> str:
     return path
 
 
-def _source(loc: tuple[int | str, ...], given: Mapping[str, Any] | None) -> str:
-    """Where a value at ``loc`` came from. Files, env vars and argv join this later."""
-    if given is None:
-        return "default"
-    if not loc or loc[0] in given:
-        return "code"
-    return "default"
+class _Layer(NamedTuple):
+    """One source's values, keyed as the config, and the names that set them.
+
+    ``names`` holds a ``(loc, name)`` pair for each contribution: the file layer has
+    one, at ``()``, named by its path, and values in code one at ``()`` with no name.
+    """
+
+    kind: str
+    data: dict[str, Any]
+    names: tuple[tuple[tuple[str, ...], str | None], ...]
+
+
+def _holds(data: Any, loc: tuple[int | str, ...]) -> bool:
+    """Whether a layer's data reaches ``loc``, or a value that isn't a mapping above it.
+
+    A list, a scalar or a model instance holds everything below it.
+    """
+    node = data
+    for part in loc:
+        if not isinstance(node, Mapping):
+            return True
+        if part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _source(loc: tuple[int | str, ...], layers: Sequence[_Layer]) -> Source:
+    """Where the value at ``loc`` came from: the highest layer holding it.
+
+    Its name is the deepest contribution whose loc is a prefix of ``loc``, else the one
+    contribution below ``loc`` when there is exactly one, else ``None``. No layer
+    holding ``loc`` is the default.
+    """
+    for layer in reversed(layers):
+        if not _holds(layer.data, loc):
+            continue
+        above = [(at, name) for at, name in layer.names if loc[: len(at)] == at]
+        if above:
+            return Source(layer.kind, max(above, key=lambda c: len(c[0]))[1])
+        below = [name for at, name in layer.names if at[: len(loc)] == loc]
+        return Source(layer.kind, below[0] if len(below) == 1 else None)
+    return Source("default")
+
+
+def _blank(value: object) -> bool:
+    """Whether a value means unset: ``None``, or a string of only whitespace."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _unblank(data: Mapping[str, Any]) -> dict[str, Any]:
+    """A file's mapping without its blank entries, at every depth of nested mappings.
+
+    A list and what it holds are left to the validators.
+    """
+    return {
+        key: _unblank(value) if isinstance(value, Mapping) else value
+        for key, value in data.items()
+        if not _blank(value)
+    }
+
+
+def _merge(low: Any, high: Any) -> Any:
+    """``high`` over ``low``: mappings key by key at every depth, else ``high`` whole.
+
+    A model instance under a mapping counts as its fields, keyed as it validates, so
+    the keys the mapping doesn't set keep the instance's values.
+    """
+    if not isinstance(high, Mapping):
+        return high
+    if isinstance(low, BaseModel):
+        fields = type(low).model_fields.items()
+        low = {_key(name, info): getattr(low, name) for name, info in fields}
+    if not isinstance(low, Mapping):
+        return high
+    merged = dict(low)
+    for key, value in high.items():
+        merged[key] = _merge(merged[key], value) if key in merged else value
+    return merged
+
+
+def _key(name: str, info: FieldInfo) -> str:
+    """The key a field validates under: its alias when that is a name, else its own."""
+    alias = info.validation_alias
+    return alias if isinstance(alias, str) else name
+
+
+def _over_defaults(model: type[BaseModel], data: Mapping[str, Any]) -> dict[str, Any]:
+    """``data`` over the defaults that are model instances, at every depth.
+
+    A model-typed field whose data is a mapping, and whose default is an instance, gets
+    the instance's values for the keys the data leaves out. A ``default_factory`` is
+    never called.
+    """
+    merged = dict(data)
+    for name, info in model.model_fields.items():
+        key = _key(name, info)
+        value = merged.get(key)
+        inner = _model_typed(info.annotation)
+        if inner is None or not isinstance(value, Mapping):
+            continue
+        if isinstance(info.default, BaseModel):
+            value = _merge(info.default, value)
+        merged[key] = _over_defaults(inner, value)
+    return merged
+
+
+def _nest(loc: tuple[str, ...], value: Any) -> dict[str, Any]:
+    """``value`` under the keys of ``loc``, as one nested mapping."""
+    for part in reversed(loc[1:]):
+        value = {part: value}
+    return {loc[0]: value}
+
+
+_JSON_KIND = {"array": list, "object": dict}
+
+
+def _decode(raw: Any, takes: Literal["string", "array", "object"]) -> tuple[Any, bool]:
+    """A raw env var or flag value as its item takes it, and whether it decoded.
+
+    Text is passed as it is, to pydantic's lax validation. A list, set, tuple, dict or
+    model reads JSON of its kind.
+    """
+    if takes == "string":
+        return raw, True
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return None, False
+    return value, isinstance(value, _JSON_KIND[takes])
+
+
+def _named_layer(
+    kind: str, raws: Iterable[tuple[int, _Item, str, Any]]
+) -> tuple[_Layer, list[str]]:
+    """The layer of the env vars or the flags that were set, and their decode errors.
+
+    ``raws`` is ``(index, item, name, raw)`` in item order. A blank value is dropped
+    first. The contributions merge by the depth of their item, then in item order, so
+    a name on a nested field beats one on the model field holding it.
+    """
+    decoded: list[tuple[int, _Item, str, Any]] = []
+    errors: list[str] = []
+    for index, item, name, raw in raws:
+        if _blank(raw):
+            continue
+        value, ok = _decode(raw, item.takes)
+        if not ok:
+            errors.append(
+                f"  {item.path} ({Source(kind, name)}): must be a JSON {item.takes}"
+            )
+            continue
+        decoded.append((index, item, name, value))
+    decoded.sort(key=lambda each: (len(each[1].loc), each[0]))
+    data: dict[str, Any] = {}
+    for _, item, _, value in decoded:
+        data = _merge(data, _nest(item.loc, value))
+    names = tuple((item.loc, name) for _, item, name, _ in decoded)
+    return _Layer(kind, data, names), errors
+
+
+def _read_env(
+    items: Sequence[_Item], environ: Mapping[str, str]
+) -> tuple[_Layer, list[str]]:
+    """The env layer: each item's declared env var, read by its exact name."""
+    return _named_layer(
+        "env",
+        (
+            (index, item, item.env, environ.get(item.env))
+            for index, item in enumerate(items)
+            if item.env is not None
+        ),
+    )
+
+
+class _ArgvError(Exception):
+    """What argparse would have printed before exiting."""
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that raises where argparse would exit."""
+
+    def error(self, message: str) -> typing.NoReturn:
+        raise _ArgvError(message)
+
+
+_POSITIONAL = (
+    "  the arguments (arg): no item takes a positional argument, got {}; "
+    "a server passes argv=sys.argv[1:]"
+)
+
+
+def _flag_in(token: str) -> str | None:
+    """A token's text up to any ``=`` when that has a flag's shape, else ``None``.
+
+    A flag holds no space either, so a token argparse kept whole is cut there too.
+    """
+    flag = re.split(r"[=\s]", token, maxsplit=1)[0]
+    return flag if _FLAG.fullmatch(flag) else None
+
+
+def _read_argv(
+    items: Sequence[_Item], argv: Sequence[str]
+) -> tuple[dict[int, str], str | None, list[str], bool]:
+    """Parse ``argv`` into each item's raw flag value, by item index.
+
+    Returns the values, the ``--config-file`` value, the argv errors and whether
+    argparse itself failed. A leftover with a flag's shape up to any ``=`` is an
+    unknown flag, reported by that text. Without an ``=``, the token after it is its
+    value when that has no flag's shape, even one starting with ``-``, and is never
+    shown. Every other leftover, a short flag or a bare ``-`` included, is counted
+    with the positionals and never quoted.
+    """
+    parser = _Parser(
+        prog="server",  # never read from sys.argv
+        add_help=False,
+        allow_abbrev=False,
+        argument_default=argparse.SUPPRESS,
+    )
+    for index, item in enumerate(items):
+        if item.arg is not None:
+            parser.add_argument(item.arg, dest=f"item{index}")
+    parser.add_argument(_RESERVED["arg"], dest="config_file")
+    try:
+        parsed, extras = parser.parse_known_args(list(argv))
+    except _ArgvError as exc:
+        return {}, None, [f"  the arguments ({Source('arg')}): {exc}"], True
+
+    found = vars(parsed)
+    values = {
+        index: found[f"item{index}"]
+        for index in range(len(items))
+        if f"item{index}" in found
+    }
+    errors: list[str] = []
+    positionals = 0
+    at = 0
+    while at < len(extras):
+        token = extras[at]
+        at += 1
+        flag = _flag_in(token)
+        if flag is None:
+            positionals += 1
+            continue
+        errors.append(
+            f"  the arguments ({Source('arg', flag)}): no item takes this flag"
+        )
+        if "=" not in token and at < len(extras) and _flag_in(extras[at]) is None:
+            at += 1  # its value, never shown
+    if positionals:
+        errors.append(_POSITIONAL.format(positionals))
+    return values, found.get("config_file"), errors, False
+
+
+def _read_file(path: str) -> tuple[_Layer | None, str | None]:
+    """The file layer read from ``path``, or the one line saying why it can't be.
+
+    The path is used as given. The line names the path and the trouble, never the
+    file's text nor the parser's message, which quotes it.
+    """
+    file = Path(path)
+    data: Any = None
+    text: str | None = None
+    trouble: str | None = None
+    try:
+        if not file.exists():
+            trouble = "does not exist"
+        elif not file.is_file():
+            trouble = "is not a file"
+        else:
+            text = file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        trouble = f"cannot be read: {type(exc).__name__}"
+    if text is not None:
+        try:
+            data = yaml.safe_load(text)
+        # A ValueError is a constructor's, such as a bad date, and quotes the value.
+        except (yaml.YAMLError, ValueError, RecursionError) as exc:
+            mark = getattr(exc, "problem_mark", None)
+            trouble = "is not valid YAML"
+            if mark is not None:
+                trouble += f" at line {mark.line + 1}, column {mark.column + 1}"
+    if trouble is None:
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            trouble = f"must be a mapping, not a {type(data).__name__}"
+    if trouble is not None:
+        return None, f"  config file {path} {trouble}"
+    return _Layer("file", _unblank(data), (((), path),)), None
 
 
 # Error types whose pydantic text can carry the input, and the fixed text said instead.
@@ -770,47 +1083,118 @@ def _message(error: Mapping[str, Any]) -> str:
     return msg
 
 
+_BOTH = (
+    "config= reads no flags or env vars: pass config=, or argv= and environ=, not both"
+)
+_BAD_ARGV = "argv= takes a list of strings, such as sys.argv[1:]"
+_BAD_ENVIRON = "environ= takes a mapping of env var names to values, such as os.environ"
+
+
+def _given(
+    composition: _Composition,
+    values: Mapping[str, Any] | BaseModel | Iterable[BaseModel],
+) -> dict[str, Any]:
+    """Values given in code as one mapping: as given, or section instances spread."""
+    if isinstance(values, BaseModel):
+        return _spread([values], composition.held, composition.replaced)
+    if isinstance(values, Mapping):
+        return dict(values)
+    if isinstance(values, type):
+        raise _bad_values(f"the class {values.__qualname__}")
+    if isinstance(values, (str, bytes)):
+        raise _bad_values(f"an instance of {type(values).__qualname__}")
+    if isinstance(values, Iterable):
+        return _spread(values, composition.held, composition.replaced)
+    raise _bad_values(f"an instance of {type(values).__qualname__}")
+
+
 def _load(
     sources: Iterable[Iterable[type[BaseModel]]],
     values: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None,
+    *,
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> _Loaded:
-    """Compose the sections and load one config from defaults and values given in code.
+    """Compose the sections and load one config.
 
-    ``values`` is a mapping, one section instance, or an iterable of them. Given values
-    are never read from a file, an env var or argv. A load error names each path and
-    its source. Pydantic's own texts never carry the input, but a server's own validator
-    text is kept as written, so a validator should not put the value in it.
+    Without ``values``, each source goes over the one below: the defaults, then the
+    YAML file named by ``--config-file`` or ``CONFIG_FILE``, then each item's env var,
+    then each item's flag. Mappings merge key by key at every depth, and anything else
+    replaces what is below it whole. A blank value is unset. ``argv=None`` reads no
+    flags, as nothing reads ``sys.argv``, and ``environ=None`` reads ``os.environ``.
+
+    ``values`` is a mapping, one section instance, or an iterable of them, given in
+    code: it goes over the defaults, and no file, env var or flag is read. Instances
+    given are kept as given.
+
+    A load error names each path and its source. Pydantic's own texts never carry the
+    input, but a server's own validator text is kept as written, so a validator should
+    not put the value in it. The argv errors, the decode errors and every validation
+    error are reported together. A named file that can't be used stops the load at
+    once, alone.
 
     A root instance's fields are spread into the mapping and validated again with the
-    rest, so a root validator that isn't idempotent runs twice on them.
+    rest, as are the values of a default model instance a source merges over, so a
+    validator that isn't idempotent runs twice on them.
 
     Raises:
-        TypeError: ``values`` isn't a mapping or section instances.
-        ValueError: Two instances for one key, or the values don't validate.
+        TypeError: ``values`` isn't a mapping or section instances, ``values`` is
+            given with ``argv`` or ``environ``, ``argv`` isn't a sequence of ``str``,
+            or ``environ`` isn't a mapping.
+        ValueError: Two instances for one key, or the config doesn't load.
     """
-    composition = _compose(sources)
-    given: dict[str, Any] | None
-    if values is None:
-        given = None
-    elif isinstance(values, BaseModel):
-        given = _spread([values], composition.held, composition.replaced)
-    elif isinstance(values, Mapping):
-        given = dict(values)
-    elif isinstance(values, type):
-        raise _bad_values(f"the class {values.__qualname__}")
-    elif isinstance(values, (str, bytes)):
-        raise _bad_values(f"an instance of {type(values).__qualname__}")
-    elif isinstance(values, Iterable):
-        given = _spread(values, composition.held, composition.replaced)
-    else:
-        raise _bad_values(f"an instance of {type(values).__qualname__}")
+    if values is not None and (argv is not None or environ is not None):
+        raise TypeError(_BOTH)
+    if argv is not None and (
+        isinstance(argv, (str, bytes, bytearray))
+        or not isinstance(argv, Sequence)
+        or not all(isinstance(token, str) for token in argv)
+    ):
+        raise TypeError(_BAD_ARGV)
+    if environ is not None and not isinstance(environ, Mapping):
+        raise TypeError(_BAD_ENVIRON)
 
+    composition = _compose(sources)
+    items = composition.items
     lines: list[str] = []
+    layers: list[_Layer] = []
+    if values is not None:
+        layers.append(_Layer("code", _given(composition, values), (((), None),)))
+    else:
+        environ = os.environ if environ is None else environ
+        flags: dict[int, str] = {}
+        path: str | None = None
+        failed = False
+        if argv is not None:
+            flags, path, lines, failed = _read_argv(items, argv)
+        if not failed:
+            if _blank(path):
+                path = environ.get(_RESERVED["env"])
+            if not _blank(path):
+                file, trouble = _read_file(path)
+                if trouble is not None:
+                    raise ValueError("the config did not load:\n" + trouble)
+                layers.append(file)
+        env, env_errors = _read_env(items, environ)
+        arg, arg_errors = _named_layer(
+            "arg",
+            (
+                (index, items[index], items[index].arg, raw)
+                for index, raw in sorted(flags.items())
+            ),
+        )
+        lines += env_errors + arg_errors
+        layers += [layer for layer in (env, arg) if layer.names]
+
+    data: dict[str, Any] = {}
+    for layer in layers:
+        data = _merge(data, layer.data)
+    data = _over_defaults(composition.model, data)
     try:
-        loaded = composition.model.model_validate({} if given is None else given)
+        loaded = composition.model.model_validate(data)
     except ValidationError as exc:
-        lines = [
-            f"  {_path(error['loc'])} ({_source(error['loc'], given)}): "
+        lines += [
+            f"  {_path(error['loc'])} ({_source(error['loc'], layers)}): "
             f"{_message(error)}"
             for error in exc.errors(include_input=False, include_url=False)
         ]
@@ -823,7 +1207,7 @@ def _load(
         value = loaded if key is None else getattr(loaded, key)
         for each in (cls, *composition.replaced.get(key, ())):
             provided[each] = value
-    return _Loaded(loaded, provided)
+    return _Loaded(loaded, provided, types.MappingProxyType({}))
 
 
 # Schema keywords whose value maps a name to a schema, so a name there is data.
