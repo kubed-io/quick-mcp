@@ -83,6 +83,13 @@ def test_each_config_sets_its_four_variables() -> None:
     assert memory["TELEMETRY_TAGS"] == '{"a": "b"}'
 
 
+def test_an_inherited_config_file_reaches_no_child() -> None:
+    # A config file can set telemetry.profiles, which would profile the off rows.
+    base = {"TELEMETRY_PROFILES": "http://127.0.0.1:1", "CONFIG_FILE": "server.yaml"}
+    for config in profile_cost.CONFIGS:
+        assert "CONFIG_FILE" not in profile_cost.child_env(config, base, 8123, {})
+
+
 def test_profiles_off_prints_one_row() -> None:
     out = run("measure", "--configs", "off", *FAST, env={})
     assert out.returncode == 0, out.stderr
@@ -119,7 +126,15 @@ def test_a_profile_config_without_an_address_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
-    "option", ["no_such_knob=1", "server_address=x", "tags={}", "app_name=x"]
+    "option",
+    [
+        "no_such_knob=1",
+        "server_address=x",
+        "tags={}",
+        "app_name=x",
+        "basic_auth_password=x",
+        "http_headers={}",
+    ],
 )
 def test_an_option_configure_does_not_take_or_quickmcp_owns_is_refused(option) -> None:
     out = run(
@@ -132,6 +147,24 @@ def test_an_option_configure_does_not_take_or_quickmcp_owns_is_refused(option) -
         env={"TELEMETRY_PROFILES": "http://127.0.0.1:1"},
     )
     assert out.returncode == 2 and option.split("=")[0] in out.stderr
+    # The refusal names the key, never its value.
+    assert option not in out.stderr
+
+
+def test_profiles_that_did_not_start_end_the_run() -> None:
+    # configure needs an int: a string makes it raise, and QuickMCP serves on unprofiled.
+    out = run(
+        "measure",
+        "--configs",
+        "cpu",
+        "--option",
+        'sample_rate="x"',
+        *FAST,
+        env={"TELEMETRY_PROFILES": "http://127.0.0.1:1"},
+    )
+    assert out.returncode == 1, out.stdout + out.stderr
+    (log,) = re.findall(r"(/\S+\.log)", out.stderr)
+    assert Path(log).is_file()
 
 
 def test_a_server_that_fails_at_boot_ends_the_run() -> None:

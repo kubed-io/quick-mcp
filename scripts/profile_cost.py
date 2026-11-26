@@ -80,6 +80,16 @@ OWNED = frozenset(
     }
 )
 
+# The pyroscope.configure keywords that carry a credential: an option's value prints in
+# its row's name, and a credential belongs in the TELEMETRY_PROFILES address instead.
+SECRET = frozenset({"basic_auth_username", "basic_auth_password", "http_headers"})
+
+# What QuickMCP logs when profiles are on but did not start; it serves on without them.
+_NOT_PROFILED = (
+    "Profiles did not start",
+    "Profiles are on, but pyroscope-io is not installed",
+)
+
 # Seconds a child has to accept a connection, and then to stop once asked.
 _BOOT_TIMEOUT = 60.0
 _STOP_TIMEOUT = 15.0
@@ -96,7 +106,10 @@ class Sample:
 
 
 class ChildFailed(Exception):
-    """The child exited, or never accepted a connection: ``log`` holds its stderr."""
+    """The child exited, never accepted a connection, or served without its profiles.
+
+    ``log`` holds its stderr.
+    """
 
     def __init__(self, config: str, what: str, log: Path) -> None:
         super().__init__(f"the {config} server {what}; its stderr is in {log}")
@@ -133,6 +146,8 @@ def child_env(
 ) -> dict[str, str]:
     """The child's environment: ``base`` with ``config``'s variables and the serving."""
     env = dict(base)
+    # A config file can set telemetry.profiles, which would profile the off rows.
+    env.pop("CONFIG_FILE", None)
     for name, value in CONFIGS[config].items():
         if value is None:
             env.pop(name, None)
@@ -205,7 +220,8 @@ def measure_once(
     """Start a child in ``config``, measure its idle and load phases, and stop it.
 
     ``log`` holds the child's output, a new temporary file when None. Raises
-    ``ChildFailed`` when the child exits, or doesn't accept a connection in 60 s.
+    ``ChildFailed`` when the child exits, doesn't accept a connection in 60 s, or, in a
+    profile configuration, logs that its profiles did not start.
     """
     if log is None:
         log = Path(tempfile.mkdtemp(prefix="profile-cost-")) / f"{config}.log"
@@ -235,9 +251,17 @@ def measure_once(
                 raise
             if child.poll() is not None:
                 raise ChildFailed(config, "exited", log)
+            if _profiled(config) and _did_not_profile(log):
+                raise ChildFailed(config, "served without its profiles", log)
             return Sample(idle=idle_cost, load=load_cost, calls=calls)
         finally:
             _stop(child)
+
+
+def _did_not_profile(log: Path) -> bool:
+    """Whether the child's ``log`` says its profiles did not start."""
+    text = log.read_text(errors="replace")
+    return any(message in text for message in _NOT_PROFILED)
 
 
 def _stop(child: subprocess.Popen[bytes]) -> None:
@@ -314,6 +338,11 @@ def _refused(options: Mapping[str, object]) -> str | None:
     for key in options:
         if key in OWNED:
             return f"--option {key}: QuickMCP sets it"
+        if key in SECRET:
+            return (
+                f"--option {key}: it carries a credential, which belongs in the "
+                "TELEMETRY_PROFILES address and is never printed"
+            )
         if key not in taken:
             return f"--option {key}: pyroscope.configure takes no such keyword"
     return None
