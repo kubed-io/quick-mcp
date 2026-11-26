@@ -232,6 +232,29 @@ async def test_fastmcp_options_go_through_beside_loaded() -> None:
     assert entered == ["lifespan"]
 
 
+async def test_the_lifespan_runs_inside_the_components() -> None:
+    events: list[str] = []
+
+    class Recorder(Component):
+        async def start(self, section: BaseModel | None) -> None:
+            events.append("start")
+
+        async def stop(self) -> None:
+            events.append("stop")
+
+    @asynccontextmanager
+    async def lifespan(server):
+        events.append("lifespan")
+        yield {}
+        events.append("lifespan exit")
+
+    loaded = load_config(components=[Recorder()], environ={})
+    mcp = QuickMCP("t", loaded=loaded, lifespan=lifespan)
+    async with Client(mcp.server):
+        pass
+    assert events == ["start", "lifespan", "lifespan exit", "stop"]
+
+
 def test_a_load_builds_one_server() -> None:
     keeper = Keeper()
     loaded = load_config(components=[keeper], environ={})
@@ -250,6 +273,27 @@ def test_a_load_builds_one_server() -> None:
     with pytest.raises(TypeError, match=message):
         QuickMCP("b", loaded=loaded)
     assert [m for m, _ in keeper.registered] == [a]
+
+
+def test_quick_mcp_takes_none_for_sections_and_components() -> None:
+    mcp = QuickMCP("t", sections=None, components=None, environ={})
+    assert isinstance(mcp.config.serving, ServingSettings)
+
+
+def test_a_register_that_raises_leaves_the_load_claimed() -> None:
+    class Boom(Component):
+        def register(self, mcp: QuickMCP, section: BaseModel | None) -> None:
+            raise RuntimeError("boom")
+
+    loaded = load_config(components=[Boom()], environ={})
+    with pytest.raises(RuntimeError, match="boom"):
+        QuickMCP("a", loaded=loaded)
+    message = (
+        r"^loaded= builds one server, and this one already built a server: "
+        r"call load_config\(\) again for another$"
+    )
+    with pytest.raises(TypeError, match=message):
+        QuickMCP("b", loaded=loaded)
 
 
 def test_a_refused_header_prefix_leaves_the_load_unbuilt() -> None:

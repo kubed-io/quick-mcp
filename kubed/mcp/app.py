@@ -330,11 +330,11 @@ class QuickMCP:
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
         self.add_middleware(_Describe(lambda: self._instructions))
-        # Last, so a component's middleware goes in after the scopes above are placed
-        # by their index: the built-ins first, then the server's, in order.
         # Claimed only once every argument has passed: from here on a component may
         # have registered, so the load stays claimed.
         loaded._claim()
+        # Last, so a component's middleware goes in after the scopes above are placed
+        # by their index: the built-ins first, then the server's, in order.
         for component, section in parts:
             component.register(self, section)
         # FastMCP reads auth when it builds the HTTP app, and its own HTTP run builds
