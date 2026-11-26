@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
+from config_server import Duck
 from fastmcp import Client
 from gateway_server import over_http
 from plugin_server import copy
@@ -19,7 +18,7 @@ OWN = "state://own"
 
 
 def make(tmp_path, delivery=None) -> QuickMCP:
-    mcp = QuickMCP("t", config=SimpleNamespace(delivery=delivery))
+    mcp = QuickMCP("t", sections=[Duck], config={"delivery": delivery})
     mcp.add_plugin(copy(tmp_path))
 
     @mcp.resource(OWN)

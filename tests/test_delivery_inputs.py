@@ -7,6 +7,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from config_server import Duck
 from fastmcp import Client, Context
 from gateway_server import over_http
 
@@ -31,7 +32,10 @@ def snapshot() -> dict:
 
 def server(delivery=None, header_prefix=None) -> QuickMCP:
     mcp = QuickMCP(
-        "t", config=SimpleNamespace(delivery=delivery), header_prefix=header_prefix
+        "t",
+        sections=[Duck],
+        config={"delivery": delivery},
+        header_prefix=header_prefix,
     )
 
     @mcp.tool

@@ -16,10 +16,10 @@ import time
 import types
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from config_server import Duck
 from fastmcp import Client, FastMCP
 from pydantic import BaseModel, ValidationError
 
@@ -101,14 +101,6 @@ def pyroscope(monkeypatch) -> list[dict]:
     return calls
 
 
-@dataclass
-class Config:
-    transport: str = "http"
-    host: str = "0.0.0.0"
-    port: int = 8000
-    telemetry: object = None
-
-
 class Monitor:
     pass
 
@@ -120,7 +112,7 @@ async def make_monitor():
 
 
 def served(name: str, telemetry: object, **options) -> QuickMCP:
-    mcp = QuickMCP(name, config=Config(telemetry=telemetry), **options)
+    mcp = QuickMCP(name, sections=[Duck], config={"telemetry": telemetry}, **options)
     mcp.singleton(Monitor, make_monitor)
 
     @mcp.tool
@@ -279,11 +271,9 @@ async def test_profiles_off_import_nothing(monkeypatch, telemetry) -> None:
 
 
 async def test_a_config_without_telemetry_imports_nothing(monkeypatch) -> None:
-    # A Serving with no telemetry attribute at all, as both servers' configs are today.
+    # A server with no telemetry section.
     monkeypatch.delitem(sys.modules, "pyroscope", raising=False)
-    mcp = QuickMCP(
-        "plain", config=argparse.Namespace(transport="http", host="0.0.0.0", port=8000)
-    )
+    mcp = QuickMCP("plain")
     async with Client(mcp.server):
         pass
     assert "pyroscope" not in sys.modules
@@ -1677,7 +1667,8 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
 
     mcp = QuickMCP(
         "ordered",
-        config=Config(telemetry=TelemetrySettings(otel=True)),
+        sections=[Duck],
+        config={"telemetry": TelemetrySettings(otel=True)},
         middleware=[Given()],
     )
     mcp.add_middleware(Added())
@@ -1698,7 +1689,7 @@ def test_otel_off_adds_no_call_metrics(telemetry) -> None:
 
     from kubed.mcp.app import _CallScope
 
-    mcp = QuickMCP("plain", config=Config(telemetry=telemetry))
+    mcp = QuickMCP("plain", sections=[Duck], config={"telemetry": telemetry})
     kinds = _middleware(mcp)
     assert UsageMiddleware not in kinds
     assert kinds[0] is _CallScope

@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Config sections:** declare pydantic sections with `@config("key")`, register them with `QuickMCP(sections=...)`, inject each with `Inject[Section]`, and write the whole config's JSON Schema with `config_schema()`.
+
+### Changed
+
+- **BREAKING:** `QuickMCP(config=...)` now takes the config's values, a mapping or section instances, and the config's classes go in `sections=`. The loaded config is `mcp.config`, injectable as `Config` or by section, and no longer as `type(config)`.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added

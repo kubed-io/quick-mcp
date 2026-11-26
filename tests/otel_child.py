@@ -13,7 +13,6 @@ not in pytest's. The tests read what this writes: spans on stdout, log lines on 
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -21,7 +20,7 @@ import sys
 
 from fastmcp import Client
 
-from kubed.mcp import QuickMCP, TelemetrySettings
+from kubed.mcp import Config, QuickMCP, TelemetrySettings, config
 
 # What telemetry off must never load.
 HEAVY = (
@@ -31,6 +30,14 @@ HEAVY = (
     "kubed.mcp._otel",
     "fastmcp.server.middleware.usage",
 )
+
+
+@config()
+class Child(Config):
+    transport: str = "http"
+    host: str = "0.0.0.0"
+    port: int = 8000
+    telemetry: TelemetrySettings | None = None
 
 
 def configure_logging() -> None:
@@ -57,10 +64,8 @@ def root_seen() -> None:
 
 
 def server(name: str, telemetry: object, *, bare: bool = False) -> QuickMCP:
-    config = argparse.Namespace(transport="http", host="0.0.0.0", port=8000)
-    if telemetry is not None:
-        config.telemetry = telemetry
-    mcp = QuickMCP(name, config=config)
+    values = {} if telemetry is None else {"telemetry": telemetry}
+    mcp = QuickMCP(name, sections=[Child], config=values)
 
     @mcp.tool
     def ping() -> str:
@@ -129,13 +134,9 @@ async def prometheus() -> None:
 
     from opentelemetry import metrics
 
-    config = argparse.Namespace(
-        transport="http",
-        host="0.0.0.0",
-        port=8000,
-        telemetry=TelemetrySettings(otel=True),
+    mcp = QuickMCP(
+        "prom", sections=[Child], config={"telemetry": TelemetrySettings(otel=True)}
     )
-    mcp = QuickMCP("prom", config=config)
 
     @mcp.tool
     def ping() -> str:
