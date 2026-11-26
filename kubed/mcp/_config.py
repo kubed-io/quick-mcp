@@ -1299,13 +1299,49 @@ def _json(value: object) -> str:
         return json.dumps(_type_name(value))
 
 
+_MASK = "**********"
+
+
+def _mask(value: object) -> object:
+    if isinstance(value, (SecretStr, SecretBytes, Secret)):
+        return _MASK
+    if isinstance(value, RootModel):
+        return _mask(value.root)
+    if isinstance(value, BaseModel):
+        fields = {name: getattr(value, name) for name in type(value).model_fields}
+        return {k: _mask(v) for k, v in {**fields, **(value.model_extra or {})}.items()}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            f.name: _mask(getattr(value, f.name)) for f in dataclasses.fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {k: _mask(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_mask(v) for v in value]
+    return value
+
+
+def _masked(value: object) -> object:
+    """``value`` with every secret in it written as ``**********``, wherever it sits.
+
+    A model and a dataclass become a dict of its fields by attribute name, so its own
+    serializers never run. A mapping's values and a list's, tuple's or set's items are
+    masked in turn. A value nested too deep to walk is named by its type.
+    """
+    try:
+        return _mask(value)
+    except RecursionError:
+        return _type_name(value)
+
+
 def _boot_line(
     leaves: Iterable[_Item], loaded: Config, sources: Mapping[str, Source]
 ) -> str:
     """The one line a load logs: each leaf not at its default, its value and source.
 
     A sensitive item's value is ``***``. Every other value is the loaded one, as JSON,
-    which pydantic's secret types mask wherever they sit inside it.
+    masked at runtime before it is written, so no serializer of the server's can print
+    a secret.
     """
     shown: list[str] = []
     for item in leaves:
@@ -1318,9 +1354,54 @@ def _boot_line(
             node: Any = loaded
             for attr in item.attrs:
                 node = getattr(node, attr, None)
-            value = _json(node)
+            value = _json(_masked(node))
         shown.append(f"{item.path}={value} ({source})")
     return "config: " + (", ".join(shown) if shown else "all defaults")
+
+
+def _drop(data: Mapping[str, Any], loc: tuple[str, ...]) -> dict[str, Any]:
+    """``data`` without the value at ``loc``, copying the mappings on the way down."""
+    head, rest = loc[0], loc[1:]
+    out = dict(data)
+    if rest:
+        out[head] = _drop(out[head], rest)
+    else:
+        del out[head]
+    return out
+
+
+def _check_shapes(
+    items: Sequence[_Item], layers: Sequence[_Layer]
+) -> tuple[list[_Layer], list[str]]:
+    """The layers without a non-mapping where a model belongs, and an error line each.
+
+    Each non-leaf item's ``loc`` is checked in every layer: a ``BaseModel`` instance
+    or a mapping there is fine, and ``None`` is left to the validators. Anything else
+    is dropped from that layer, so the validators don't report the path again, and
+    named by its type and its layer's source. Items go depth-first, so a parent's
+    error removes what its children would see.
+    """
+    errors: list[str] = []
+    checked = list(layers)
+    for item in items:
+        if item.leaf or not item.loc:
+            continue
+        for index, layer in enumerate(checked):
+            node: Any = layer.data
+            for part in item.loc:
+                if not isinstance(node, Mapping) or part not in node:
+                    node = None
+                    break
+                node = node[part]
+            else:
+                if node is None or isinstance(node, (Mapping, BaseModel)):
+                    continue
+                errors.append(
+                    f"  {item.path} ({_source(item.loc, [layer])}): "
+                    f"must be a mapping, not a {type(node).__name__}"
+                )
+                checked[index] = layer._replace(data=_drop(layer.data, item.loc))
+    return checked, errors
 
 
 def _load(
@@ -1406,6 +1487,8 @@ def _load(
         lines += env_errors + arg_errors
         layers += [layer for layer in (env, arg) if layer.names]
 
+    layers, shape_errors = _check_shapes(items, layers)
+    lines += shape_errors
     data: dict[str, Any] = {}
     for layer in layers:
         data = _merge(data, layer.data)

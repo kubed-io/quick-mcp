@@ -1224,3 +1224,64 @@ def test_the_public_names_are_the_modules_own() -> None:
     import kubed.mcp
 
     assert kubed.mcp.Source is Source and kubed.mcp.NoDecode is NoDecode
+
+
+# -- shapes
+
+
+@config("redis")
+class Redis(Config):
+    host: str = Field("", env="REDIS_HOST")
+
+
+class Deeper(Config):
+    x: int = 0
+
+
+class Inner(Config):
+    deep: Deeper = Deeper()
+
+
+@config("outer")
+class Outer(Config):
+    inner: Inner = Field(Inner(), env="OUTER")
+
+
+def test_a_scalar_where_a_section_belongs_is_its_layers_error(tmp_path) -> None:
+    f = tmp_path / "c.yaml"
+    f.write_text("redis: broken\n")
+    with pytest.raises(ValueError) as caught:
+        load(Redis, environ={"CONFIG_FILE": str(f), "REDIS_HOST": "x"})
+    message = str(caught.value)
+    assert f"  redis (file {f}): must be a mapping, not a str" in message
+    assert message.count("  redis") == 1
+
+
+def test_a_scalar_section_alone_is_reported_once() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Redis]], {"redis": 5})
+    assert (
+        str(caught.value)
+        == "the config did not load:\n  redis (code): must be a mapping, not a int"
+    )
+
+
+def test_a_scalar_for_a_model_inside_json_names_the_env_var() -> None:
+    with pytest.raises(ValueError) as caught:
+        load(Outer, environ={"OUTER": '{"deep": 5}'})
+    assert "  outer.inner.deep (env OUTER): must be a mapping, not a int" in str(
+        caught.value
+    )
+    assert str(caught.value).count("outer.inner.deep") == 1
+
+
+# -- boot line
+
+
+def test_the_boot_line_masks_a_revealing_serializer_held_by_any(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
+        _load([[Loose]], {"loose": {"thing": Login(name="a", token="S3CRET")}})
+    assert "S3CRET" not in caplog.text
+    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+        'config: loose.thing={"name":"a","token":"**********"} (code)'
+    ]
