@@ -14,6 +14,7 @@ from typing import Literal
 import fastmcp.server.server
 import pytest
 from fastmcp import Client, FastMCP
+from pydantic import model_validator
 from starlette.testclient import TestClient
 
 import kubed.mcp
@@ -31,7 +32,7 @@ from kubed.mcp import (
     config,
     config_schema,
 )
-from kubed.mcp._config import _compose
+from kubed.mcp._config import _compose, _load
 from kubed.mcp.auth import TokenVerifier
 from kubed.mcp.container import Container
 
@@ -575,3 +576,234 @@ async def test_auth_is_fixed_inside_the_lifespan() -> None:
     async with Client(mcp.server):
         with pytest.raises(RuntimeError, match=r"auth is fixed once serving starts"):
             mcp.auth = Refuse()
+
+
+# -- hooks
+
+
+@config()
+class Kb(Config):
+    port: int = Field(9100, env="PORT", arg="--port")
+    bind: str = "0.0.0.0"
+
+
+def from_root(config) -> ServingSettings:
+    return ServingSettings(transport="http", host=config.bind, port=config.port)
+
+
+def test_a_hook_builds_serving_from_the_servers_own_fields() -> None:
+    mcp = QuickMCP(
+        "kb", sections=[Kb], hooks={"serving": from_root}, environ={"PORT": "9200"}
+    )
+    s = mcp.config.serving
+    assert (s.transport, s.host, s.port) == ("http", "0.0.0.0", 9200)
+    assert mcp.config.port == 9200 and mcp.config_sources["port"] == Source(
+        "env", "PORT"
+    )
+    assert {
+        mcp.config_sources[f"serving.{n}"]
+        for n in ("transport", "host", "port", "log_level")
+    } == {Source("hook")}
+
+
+def test_a_hooked_built_ins_env_and_flags_are_not_read() -> None:
+    seen: list[object] = []
+
+    def keep(config):
+        seen.append(config.serving)
+        return ServingSettings()
+
+    mcp = QuickMCP(
+        "t", hooks={"serving": keep}, environ={"HOST": "10.0.0.1", "PORT": "1"}
+    )
+    assert seen[0].host == "127.0.0.1" and mcp.config.serving.port == 8000
+    with pytest.raises(
+        ValueError, match=r"  the arguments \(arg --port\): no item takes this flag"
+    ):
+        QuickMCP("t", hooks={"serving": keep}, argv=["--port", "1"], environ={})
+
+
+def test_a_hooked_sections_file_entries_are_not_read(tmp_path) -> None:
+    f = tmp_path / "c.yaml"
+    f.write_text("serving:\n  port: 1\n")
+    mcp = QuickMCP(
+        "t",
+        hooks={"serving": lambda c: ServingSettings(port=2)},
+        environ={"CONFIG_FILE": str(f)},
+    )
+    assert mcp.config.serving.port == 2 and mcp.config_sources[
+        "serving.port"
+    ] == Source("hook")
+
+
+def test_a_servers_port_and_a_hooked_serving_do_not_clash() -> None:
+    with pytest.raises(
+        ValueError, match=r"'PORT' is declared by both port and serving\.port"
+    ):
+        QuickMCP("kb", sections=[Kb], environ={})
+    QuickMCP("kb", sections=[Kb], hooks={"serving": from_root}, environ={})
+    schema = config_schema(Kb, hooked=["serving"])
+    serving = schema["$defs"]["ServingSettings"]["properties"]["port"]
+    assert (
+        "env" not in serving
+        and "arg" not in serving
+        and schema["properties"]["port"]["env"] == "PORT"
+    )
+    with pytest.raises(ValueError, match=r"PORT"):
+        config_schema(Kb)
+
+
+def test_a_hook_returning_the_wrong_type_is_a_type_error() -> None:
+    with pytest.raises(
+        TypeError,
+        match=r"hooks\['serving'\] returned a dict, not an instance of ServingSettings",
+    ):
+        QuickMCP("t", hooks={"serving": lambda c: {"port": 1}}, environ={})
+
+
+def test_a_hook_may_return_the_servers_subclass_and_must_when_one_holds_the_key() -> (
+    None
+):
+    mcp = QuickMCP(
+        "t", sections=[Pod], hooks={"serving": lambda c: Pod(port=3)}, environ={}
+    )
+    assert type(mcp.config.serving) is Pod and mcp.config.serving.port == 3
+    with pytest.raises(TypeError, match=r"not an instance of Pod"):
+        QuickMCP(
+            "t",
+            sections=[Pod],
+            hooks={"serving": lambda c: ServingSettings()},
+            environ={},
+        )
+
+
+def test_a_hooks_result_is_validated_and_its_errors_name_the_hook() -> None:
+    bad = ServingSettings.model_construct(port="not a port")
+    with pytest.raises(
+        ValueError, match=r"  serving\.port \(hook\): Input should be a valid integer"
+    ):
+        QuickMCP("t", hooks={"serving": lambda c: bad}, environ={})
+
+
+@pytest.mark.parametrize(
+    "hooks, error, match",
+    [
+        (
+            {"recording": from_root},
+            ValueError,
+            r"hooks= takes a built-in's key, one of 'serving', 'telemetry', 'delivery'; got 'recording'",
+        ),
+        ({"serving": 1}, TypeError, r"hooks\['serving'\] must be callable"),
+        ([("serving", from_root)], TypeError, r"hooks= takes a mapping"),
+    ],
+)
+def test_a_bad_hooks_argument_is_refused(hooks, error, match) -> None:
+    with pytest.raises(error, match=match):
+        QuickMCP("t", hooks=hooks, environ={})
+
+
+def test_every_built_in_takes_a_hook() -> None:
+    mcp = QuickMCP(
+        "t",
+        environ={},
+        hooks={
+            "telemetry": lambda c: TelemetrySettings(otel=False, tags={"a": "b"}),
+            "delivery": lambda c: DeliverySettings(via="local"),
+        },
+    )
+    assert (
+        mcp.config.telemetry.tags == {"a": "b"} and mcp.config.delivery.via == "local"
+    )
+    assert mcp.config_sources["delivery.via"] == Source("hook")
+
+
+def test_the_boot_line_shows_hooked_items_as_hook() -> None:
+    loaded = _load(
+        [[]], None, environ={}, hooks={"serving": lambda c: ServingSettings(port=1)}
+    )
+    assert "serving.port=1 (hook)" in loaded.boot_line
+
+
+def test_a_hooks_result_missing_a_field_is_a_load_error() -> None:
+    bad = ServingSettings.model_construct()
+    vars(bad).pop("port")
+    with pytest.raises(ValueError, match=r"  serving\.port \(hook\): Field required"):
+        QuickMCP("t", hooks={"serving": lambda c: bad}, environ={})
+
+
+def test_config_entries_under_a_hooked_key_are_dropped() -> None:
+    mcp = QuickMCP(
+        "t",
+        config={"serving": {"port": 5}},
+        hooks={"serving": lambda c: ServingSettings(port=2)},
+    )
+    assert mcp.config.serving.port == 2
+    assert mcp.config_sources["serving.port"] == Source("hook")
+
+
+@config("remote")
+class Remote(Config):
+    url: str = Field("mem://", arg="--backend-url")
+
+
+def test_the_flags_of_the_sections_after_a_hooked_one_line_up() -> None:
+    mcp = QuickMCP(
+        "t",
+        sections=[Remote],
+        hooks={"serving": lambda c: ServingSettings()},
+        argv=["--backend-url", "y"],
+        environ={},
+    )
+    assert mcp.config.remote.url == "y"
+    assert mcp.config_sources["remote.url"] == Source("arg", "--backend-url")
+
+
+class HookFailed(Exception):
+    """A hook's own error, which the load lets through."""
+
+
+def test_a_hook_that_raises_propagates_unchanged() -> None:
+    def fail(config):
+        raise HookFailed("boom")
+
+    with pytest.raises(HookFailed, match=r"^boom$"):
+        QuickMCP("t", hooks={"serving": fail}, environ={})
+
+
+SEEN_PORTS: list[int] = []
+
+
+@config()
+class Watching(Config):
+    @model_validator(mode="after")
+    def watch(self):
+        SEEN_PORTS.append(self.serving.port)
+        return self
+
+
+def test_a_root_validator_sees_the_hooked_values_on_the_second_validation() -> None:
+    SEEN_PORTS.clear()
+    QuickMCP(
+        "t",
+        sections=[Watching],
+        hooks={"serving": lambda c: ServingSettings(port=9)},
+        environ={},
+    )
+    assert SEEN_PORTS == [8000, 9]
+
+
+@pytest.mark.parametrize(
+    "hooked, error, match",
+    [
+        (
+            ["recording"],
+            ValueError,
+            r"hooked= takes a built-in's key, one of 'serving', 'telemetry', "
+            r"'delivery'; got 'recording'",
+        ),
+        ("serving", TypeError, r"hooked= takes an iterable of built-in keys"),
+    ],
+)
+def test_a_bad_hooked_argument_is_refused(hooked, error, match) -> None:
+    with pytest.raises(error, match=match):
+        config_schema(hooked=hooked)

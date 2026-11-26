@@ -72,6 +72,30 @@ def _builtin_sections() -> tuple[type[BaseModel], ...]:
     return BUILTINS
 
 
+def _builtin_keys() -> tuple[str, ...]:
+    """The built-in sections' keys, in the order they are composed."""
+    return tuple(vars(cls)[_STAMP] for cls in _builtin_sections())
+
+
+def _check_hooks(keys: Iterable[object], what: str) -> frozenset[str]:
+    """The keys, each checked to be a built-in's key, as a set.
+
+    ``what`` is the argument named in the error, ``"hooks="`` or ``"hooked="``.
+
+    Raises:
+        ValueError: A key isn't a built-in's.
+    """
+    builtins = _builtin_keys()
+    checked = list(keys)
+    for key in checked:
+        if not isinstance(key, str) or key not in builtins:
+            raise ValueError(
+                f"{what} takes a built-in's key, one of "
+                f"{', '.join(repr(k) for k in builtins)}; got {key!r}"
+            )
+    return frozenset(checked)
+
+
 class _Top(Config):
     """The top of the composed config: frozen, whatever the root section says."""
 
@@ -621,10 +645,22 @@ _RESERVED = {"env": "CONFIG_FILE", "arg": "--config-file"}
 _NAME_KIND = {"env": "env var", "arg": "flag"}
 
 
-def _check_names(items: Iterable[_Item]) -> None:
-    """Refuse a malformed name, one of quick-mcp's own, or one declared twice."""
+def _is_hooked(item: _Item, hooked: AbstractSet[str]) -> bool:
+    """Whether an item sits under a hooked key, so no name of it is read."""
+    return item.loc[0] in hooked
+
+
+def _check_names(
+    items: Iterable[_Item], hooked: AbstractSet[str] = frozenset()
+) -> None:
+    """Refuse a malformed name, one of quick-mcp's own, or one declared twice.
+
+    The items under a hooked key are skipped: their names are never read.
+    """
     declared: dict[tuple[str, str], str] = {}
     for item in items:
+        if _is_hooked(item, hooked):
+            continue
         for kind, name in (("env", item.env), ("arg", item.arg)):
             if name is None:
                 continue
@@ -684,13 +720,20 @@ def _check_held(held_in: dict[type, str], direct: set[type]) -> None:
                     )
 
 
-def _items(model: type[BaseModel], root: type[BaseModel] | None) -> tuple[_Item, ...]:
-    """The composed model's items, depth first in declaration order, checked."""
+def _items(
+    model: type[BaseModel],
+    root: type[BaseModel] | None,
+    hooked: AbstractSet[str] = frozenset(),
+) -> tuple[_Item, ...]:
+    """The composed model's items, depth first in declaration order, checked.
+
+    The names of the items under a hooked key aren't checked, as they aren't read.
+    """
     items: list[_Item] = []
     direct: set[type] = {model} if root is None else {model, root}
     held_in: dict[type, str] = {}
     _walk_items(model, (), (), frozenset({model}), items, direct, held_in)
-    _check_names(items)
+    _check_names(items, hooked)
     _check_held(held_in, direct)
     return tuple(items)
 
@@ -698,13 +741,18 @@ def _items(model: type[BaseModel], root: type[BaseModel] | None) -> tuple[_Item,
 _NOT_ITERABLE = "sections= takes an iterable of section classes, such as a list"
 
 
-def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
+def _compose(
+    sources: Iterable[Iterable[type[BaseModel]]],
+    *,
+    hooked: frozenset[str] = frozenset(),
+) -> _Composition:
     """Register the sections of every source and compose them into one config model.
 
     The built-in sections come first, then each source in order. The most derived class
     wins a key. Every field reached through model fields is recorded as an item, and the
     names items declare are checked here, so ``config_schema`` refuses what a server
-    refuses.
+    refuses. The names under a ``hooked`` key aren't checked, as a hook supplies that
+    section and they are never read.
     """
     held: dict[str | None, type[BaseModel]] = {}
     replaced: dict[str | None, list[type[BaseModel]]] = {}
@@ -761,16 +809,16 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
         model,
         held,
         {key: tuple(losers) for key, losers in replaced.items()},
-        _items(model, root),
+        _items(model, root, hooked),
     )
 
 
 class Source(NamedTuple):
     """Where a config item's value came from.
 
-    ``kind`` is an open set: ``"default"``, ``"file"``, ``"env"``, ``"arg"`` and
-    ``"code"`` today. ``name`` is the file's path, the env var or the flag, else
-    ``None``. As a string it is the kind, then the name when there is one:
+    ``kind`` is an open set: ``"default"``, ``"file"``, ``"env"``, ``"arg"``,
+    ``"code"`` and ``"hook"`` today. ``name`` is the file's path, the env var or the
+    flag, else ``None``. As a string it is the kind, then the name when there is one:
     ``default``, ``file /etc/kb.yaml``, ``env PORT``, ``arg --port``.
     """
 
@@ -892,7 +940,8 @@ class _Layer(NamedTuple):
     """One source's values, keyed as the config, and the names that set them.
 
     ``names`` holds a ``(loc, name)`` pair for each contribution: the file layer has
-    one, at ``()``, named by its path, and values in code one at ``()`` with no name.
+    one, at ``()``, named by its path, values in code one at ``()`` with no name, and
+    the hooks one per hooked key, at ``(key,)`` with no name.
     """
 
     kind: str
@@ -1459,12 +1508,97 @@ def _check_shapes(
     return checked, errors
 
 
+_BAD_HOOKS = "hooks= takes a mapping of built-in keys to callables"
+
+
+def _check_hook_mapping(
+    hooks: Mapping[str, Callable[[Config], BaseModel]] | None,
+) -> dict[str, Callable[[Config], BaseModel]]:
+    """``hooks=`` as a dict, each key a built-in's and each value callable."""
+    if hooks is None:
+        return {}
+    if not isinstance(hooks, Mapping):
+        raise TypeError(_BAD_HOOKS)
+    _check_hooks(hooks.keys(), "hooks=")
+    for key, hook in hooks.items():
+        if not callable(hook):
+            raise TypeError(f"hooks[{key!r}] must be callable")
+    return dict(hooks)
+
+
+def _without(layer: _Layer, hooked: AbstractSet[str]) -> _Layer:
+    """A layer without its entries under the hooked keys."""
+    if not hooked:
+        return layer
+    return layer._replace(data={k: v for k, v in layer.data.items() if k not in hooked})
+
+
+def _run_hooks(
+    composition: _Composition,
+    hooks: Mapping[str, Callable[[Config], BaseModel]],
+    loaded: Config,
+) -> tuple[dict[str, BaseModel], list[str]]:
+    """Each hook's section, validated as its own class, and the errors of those that
+    don't validate.
+
+    The hooks run in built-in order, each given ``loaded``. A hook that raises
+    propagates as it is. A field a result doesn't hold, as ``model_construct`` can
+    leave one, is ``Field required``, whatever its default.
+    """
+    validated: dict[str, BaseModel] = {}
+    lines: list[str] = []
+    for key in (k for k in _builtin_keys() if k in hooks):
+        holder = composition.held[key]
+        result = hooks[key](loaded)
+        if not isinstance(result, holder):
+            raise TypeError(
+                f"hooks[{key!r}] returned a {type(result).__qualname__}, "
+                f"not an instance of {holder.__qualname__}"
+            )
+        cls = type(result)
+        missing = [
+            f"  {key}.{_path((_key(cls, name, info),), cls)} ({Source('hook')}): "
+            "Field required"
+            for name, info in cls.model_fields.items()
+            if name not in vars(result)
+        ]
+        if missing:
+            lines += missing
+            continue
+        try:
+            validated[key] = cls.model_validate(_merge(result, {}))
+        except ValidationError as exc:
+            lines += [
+                f"  {key}"
+                + (f".{_path(error['loc'], cls)}" if error["loc"] else "")
+                + f" ({Source('hook')}): {_message(error)}"
+                for error in exc.errors(include_input=False, include_url=False)
+            ]
+    return validated, lines
+
+
+def _validate(
+    composition: _Composition, data: Mapping[str, Any], layers: Sequence[_Layer]
+) -> tuple[Config | None, list[str]]:
+    """The composed model validated from ``data``, or the error line of each failure."""
+    try:
+        return composition.model.model_validate(data), []
+    except ValidationError as exc:
+        return None, [
+            f"  {_path(error['loc'], composition.model)} "
+            f"({_source(error['loc'], layers)}): "
+            f"{_message(error)}"
+            for error in exc.errors(include_input=False, include_url=False)
+        ]
+
+
 def _load(
     sources: Iterable[Iterable[type[BaseModel]]],
     values: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None,
     *,
     argv: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
+    hooks: Mapping[str, Callable[[Config], BaseModel]] | None = None,
 ) -> _Loaded:
     """Compose the sections and load one config.
 
@@ -1493,11 +1627,27 @@ def _load(
     rest, as are the values of a default model instance a source merges over, so a
     validator that isn't idempotent runs twice on them.
 
+    ``hooks`` maps a built-in's key, ``serving``, ``telemetry`` or ``delivery``, to a
+    callable that supplies that section from the server's own config. A hooked key is
+    left out of every source: its env vars aren't read, its flags aren't parsed, so
+    passing one is an unknown flag, and the entries under it in the file or in
+    ``values`` are dropped. It loads at its defaults, so a hooked section's every field
+    needs a default, since its own sources aren't read, and its names aren't checked
+    against the server's. Once the config validates, the hooks run in built-in order,
+    each given that config, and each must return an instance of the class holding the
+    key. Each result is validated again as its own class, its errors reported together
+    under ``<key>.<path> (hook)``, and then the whole config is validated again with
+    each validated section in place, so a root validator sees the hooked values and runs
+    twice. Every leaf under a hooked key has the source ``hook``. A hook that raises
+    propagates as it is.
+
     Raises:
         TypeError: ``values`` isn't a mapping or section instances, ``values`` is
             given with ``argv`` or ``environ``, ``argv`` isn't a sequence of ``str``,
-            or ``environ`` isn't a mapping.
-        ValueError: Two instances for one key, or the config doesn't load.
+            ``environ`` isn't a mapping, ``hooks`` isn't a mapping of callables, or a
+            hook returns something other than an instance of its key's class.
+        ValueError: Two instances for one key, a key of ``hooks`` isn't a built-in's,
+            or the config doesn't load.
     """
     if values is not None and (argv is not None or environ is not None):
         raise TypeError(_BOTH)
@@ -1509,20 +1659,26 @@ def _load(
         raise TypeError(_BAD_ARGV)
     if environ is not None and not isinstance(environ, Mapping):
         raise TypeError(_BAD_ENVIRON)
+    hooks = _check_hook_mapping(hooks)
+    hooked = frozenset(hooks)
 
-    composition = _compose(sources)
+    composition = _compose(sources, hooked=hooked)
     items = composition.items
+    # The items whose names are read: one list for the env vars and the flags, so the
+    # flags' indexes are into it.
+    read = tuple(item for item in items if not _is_hooked(item, hooked))
     lines: list[str] = []
     layers: list[_Layer] = []
     if values is not None:
-        layers.append(_Layer("code", _given(composition, values), (((), None),)))
+        code = _Layer("code", _given(composition, values), (((), None),))
+        layers.append(_without(code, hooked))
     else:
         environ = os.environ if environ is None else environ
         flags: dict[int, str] = {}
         path: str | None = None
         failed = False
         if argv is not None:
-            flags, path, lines, failed = _read_argv(items, argv)
+            flags, path, lines, failed = _read_argv(read, argv)
         if not failed:
             if _blank(path):
                 path = environ.get(_RESERVED["env"])
@@ -1530,12 +1686,12 @@ def _load(
                 file, trouble = _read_file(path)
                 if trouble is not None:
                     raise ValueError("the config did not load:\n" + trouble)
-                layers.append(file)
-        env, env_errors = _read_env(items, environ)
+                layers.append(_without(file, hooked))
+        env, env_errors = _read_env(read, environ)
         arg, arg_errors = _named_layer(
             "arg",
             (
-                (index, items[index], items[index].arg, raw)
+                (index, read[index], read[index].arg, raw)
                 for index, raw in sorted(flags.items())
             ),
         )
@@ -1548,18 +1704,20 @@ def _load(
     for layer in layers:
         data = _merge(data, layer.data)
     data = _over_defaults(composition.model, data)
-    try:
-        loaded = composition.model.model_validate(data)
-    except ValidationError as exc:
-        lines += [
-            f"  {_path(error['loc'], composition.model)} "
-            f"({_source(error['loc'], layers)}): "
-            f"{_message(error)}"
-            for error in exc.errors(include_input=False, include_url=False)
-        ]
+    # Built outside an ``except``, so no original error is on a chain.
+    loaded, errors = _validate(composition, data, layers)
+    lines += errors
+    if not lines and hooks:
+        assert loaded is not None
+        validated, lines = _run_hooks(composition, hooks, loaded)
+        if not lines:
+            layers.append(
+                _Layer("hook", validated, tuple(((key,), None) for key in validated))
+            )
+            loaded, lines = _validate(composition, {**data, **validated}, layers)
     if lines:
-        # Raised outside the ``except``, so the original error is on no chain.
         raise ValueError("the config did not load:\n" + "\n".join(lines))
+    assert loaded is not None
 
     provided: dict[type, object] = {Config: loaded}
     for key, cls in composition.held.items():
@@ -1632,8 +1790,11 @@ class _Schema(GenerateJsonSchema):
     Pydantic marks ``SecretStr`` and ``SecretBytes`` as ``writeOnly``, but not
     ``Secret[T]``, so the mark is written from each model's fields rather than read from
     pydantic's output. ``_scrub`` then drops every marked property's default and
-    examples.
+    examples. The properties of each class in ``unread`` lose their ``env`` and
+    ``arg``, which a hooked section's items don't read.
     """
+
+    unread: typing.ClassVar[frozenset[type]] = frozenset()
 
     def model_schema(self, schema: Any) -> Any:
         json_schema = super().model_schema(schema)
@@ -1645,10 +1806,46 @@ class _Schema(GenerateJsonSchema):
             prop = properties.get(_schema_key(name, cls.model_fields[name]))
             if isinstance(prop, dict):
                 prop["sensitive"] = True
+        if cls in self.unread:
+            for prop in properties.values():
+                if isinstance(prop, dict):
+                    prop.pop("env", None)
+                    prop.pop("arg", None)
         return json_schema
 
 
-def config_schema(*sections: type[BaseModel]) -> dict[str, Any]:
+def _reached(classes: Iterable[type[BaseModel]]) -> set[type[BaseModel]]:
+    """The classes and every model their fields reach, at any depth."""
+    queue = list(classes)
+    seen = set(queue)
+    while queue:
+        cls = queue.pop()
+        for info in cls.model_fields.values():
+            for model in _models_in(info.annotation):
+                if issubclass(model, BaseModel) and model not in seen:
+                    seen.add(model)
+                    queue.append(model)
+    return seen
+
+
+def _unread(composition: _Composition, hooked: AbstractSet[str]) -> frozenset[type]:
+    """The models reached only through the hooked sections, whose names aren't read.
+
+    A model a section that isn't hooked reaches too keeps its names, which are read
+    there: the schema has one definition per class.
+    """
+    held = composition.held
+    under = _reached(held[key] for key in hooked)
+    read = _reached(cls for key, cls in held.items() if key not in hooked)
+    return frozenset(under - read)
+
+
+_BAD_HOOKED = "hooked= takes an iterable of built-in keys, such as ['serving']"
+
+
+def config_schema(
+    *sections: type[BaseModel], hooked: Iterable[str] = ()
+) -> dict[str, Any]:
     """The JSON Schema of the config that ``sections`` compose, without a server.
 
     The built-in sections are composed first and every registration rule applies, so a
@@ -1659,16 +1856,28 @@ def config_schema(*sections: type[BaseModel]) -> dict[str, Any]:
     so is any default that is a JSON object or sits on a model-typed field, which could
     hold one.
 
+    ``hooked`` names the built-ins a server supplies through ``hooks=``, and composes as
+    that server does: those sections stay in the schema, but their properties, at any
+    depth, have no ``env`` or ``arg``, which aren't read, and their names aren't checked
+    against the others. A model that a section not hooked reaches too keeps its names.
+
     Raises:
-        TypeError: A section isn't a marked, strict pydantic model, or an item's name
-            or ``sensitive=True`` can't be used.
-        ValueError: Two sections claim one key, a key clashes with the root, or two
-            items declare one name.
+        TypeError: A section isn't a marked, strict pydantic model, an item's name or
+            ``sensitive=True`` can't be used, or ``hooked`` isn't an iterable of keys.
+        ValueError: Two sections claim one key, a key clashes with the root, two items
+            declare one name, or a key of ``hooked`` isn't a built-in's.
     """
+    if isinstance(hooked, (str, bytes)) or not isinstance(hooked, Iterable):
+        raise TypeError(_BAD_HOOKED)
+    keys = _check_hooks(hooked, "hooked=")
+    composition = _compose([sections], hooked=keys)
+    generator = type(
+        "_HookedSchema", (_Schema,), {"unread": _unread(composition, keys)}
+    )
     with warnings.catch_warnings():
         # Pydantic's warning about a default it can't write prints the default, and
         # the scrub leaves every such default out of the schema anyway.
         warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
-        schema = _compose([sections]).model.model_json_schema(schema_generator=_Schema)
+        schema = composition.model.model_json_schema(schema_generator=generator)
     _scrub(schema)
     return schema

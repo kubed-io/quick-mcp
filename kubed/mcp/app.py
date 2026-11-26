@@ -194,6 +194,18 @@ class QuickMCP:
     ``os.environ`` when None. Neither goes with ``config``, which reads no file, env var
     or flag: passing either with it raises ``TypeError``. ``mcp.config_sources`` says
     where each item's value came from.
+
+    ``hooks`` supplies a built-in's section from the server's own config, in place of
+    that section's file entries, env vars and flags, none of which is then read. It maps
+    ``"serving"``, ``"telemetry"`` or ``"delivery"`` to a callable. Once the config
+    validates, with the hooked sections at their defaults (a hooked section's every
+    field needs a default, since its own sources aren't read), each hook is called
+    with it, in that order, and returns an instance of the class holding its key, the
+    server's subclass when one replaces the built-in. That instance is validated, the
+    config validated again with it in place, and its items' source is ``hook``. Any
+    other key raises ``ValueError``, and a value that isn't callable, a ``hooks`` that
+    isn't a mapping or a hook returning another type raises ``TypeError``. A hook that
+    raises propagates as it is.
     """
 
     def __init__(
@@ -202,6 +214,7 @@ class QuickMCP:
         *,
         sections: Iterable[type[BaseModel]] = (),
         components: Iterable[Component] = (),
+        hooks: Mapping[str, Callable[[Config], BaseModel]] | None = None,
         config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
         argv: Sequence[str] | None = None,
         environ: Mapping[str, str] | None = None,
@@ -214,6 +227,7 @@ class QuickMCP:
             config,
             argv=argv,
             environ=environ,
+            hooks=hooks,
         )
         header_prefix = _header_prefix(header_prefix)
         self._serving = False
