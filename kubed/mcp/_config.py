@@ -10,10 +10,10 @@ from __future__ import annotations
 import dataclasses
 import keyword
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple, TypeVar
 
-from pydantic import BaseModel, ConfigDict, create_model
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 from pydantic import Field as _PydanticField
 from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
 
@@ -299,7 +299,12 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
                 f"{root.__qualname__}, and the key of {cls.__qualname__}"
             )
         if all(not f.is_required() for f in cls.model_fields.values()):
-            fields[key] = (cls, _PydanticField(default_factory=cls))
+            # Validate ``{}`` rather than call ``cls()``, so a failing default is
+            # reported under the key.
+            fields[key] = (
+                cls,
+                _PydanticField(default_factory=dict, validate_default=True),
+            )
         else:
             fields[key] = (cls, ...)
 
@@ -310,3 +315,171 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
         held,
         {key: tuple(losers) for key, losers in replaced.items()},
     )
+
+
+class _Loaded(NamedTuple):
+    """What ``_load`` returns: the config, and what to inject for each class."""
+
+    config: Config
+    provided: dict[type, object]
+
+
+def _bad_values(what: str) -> TypeError:
+    return TypeError(
+        f"config= takes a mapping or section instances, got {what}; "
+        "classes go in sections="
+    )
+
+
+def _spread(
+    items: Iterable[Any],
+    held: dict[str | None, type[BaseModel]],
+    replaced: dict[str | None, tuple[type[BaseModel], ...]],
+) -> dict[str, Any]:
+    """Turn section instances into one mapping, each under the key it belongs to."""
+    data: dict[str, Any] = {}
+    seen: set[str | None] = set()
+    for item in items:
+        if isinstance(item, type):
+            raise _bad_values(f"the class {item.__qualname__}")
+        if not isinstance(item, BaseModel):
+            raise _bad_values(f"an instance of {type(item).__qualname__}")
+        kind = type(item)
+        exact = [key for key, cls in held.items() if cls is kind]
+        matches = exact or [key for key, cls in held.items() if isinstance(item, cls)]
+        # The most derived winning class takes an instance several of them match.
+        matches.sort(key=lambda key: len(held[key].__mro__), reverse=True)
+        if not matches:
+            for key, losers in replaced.items():
+                if isinstance(item, losers):
+                    raise TypeError(
+                        f"{kind.__qualname__} lost {_where(key)} to "
+                        f"{held[key].__qualname__}: give an instance of "
+                        f"{held[key].__qualname__}"
+                    )
+            raise _bad_values(
+                f"an instance of {kind.__qualname__}, which isn't registered"
+            )
+        key = matches[0]
+        if key in seen:
+            raise ValueError(f"Two instances were given for {_where(key)}")
+        seen.add(key)
+        if key is None:
+            data.update({name: getattr(item, name) for name in kind.model_fields})
+        else:
+            data[key] = item
+    return data
+
+
+def _path(loc: tuple[int | str, ...]) -> str:
+    """Join a pydantic ``loc``: names with ``.``, indexes as ``[i]``."""
+    if not loc:
+        return "the root section"
+    path = ""
+    for part in loc:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        elif part.startswith("["):  # pydantic's "[key]", for a bad dict key
+            path += part
+        else:
+            path += f".{part}" if path else part
+    return path
+
+
+def _source(loc: tuple[int | str, ...], given: Mapping[str, Any] | None) -> str:
+    """Where a value at ``loc`` came from. Files, env vars and argv join this later."""
+    if given is None:
+        return "default"
+    if not loc or loc[0] in given:
+        return "code"
+    return "default"
+
+
+# Error types whose pydantic text can carry the input, and the fixed text said instead.
+_FIXED_MESSAGES = {
+    "union_tag_invalid": "the tag isn't one of the expected values",
+    "zoneinfo_str": "invalid timezone",
+    "byte_size_unit": "could not interpret the byte unit",
+    "timezone_offset": "the timezone offset isn't the expected one",
+    "bytes_invalid_encoding": "the data isn't valid in the expected encoding",
+}
+# A server's own validator raises these with its exception in ``ctx["error"]``.
+# Pydantic's own checks use ``value_error`` too, with a string detail, so the context
+# decides.
+_OWN_WORDS = frozenset({"value_error", "assertion_error"})
+
+
+def _message(error: Mapping[str, Any]) -> str:
+    """The text for one validation error, never carrying the input.
+
+    Pydantic's text is kept when it comes from the schema alone. The ones that append
+    what went wrong with the input (``*_parsing``, ``json_invalid``, ``import_error``)
+    are cut at their first ``, `` or ``: ``, which always comes before the detail, and a
+    few others are replaced by a fixed text.
+    """
+    kind = error["type"]
+    ctx = error.get("ctx") or {}
+    if kind in _OWN_WORDS and isinstance(ctx.get("error"), Exception):
+        return error["msg"]
+    if kind in _FIXED_MESSAGES:
+        return _FIXED_MESSAGES[kind]
+    msg = error["msg"]
+    if "error" in ctx or "reason" in ctx:
+        cuts = [i for i in (msg.find(", "), msg.find(": ")) if i >= 0]
+        return msg[: min(cuts)] if cuts else msg
+    return msg
+
+
+def _load(
+    sources: Iterable[Iterable[type[BaseModel]]],
+    values: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None,
+) -> _Loaded:
+    """Compose the sections and load one config from defaults and values given in code.
+
+    ``values`` is a mapping, one section instance, or an iterable of them. Given values
+    are never read from a file, an env var or argv. A load error names each path and
+    its source, and never a value.
+
+    A root instance's fields are spread into the mapping and validated again with the
+    rest, so a root validator that isn't idempotent runs twice on them.
+
+    Raises:
+        TypeError: ``values`` isn't a mapping or section instances.
+        ValueError: Two instances for one key, or the values don't validate.
+    """
+    composition = _compose(sources)
+    given: dict[str, Any] | None
+    if values is None:
+        given = None
+    elif isinstance(values, BaseModel):
+        given = _spread([values], composition.held, composition.replaced)
+    elif isinstance(values, Mapping):
+        given = dict(values)
+    elif isinstance(values, type):
+        raise _bad_values(f"the class {values.__qualname__}")
+    elif isinstance(values, (str, bytes)):
+        raise _bad_values(f"an instance of {type(values).__qualname__}")
+    elif isinstance(values, Iterable):
+        given = _spread(values, composition.held, composition.replaced)
+    else:
+        raise _bad_values(f"an instance of {type(values).__qualname__}")
+
+    lines: list[str] = []
+    try:
+        loaded = composition.model.model_validate({} if given is None else given)
+    except ValidationError as exc:
+        lines = [
+            f"  {_path(error['loc'])} ({_source(error['loc'], given)}): "
+            f"{_message(error)}"
+            for error in exc.errors(include_input=False, include_url=False)
+        ]
+    if lines:
+        # Raised outside the ``except``, so the original error is on no chain.
+        raise ValueError("the config did not load:\n" + "\n".join(lines))
+
+    provided: dict[type, object] = {Config: loaded}
+    for key, cls in composition.held.items():
+        value = loaded if key is None else getattr(loaded, key)
+        for each in (cls, *composition.replaced.get(key, ())):
+            provided[each] = value
+    return _Loaded(loaded, provided)

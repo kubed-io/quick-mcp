@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
-from typing import Annotated, NewType
+import datetime
+import uuid
+import zoneinfo
+from types import MappingProxyType
+from typing import Annotated, Literal, NewType
 
 import pytest
 from pydantic import (
     BaseModel,
     ConfigDict,
+    EmailStr,
+    ImportString,
+    Json,
     ValidationError,
     field_validator,
     model_validator,
@@ -16,7 +24,7 @@ from pydantic import (
 from typing_extensions import TypeAliasType, TypedDict
 
 import kubed.mcp._config
-from kubed.mcp._config import Config, Field, _compose, config
+from kubed.mcp._config import Config, Field, _compose, _load, config
 
 pytestmark = pytest.mark.unit
 
@@ -458,3 +466,312 @@ def test_a_new_type_and_a_type_alias_are_followed() -> None:
         _compose([[HoldsNewType]])
     with pytest.raises(TypeError, match=r"Loose at aliased\.item"):
         _compose([[HoldsAlias]])
+
+
+# -- loading
+
+
+@config("required")
+class Required(Config):
+    token: str
+
+
+@config("secretive")
+class Secretive(Config):
+    token: str = Field("dflt", sensitive=True)
+
+
+class Unregistered(Config):
+    token: str = "hunter2"
+
+
+@config("node")
+class HoldsTree(Config):
+    children: list[Node] = Field(default_factory=list)
+
+
+@config()
+class Failing(Config):
+    @model_validator(mode="after")
+    def _never(self) -> Failing:
+        raise ValueError("no way")
+
+
+class TagA(Config):
+    kind: Literal["a"]
+
+
+class TagB(Config):
+    kind: Literal["b"]
+
+
+@config("leaky")
+class Leaky(Config):
+    tag: Annotated[TagA | TagB, Field(discriminator="kind")] | None = None
+    module: ImportString | None = None
+    ident: uuid.UUID | None = None
+    when: datetime.datetime | None = None
+    doc: Json[int] | None = None
+    zone: zoneinfo.ZoneInfo | None = None
+    mail: EmailStr | None = None
+
+
+@config("keyed")
+class Keyed(Config):
+    m: dict[int, int] = Field(default_factory=dict)
+
+
+@config("keyfail")
+class KeyFail(Config):
+    @model_validator(mode="after")
+    def _refuse(self) -> KeyFail:
+        raise ValueError("nope keyed")
+
+
+class BadInner(Config):
+    x: int = Field("bad", validate_default=True)
+
+
+@config("outer")
+class Outer(Config):
+    inner: BadInner = Field(default_factory=dict, validate_default=True)
+
+
+@config()
+class R1(Config):
+    pass
+
+
+@config()
+class R2(R1):
+    pass
+
+
+@config()
+class RootOf(Config):
+    pass
+
+
+@config("x")
+class XOfRoot(RootOf):
+    pass
+
+
+class Child(XOfRoot):
+    pass
+
+
+@dataclasses.dataclass
+class Settings:
+    port: int = 8000
+
+
+def test_no_sections_load_an_empty_config() -> None:
+    loaded = _load([[]], None)
+    assert type(loaded.config).model_fields == {}
+    assert isinstance(loaded.config, Config)
+    assert loaded.provided == {Config: loaded.config}
+
+
+def test_defaults_load_and_properties_and_validators_run() -> None:
+    loaded = _load([[Root, Recording, Nest]], None)
+    assert loaded.config.name == "flow" and loaded.config.shout == "FLOW"
+    assert loaded.config.recording.enabled is False
+    # a section's assigning validator still works
+    assert loaded.config.nest.label == "unnamed"
+
+
+def test_three_levels_load_from_a_dict() -> None:
+    loaded = _load(
+        [[Nest]], {"nest": {"label": " x ", "middle": {"deep": {"level": 4}}}}
+    )
+    assert loaded.config.nest.label == "x"
+    assert loaded.config.nest.middle.deep.twice == 8
+
+
+def test_a_dict_may_hold_section_instances() -> None:
+    recording = Recording(inbox="/in")
+    loaded = _load([[Root, Recording]], {"name": "kb", "recording": recording})
+    assert loaded.config.recording is recording and loaded.config.name == "kb"
+
+
+def test_section_instances_go_to_their_keys_and_a_root_spreads() -> None:
+    recording = Recording(inbox="/in")
+    loaded = _load([[Root, Recording]], [Root(name="kb"), recording])
+    assert loaded.config.name == "kb" and loaded.config.recording is recording
+
+
+def test_a_single_instance_is_one_section() -> None:
+    assert _load([[Root]], Root(name="kb")).config.name == "kb"
+
+
+def test_a_non_dict_mapping_is_accepted() -> None:
+    assert _load([[Root]], MappingProxyType({"name": "kb"})).config.name == "kb"
+
+
+def test_the_provided_values_cover_every_class() -> None:
+    loaded = _load([[Root, Base, Sub]], None)
+    assert loaded.provided[Sub] is loaded.provided[Base] is loaded.config.base
+    assert loaded.provided[Config] is loaded.provided[Root] is loaded.config
+
+
+@pytest.mark.parametrize(
+    "values, path",
+    [
+        ({"nope": 1}, "nope (code)"),
+        ({"recording": {"nope": 1}}, "recording.nope (code)"),
+        ({"nest": {"middle": {"deep": {"nope": 1}}}}, "nest.middle.deep.nope (code)"),
+    ],
+)
+def test_an_unknown_key_names_its_path_and_source(values, path) -> None:
+    with pytest.raises(ValueError, match=r"^the config did not load:") as caught:
+        _load([[Root, Recording, Nest]], values)
+    assert f"  {path}: Extra inputs are not permitted" in str(caught.value)
+
+
+def test_a_missing_required_section_is_from_default() -> None:
+    with pytest.raises(ValueError, match=r"required \(default\): Field required"):
+        _load([[Required]], None)
+
+
+def test_a_list_index_is_written_in_brackets() -> None:
+    with pytest.raises(ValueError, match=r"  node\.children\[0\]\.nope \(code\)"):
+        _load([[HoldsTree]], {"node": {"children": [{"nope": 1}]}})
+
+
+def test_an_email_error_never_holds_the_input() -> None:
+    pytest.importorskip("email_validator")
+    for mail in ("a@s3cr\u00e9t\u0661\u06f1.com", "a@s3cr_t.com"):
+        with pytest.raises(ValueError) as caught:
+            _load([[Leaky]], {"leaky": {"mail": mail}})
+        message = str(caught.value)
+        assert "s3cr" not in message
+        assert "leaky.mail (code): value is not a valid email address" in message
+
+
+def test_a_dict_key_error_has_no_stray_dot() -> None:
+    with pytest.raises(ValueError, match=r"  keyed\.m\.k\[key\] \(code\)"):
+        _load([[Keyed]], {"keyed": {"m": {"k": 1}}})
+
+
+def test_an_error_with_no_path_names_the_root_section() -> None:
+    with pytest.raises(ValueError, match=r"  the root section \(default\): .*no way"):
+        _load([[Failing]], None)
+
+
+def test_a_load_error_never_holds_a_value() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Secretive]], {"secretive": {"token": ["s3cret"]}})
+    assert "s3cret" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "values, match",
+    [
+        (Settings(), "sections="),  # a dataclass, as test_app's
+        (argparse.Namespace(port=1), "sections="),
+        (Unregistered(), "sections="),  # a Config subclass never registered
+        ([Recording], "sections="),  # a class among values
+        ("recording", "mapping or section instances"),
+        (b"recording", "mapping or section instances"),
+        (42, "mapping or section instances"),
+        (Recording, "the class Recording"),
+    ],
+)
+def test_an_old_style_config_is_a_type_error_naming_sections(values, match) -> None:
+    with pytest.raises(TypeError, match=match) as caught:
+        _load([[Root, Recording]], values)
+    assert "sections=" in str(caught.value)
+
+
+def test_an_unregistered_instance_never_leaks_its_values() -> None:
+    for values in (Unregistered(token="s3cret"), [Unregistered(token="s3cret")]):
+        with pytest.raises(TypeError) as caught:
+            _load([[Root]], values)
+        assert "s3cret" not in str(caught.value)
+        assert "Unregistered" in str(caught.value)
+
+
+def test_an_instance_of_a_replaced_class_names_the_winner() -> None:
+    with pytest.raises(TypeError, match="Sub"):
+        _load([[Base, Sub]], [Base()])
+
+
+def test_two_instances_for_one_key_are_refused() -> None:
+    with pytest.raises(ValueError, match="'recording'"):
+        _load([[Recording]], [Recording(), Recording()])
+
+
+def test_instances_are_kept_as_given() -> None:
+    recording = Recording(inbox="/in")
+    assert _load([[Recording]], {"recording": recording}).config.recording is recording
+    assert _load([[Recording]], [recording]).config.recording is recording
+
+
+def test_a_source_is_code_only_for_a_key_that_was_given() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Required, Recording]], {"recording": {"nope": 1}})
+    message = str(caught.value)
+    assert "recording.nope (code)" in message
+    assert "required (default): Field required" in message
+
+
+_SECRET = "s3cret"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"tag": {"kind": _SECRET}},
+        {"module": f"{_SECRET}.mod"},
+        {"ident": f"{_SECRET}-zzzz"},
+        {"when": _SECRET},
+        {"doc": _SECRET},
+        {"zone": _SECRET},
+    ],
+)
+def test_a_pydantic_message_that_carries_the_input_is_replaced(values) -> None:
+    with pytest.raises(ValueError, match=r"^the config did not load:") as caught:
+        _load([[Leaky]], {"leaky": values})
+    message = str(caught.value)
+    assert _SECRET not in message and "found `" not in message
+    assert f"leaky.{next(iter(values))} (code)" in message
+
+
+def test_the_servers_own_validator_text_is_kept() -> None:
+    with pytest.raises(ValueError, match=r"nope keyed"):
+        _load([[KeyFail]], {"keyfail": {}})
+
+
+def test_a_keyed_section_that_refuses_its_defaults_names_its_key() -> None:
+    with pytest.raises(ValueError, match=r"  keyfail \(default\): .*nope keyed"):
+        _load([[KeyFail]], None)
+
+
+def test_a_nested_default_failure_names_the_full_path() -> None:
+    with pytest.raises(ValueError, match=r"  outer\.inner\.x \(default\)"):
+        _load([[Outer]], None)
+
+
+def test_a_root_error_with_values_given_is_from_code() -> None:
+    with pytest.raises(ValueError, match=r"the root section \(code\)"):
+        _load([[Failing]], {})
+
+
+def test_an_int_is_named_as_an_instance() -> None:
+    with pytest.raises(TypeError) as caught:
+        _load([[Root]], 42)
+    assert "an instance of int" in str(caught.value) and "a int" not in str(
+        caught.value
+    )
+
+
+def test_an_instance_of_a_replaced_root_class_names_the_winner() -> None:
+    with pytest.raises(TypeError, match="R2"):
+        _load([[R1, R2]], [R1()])
+
+
+def test_an_instance_goes_to_the_most_derived_matching_key() -> None:
+    child = Child()
+    assert _load([[RootOf, XOfRoot]], [child]).config.x is child
