@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The telemetry start line shows where each OTLP exporter sends, as host and port.
+
 ## [0.4.3] - 2026-11-26
 
 ### Fixed

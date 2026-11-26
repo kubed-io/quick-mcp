@@ -2427,8 +2427,71 @@ async def test_the_start_line_names_otels_exporters(
             pass
     assert start_lines(caplog) == [
         "telemetry: profiles → pyroscope.example.com:4040; "
-        "otel → traces console, metrics otlp, logs none"
+        "otel → traces console, metrics otlp (default), logs none"
     ]
+
+
+def otel_line() -> str:
+    signals = kubed.mcp.telemetry._Signals(None, otel=object())
+    return kubed.mcp.telemetry._start_line(signals, None)
+
+
+def test_the_start_line_shows_default_with_no_endpoint() -> None:
+    assert otel_line() == "telemetry: otel → traces otlp (default), metrics otlp (default), logs none"
+
+
+def test_the_start_line_names_the_shared_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.example:4318")
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (collector.example:4318), "
+        "metrics otlp (collector.example:4318), logs none"
+    )
+
+
+def test_a_per_signal_endpoint_beats_the_shared_one(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://shared.example:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://traces.example:443/v1/traces")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "")  # empty counts as unset
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (traces.example:443), "
+        "metrics otlp (shared.example:4318), logs none"
+    )
+
+
+def test_an_endpoint_never_shows_its_credentials(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "https://user:s3cret@collector.example:4318/v1/traces?x=s3cret",
+    )
+    line = otel_line()
+    assert line.startswith("telemetry: otel → traces otlp (collector.example:4318), metrics otlp (default)")
+    assert "s3cret" not in line and "user" not in line and "/v1" not in line
+
+
+def test_logs_over_otlp_show_their_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://logs.example:4318")
+    assert otel_line().endswith(", logs none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "otlp")
+    assert otel_line().endswith(", logs otlp (logs.example:4318)")
+
+
+def test_only_the_otlp_entries_of_a_list_show_an_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", " otlp_proto_grpc , console ")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "prometheus")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
+    assert otel_line() == (
+        "telemetry: otel → traces otlp_proto_grpc (collector:4317),console, "
+        "metrics prometheus, logs none"
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["s3cret", "   ", "http://"])
+def test_an_endpoint_with_no_host_says_so(monkeypatch, endpoint) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (an address with no host), "
+        "metrics otlp (an address with no host), logs none"
+    )
 
 
 @pytest.mark.parametrize(
