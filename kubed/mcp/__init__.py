@@ -7,10 +7,10 @@ Protocol plumbing is in ``kubed.mcp.protocol``, auth in ``kubed.mcp.auth`` and t
 request's headers and query in ``kubed.mcp.request``.
 
 Every name but ``Component``, ``Config``, ``DeliverySettings``, ``Field``,
-``NoDecode``, ``ServingSettings``, ``Source``, ``TelemetrySettings``, ``config`` and
-``config_schema`` resolves on first use, so importing ``kubed.mcp`` loads no FastMCP
-until one of them is used, and a config module can declare its sections and
-components and write their schema without loading FastMCP.
+``LoadedConfig``, ``NoDecode``, ``ServingSettings``, ``Source``, ``TelemetrySettings``,
+``config``, ``config_schema`` and ``load_config`` resolves on first use, so importing
+``kubed.mcp`` loads no FastMCP until one of them is used, and a config module can
+declare its sections and components and write their schema without loading FastMCP.
 """
 
 from __future__ import annotations
@@ -20,7 +20,16 @@ from importlib.metadata import version
 from typing import TYPE_CHECKING
 
 from ._builtins import DeliverySettings, ServingSettings
-from ._config import Config, Field, NoDecode, Source, config, config_schema
+from ._config import (
+    Config,
+    Field,
+    LoadedConfig,
+    NoDecode,
+    Source,
+    config,
+    config_schema,
+    load_config,
+)
 from .components import Component
 from .telemetry import TelemetrySettings
 
@@ -65,6 +74,7 @@ __all__ = [
     "Field",
     "Image",
     "Inject",
+    "LoadedConfig",
     "Middleware",
     "NoDecode",
     "NotFoundError",
@@ -87,6 +97,7 @@ __all__ = [
     "ValidationError",
     "config",
     "config_schema",
+    "load_config",
     "lookup",
 ]
 

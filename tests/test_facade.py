@@ -98,6 +98,7 @@ OWN = {
         "DeliverySettings",
         "Field",
         "Inject",
+        "LoadedConfig",
         "NoDecode",
         "QuickMCP",
         "ServingSettings",
@@ -105,6 +106,7 @@ OWN = {
         "TelemetrySettings",
         "config",
         "config_schema",
+        "load_config",
         "lookup",
     },
     "kubed.mcp.protocol": {"AdvertiseLegacyExtensions", "types"},
@@ -192,6 +194,7 @@ def _fresh(code: str) -> dict:
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
         "from kubed.mcp import Config, Field, NoDecode, Source, config, config_schema",
         "from kubed.mcp import Component, DeliverySettings, ServingSettings",
+        "from kubed.mcp import LoadedConfig, load_config\nassert isinstance(load_config(environ={}), LoadedConfig)",
         "from kubed.mcp import Config, Field, config, config_schema\n"
         "@config('recording')\n"
         "class Recording(Config):\n"
@@ -251,7 +254,7 @@ def test_a_submodule_still_imports_from_the_package() -> None:
     "module, extra, allowed",
     [
         ("kubed.mcp.telemetry", set(), {"_config"}),
-        ("kubed.mcp._config", {"yaml"}, set()),
+        ("kubed.mcp._config", {"yaml"}, {"components"}),
         ("kubed.mcp._builtins", set(), {"_config", "telemetry", "components"}),
         ("kubed.mcp.components", set(), set()),
     ],

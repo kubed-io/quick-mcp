@@ -21,9 +21,9 @@ from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
 from ._builtins import DeliverySettings, ServingSettings, _builtin_components
-from ._config import Config, Source, _load
+from ._config import Config, LoadedConfig, Source, load_config
 from ._handshake import _Describe
-from .components import Component, _start_all, _stop_all
+from .components import Component, _start_all, _stop_all, _what
 from .container import (
     _CALL,
     SERVING,
@@ -152,28 +152,6 @@ def quiet_fastmcp_logging() -> None:
     logger.propagate = True
 
 
-def _components(components: Iterable[Component]) -> tuple[Component, ...]:
-    """``components=`` as a tuple, each one checked to be a ``Component`` instance."""
-    if isinstance(components, (Component, type)) or not isinstance(
-        components, Iterable
-    ):
-        raise TypeError(
-            "components= takes Component instances in a sequence, got "
-            + _what(components)
-        )
-    checked = tuple(components)
-    for each in checked:
-        if not isinstance(each, Component):
-            raise TypeError(f"components= takes Component instances, got {_what(each)}")
-    return checked
-
-
-def _what(value: object) -> str:
-    if isinstance(value, type):
-        return f"the class {value.__qualname__}"
-    return f"an instance of {type(value).__qualname__}"
-
-
 def _refuse_serving_options(
     serving: ServingSettings, http_options: Mapping[str, Any]
 ) -> None:
@@ -213,9 +191,10 @@ class QuickMCP:
     registers at the end of construction, after the built-in components, and each
     starts when serving starts and stops when it ends (``Component``). ``config``
     gives their values in code: a mapping, a section instance, or an iterable of them.
-    The config loads first thing in ``__init__``, so a bad one stops construction, and
-    ``mcp.config`` is the loaded instance. Each section class resolves
-    by ``Inject[...]``, and ``Inject[Config]`` is the whole config.
+    The config loads first thing in ``__init__`` (unless ``loaded`` gives it already
+    loaded), so a bad one stops construction, and ``mcp.config`` is the loaded
+    instance. Each section class resolves by ``Inject[...]``, and ``Inject[Config]`` is
+    the whole config.
 
     ``argv`` is the server's flags, ``sys.argv[1:]`` from its entry point: None reads
     none, as quick-mcp never reads ``sys.argv``. ``environ`` is the env vars read, and
@@ -234,14 +213,22 @@ class QuickMCP:
     other key raises ``ValueError``, and a value that isn't callable, a ``hooks`` that
     isn't a mapping or a hook returning another type raises ``TypeError``. A hook that
     raises propagates as it is.
+
+    ``loaded`` is a config ``load_config()`` loaded, and the server is built from it as
+    it is: no source is read again, ``mcp.config_sources`` is its record, and its
+    components register and start as ``components=`` do. Passing it with ``sections``,
+    ``components``, ``hooks``, ``config``, ``argv`` or ``environ`` raises ``TypeError``,
+    as does a ``loaded`` that isn't a ``LoadedConfig``. A ``LoadedConfig`` builds one
+    server, so a second ``QuickMCP`` given the same one raises ``TypeError``.
     """
 
     def __init__(
         self,
         name: str,
         *,
-        sections: Iterable[type[BaseModel]] = (),
-        components: Iterable[Component] = (),
+        loaded: LoadedConfig | None = None,
+        sections: Iterable[type[BaseModel]] | None = None,
+        components: Iterable[Component] | None = None,
         hooks: Mapping[str, Callable[[Config], BaseModel]] | None = None,
         config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
         argv: Sequence[str] | None = None,
@@ -249,28 +236,53 @@ class QuickMCP:
         header_prefix: str | None = None,
         **fastmcp_options: Any,
     ):
-        components = _components(components)
-        loaded = _load(
-            [[c.section for c in components if c.section is not None], sections],
-            config,
-            argv=argv,
-            environ=environ,
-            hooks=hooks,
-        )
+        if loaded is not None:
+            if not isinstance(loaded, LoadedConfig):
+                raise TypeError(
+                    f"loaded= takes what load_config() returns, got {_what(loaded)}"
+                )
+            given = [
+                f"{key}="
+                for key, value in (
+                    ("sections", sections),
+                    ("components", components),
+                    ("hooks", hooks),
+                    ("config", config),
+                    ("argv", argv),
+                    ("environ", environ),
+                )
+                if value is not None
+            ]
+            if given:
+                raise TypeError(
+                    "loaded= is already loaded: pass "
+                    f"{', '.join(given)} to load_config(), not with loaded="
+                )
+        else:
+            loaded = load_config(
+                sections=() if sections is None else sections,
+                components=() if components is None else components,
+                hooks=hooks,
+                config=config,
+                argv=argv,
+                environ=environ,
+            )
+        checked = loaded._components
+        loaded_config = loaded._loaded
         header_prefix = _header_prefix(header_prefix)
         self._serving = False
         self._container = Container()
-        self._config = loaded.config
-        self._config_sources = loaded.sources
-        self._provided = loaded.provided
+        self._config = loaded_config.config
+        self._config_sources = loaded_config.sources
+        self._provided = loaded_config.provided
         parts = [
             (
                 c,
                 None
                 if c.section is None
-                else cast(BaseModel, loaded.provided[c.section]),
+                else cast(BaseModel, loaded_config.provided[c.section]),
             )
-            for c in (*_builtin_components(name), *components)
+            for c in (*_builtin_components(name), *checked)
         ]
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
@@ -279,7 +291,7 @@ class QuickMCP:
                 self._container,
                 lifespan,
                 parts=parts,
-                boot_line=loaded.boot_line,
+                boot_line=loaded_config.boot_line,
                 on_enter=self._serving_starts,
             ),
             **fastmcp_options,
@@ -289,7 +301,7 @@ class QuickMCP:
         # metrics in at registration, below.
         self.server.middleware.insert(0, _CallScope(self._container))
         SERVING[self.server] = self._container
-        for key, value in loaded.provided.items():
+        for key, value in loaded_config.provided.items():
             self._container.provide(key, value)
         # FastMCP's own, unchanged.
         self.prompt = self.server.prompt
@@ -318,6 +330,9 @@ class QuickMCP:
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
         self.add_middleware(_Describe(lambda: self._instructions))
+        # Claimed only once every argument has passed: from here on a component may
+        # have registered, so the load stays claimed.
+        loaded._claim()
         # Last, so a component's middleware goes in after the scopes above are placed
         # by their index: the built-ins first, then the server's, in order.
         for component, section in parts:
