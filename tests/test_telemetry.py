@@ -7,7 +7,10 @@ import importlib
 import inspect
 import json
 import logging
+import logging.handlers
 import os
+import queue
+import re
 import socket
 import subprocess
 import sys
@@ -26,6 +29,7 @@ import kubed.mcp
 import kubed.mcp.telemetry
 from kubed.mcp import Component, Inject, QuickMCP, TelemetrySettings, config
 from kubed.mcp._builtins import _TelemetryComponent
+from kubed.mcp._otel import _TraceText
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
 
@@ -51,9 +55,12 @@ def _clean(monkeypatch) -> Iterator[None]:
         monkeypatch.delenv(name, raising=False)
     # _set_defaults writes os.environ directly, so the whole of it is put back.
     environ = dict(os.environ)
+    # A start whose stop the test never runs leaves its trace-text factory set.
+    factory = logging.getLogRecordFactory()
     _reset_otel()
     yield
     _reset_otel()
+    logging.setLogRecordFactory(factory)
     for name in [n for n in os.environ if n not in environ]:
         del os.environ[name]
     for name, value in environ.items():
@@ -660,7 +667,11 @@ def test_the_real_configuration_exports_a_named_tagged_span() -> None:
     # TEL-15 on the initialize() path: the record carries the server span's trace.
     log_span = next(o for o in server if o["name"] == "tools/call log")
     trace_id = log_span["context"]["trace_id"].removeprefix("0x")
-    assert f"inside trace={trace_id}" in out.stderr
+    assert re.search(
+        rf"^inside trace_id={trace_id} span_id=[0-9a-f]{{16}} trace={trace_id}$",
+        out.stderr,
+        re.M,
+    )
     # The second server, otel on after the first stopped: served, and said why not.
     assert "second served pong" in out.stderr
     assert out.stderr.count("OpenTelemetry runs once per process") == 1
@@ -677,7 +688,10 @@ def test_otel_leaves_a_bare_root_logger_bare(mode) -> None:
         assert seen["handlers"] == []
         assert seen["level"] == logging.WARNING
     # So logging.lastResort still prints the tool's WARNING.
-    assert "inside" in out.stderr.splitlines()
+    assert any(
+        re.fullmatch(r"inside trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", line)
+        for line in out.stderr.splitlines()
+    )
     if mode == "bare-configured":
         # The child's own provider traced: initialize() never replaced it.
         server = [
@@ -1202,7 +1216,7 @@ async def test_log_records_carry_the_trace_and_root_keeps_its_handlers(
         for s in spans.get_finished_spans()
         if s.kind is SpanKind.SERVER and s.name == "tools/call log"
     ]
-    records = [r for r in keep.records if r.getMessage() == "inside"]
+    records = [r for r in keep.records if r.msg == "inside"]
     assert len(calls) == 1
     assert len(records) == 1
     assert records[0].otelTraceID == format(calls[0].context.trace_id, "032x")
@@ -1274,6 +1288,170 @@ async def test_logging_that_fails_to_instrument_still_keeps_the_trace(
     ]
     assert_safe(caplog.records, "s3cret")
     assert not LoggingInstrumentor().is_instrumented_by_opentelemetry
+
+
+# -- trace ids in the line (TEL-18) -------------------------------------------
+
+
+class Lines(logging.Handler):
+    """Keeps each record as its formatter writes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+
+class as_json(logging.Formatter):
+    """A formatter that reads ``getMessage()``, as a JSON log formatter does."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({"level": record.levelname, "message": record.getMessage()})
+
+
+def iter_queue(source: queue.SimpleQueue) -> Iterator[logging.LogRecord]:
+    while True:
+        try:
+            yield source.get_nowait()
+        except queue.Empty:
+            return
+
+
+async def test_a_line_inside_a_span_ends_with_its_ids(traced, spans) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.trace import SpanKind
+
+    text, data, keep = Lines(), Lines(), Keep()
+    text.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    data.setFormatter(as_json())
+    mcp = served("ids", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def log() -> str:
+        logging.getLogger("tests.tool").warning("value %s", 5)
+        return "logged"
+
+    root = logging.getLogger()
+    for handler in (text, data, keep):
+        root.addHandler(handler)
+    try:
+        async with Client(mcp.server) as client:
+            await client.call_tool("log", {})
+            logging.getLogger("tests.tool").warning("outside")
+    finally:
+        for handler in (text, data, keep):
+            root.removeHandler(handler)
+        if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+            LoggingInstrumentor().uninstrument()
+    (record,) = [r for r in keep.records if r.msg == "value %s"]
+    ids = f" trace_id={record.otelTraceID} span_id={record.otelSpanID}"
+    assert re.fullmatch(r" trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", ids)
+    (call,) = [
+        s
+        for s in spans.get_finished_spans()
+        if s.kind is SpanKind.SERVER and s.name == "tools/call log"
+    ]
+    assert record.otelTraceID == format(call.context.trace_id, "032x")
+    assert f"WARNING value 5{ids}" in text.lines
+    assert "WARNING outside" in text.lines
+    messages = [json.loads(x) for x in data.lines]
+    assert {"level": "WARNING", "message": f"value 5{ids}"} in messages
+    assert {"level": "WARNING", "message": "outside"} in messages
+    assert (record.msg, record.args) == ("value %s", (5,))
+
+
+async def test_a_queue_handler_shows_the_ids_once(traced, spans) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+
+    queued: queue.SimpleQueue = queue.SimpleQueue()
+    handler = logging.handlers.QueueHandler(queued)
+    mcp = served("queued", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def log() -> str:
+        logging.getLogger("tests.tool").warning("queued %s", 1)
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logging.getLogger("tests.tool").exception("failed %s", 2)
+        return "logged"
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        async with Client(mcp.server) as client:
+            await client.call_tool("log", {})
+    finally:
+        root.removeHandler(handler)
+        if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+            LoggingInstrumentor().uninstrument()
+    recorded = list(iter_queue(queued))
+    records = [r for r in recorded if r.getMessage().startswith("queued 1")]
+    # As a QueueListener's handler does.
+    formatted = logging.Formatter("%(message)s").format(records[0])
+    assert formatted.count(" trace_id=") == 1
+    assert re.fullmatch(
+        r"queued 1 trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", formatted
+    )
+    # The queued msg holds the ids, a newline and the traceback: still once.
+    (failed,) = [r for r in recorded if r.getMessage().startswith("failed 2")]
+    text = logging.Formatter("%(message)s").format(failed)
+    assert text.count(" trace_id=") == 1
+    assert "ValueError" in text
+
+
+def test_remove_puts_the_previous_factory_back(traced) -> None:
+    before = logging.getLogRecordFactory()
+    text = _TraceText()
+    text.install()
+    try:
+        assert logging.getLogRecordFactory() is not before
+    finally:
+        text.remove()
+    assert logging.getLogRecordFactory() is before
+
+
+def test_remove_after_another_factory_leaves_it_and_goes_quiet(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    text = _TraceText()
+    text.install()
+    ours = logging.getLogRecordFactory()
+    other = lambda *a, **kw: ours(*a, **kw)  # noqa: E731
+    logging.setLogRecordFactory(other)
+    try:
+        text.remove()
+        assert logging.getLogRecordFactory() is other
+        with provider.get_tracer("t").start_as_current_span("quiet"):
+            record = logging.getLogger("tests").makeRecord(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+        assert record.getMessage() == "m"
+    finally:
+        logging.setLogRecordFactory(before)
+
+
+async def test_otel_off_installs_no_factory(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    seen: list[object] = []
+    mcp = served("no-ids", TelemetrySettings())
+
+    @mcp.tool
+    def look() -> str:
+        seen.append(logging.getLogRecordFactory())
+        with provider.get_tracer("t").start_as_current_span("own"):
+            made = logging.getLogRecordFactory()(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+            seen.append(made.getMessage())
+        return "ok"
+
+    async with Client(mcp.server) as client:
+        await client.call_tool("look", {})
+    assert seen == [before, "m"]
 
 
 # Span profiles (TEL-14): with both signals on, each root span tags the profile samples
