@@ -1017,7 +1017,8 @@ class _Build:
 
 @dataclass(frozen=True)
 class _Pin:
-    """What one request reads: the state, view and key it began with, and the build."""
+    """What one request reads: the state, view and key it was pinned with, and the
+    build."""
 
     state: _State
     view: View
@@ -1631,8 +1632,8 @@ class Plugins:
     of it is served, so a refused plugin leaves no trace. What is served is a
     ``_State``, replaced whole by ``serve`` and never changed in place. The server's
     one skills provider, prompts provider and agents extension read the request's pin
-    instead (``pinned``): a build of what the view admits of the state the request
-    began with.
+    instead (``pinned``): a build of what the view admits of the state served once the
+    request's view has run.
     """
 
     def __init__(self, server: FastMCP) -> None:
@@ -1828,11 +1829,14 @@ class Plugins:
         return slot.pin
 
     async def _pin(self) -> _Pin:
-        """One pin, made fresh. The memo is taken first, so a build begun before a
-        change is never stored where a request after the change finds it."""
+        """One pin, made fresh. The view runs first, so a set it serves (PLUG-51) is
+        what the request reads. The memo and the state are taken after it and before
+        any await, and a build is stored only while its memo is still the server's, so
+        a change made during a build is never stored where a later request finds it. A
+        view may serve; nothing else."""
+        view = self._view() if self._view else _EVERY
         memo = self._memo
         state = self._state
-        view = self._view() if self._view else _EVERY
         key = self._key(state, view, gateway.prefix())
         build = await self._build_for(memo, state, view, key)
         return _Pin(state, view, key, build)
