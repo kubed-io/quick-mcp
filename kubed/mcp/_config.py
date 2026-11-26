@@ -262,14 +262,19 @@ def _register(
 def _parts(annotation: object) -> Iterable[object]:
     """Every node of an annotation: itself, then the arguments of its generics.
 
-    A NewType and a type alias are followed to what they name. ``Annotated`` metadata,
-    such as a nested ``FieldInfo``, is a node too.
+    A NewType and a type alias are followed to what they name, and a subscripted alias
+    to its arguments too. ``Annotated`` metadata, such as a nested ``FieldInfo``, is a
+    node too.
     """
     if hasattr(annotation, "__supertype__"):  # a NewType
         yield from _parts(annotation.__supertype__)
         return
     if hasattr(annotation, "__value__") and not isinstance(annotation, type):
-        yield from _parts(annotation.__value__)  # a TypeAliasType
+        # A TypeAliasType, or one subscripted, as Many[Login]: its body holds a
+        # TypeVar where the subscript holds the type, so both are followed.
+        yield from _parts(annotation.__value__)
+        for arg in typing.get_args(annotation):
+            yield from _parts(arg)
         return
     yield annotation
     for arg in typing.get_args(annotation):

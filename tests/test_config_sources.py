@@ -963,6 +963,74 @@ def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth(caplog) -> 
     ]
 
 
+needs_type_params = pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="typing.TypeAliasType is 3.12+"
+)
+
+
+def _generic_aliases() -> tuple[Any, Any]:
+    """``Many[T] = list[T]`` and ``Pair[K, V] = dict[K, V]``, as TypeAliasTypes."""
+    import typing
+
+    t, k, v = typing.TypeVar("T"), typing.TypeVar("K"), typing.TypeVar("V")
+    many = typing.TypeAliasType("Many", list[t], type_params=(t,))
+    pair = typing.TypeAliasType("Pair", dict[k, v], type_params=(k, v))
+    return many, pair
+
+
+@needs_type_params
+def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret(caplog) -> None:
+    many, pair = _generic_aliases()
+
+    @config("aliased")
+    class Aliased(Config):
+        creds: many[Login] = Field(default_factory=list, env="ALIASED_CREDS")
+        named: pair[str, Login] = Field(default_factory=dict, env="ALIASED_NAMED")
+
+    environ = {
+        "ALIASED_CREDS": '[{"name": "a", "token": "S3CRET-MANY"}]',
+        "ALIASED_NAMED": '{"x": {"name": "b", "token": "S3CRET-PAIR"}}',
+    }
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
+        loaded = load(Aliased, environ=environ).config
+    assert loaded.aliased.named["x"].token.get_secret_value() == "S3CRET-PAIR"
+    assert "S3CRET" not in caplog.text
+    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+        "config: aliased.creds=*** (env ALIASED_CREDS), "
+        "aliased.named=*** (env ALIASED_NAMED)"
+    ]
+
+
+@needs_type_params
+def test_a_bad_key_under_a_generic_alias_of_secrets_never_prints() -> None:
+    _, pair = _generic_aliases()
+
+    @config("aliaskeys")
+    class AliasKeys(Config):
+        keys: pair[str, SecretStr] = Field(default_factory=dict, env="ALIASKEYS_KEYS")
+
+    with pytest.raises(ValueError) as caught:
+        load(AliasKeys, environ={"ALIASKEYS_KEYS": '{"s3cretkey": 5}'})
+    message = str(caught.value)
+    assert "  aliaskeys.keys (env ALIASKEYS_KEYS): " in message
+    assert "s3cretkey" not in message
+
+
+@needs_type_params
+def test_a_model_under_a_generic_alias_must_forbid_unknown_keys() -> None:
+    many, _ = _generic_aliases()
+
+    class Loose(BaseModel):
+        name: str = ""
+
+    @config("aliasloose")
+    class AliasLoose(Config):
+        items: many[Loose] = Field(default_factory=list)
+
+    with pytest.raises(TypeError, match=r"Loose at aliasloose\.items allows unknown"):
+        _compose([[AliasLoose]])
+
+
 # -- secrets
 
 
