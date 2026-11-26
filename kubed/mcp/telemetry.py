@@ -21,7 +21,7 @@ from pydantic import SecretStr
 from ._config import Config, Field, config
 
 if TYPE_CHECKING:
-    from fastmcp.server.middleware import Middleware
+    from ._metrics import _CallMetrics
 
 log = logging.getLogger(__name__)
 
@@ -248,17 +248,18 @@ def _start_otel(
     return _otel.start(name, settings, profiles)
 
 
-def _call_metrics(settings: TelemetrySettings | None) -> Middleware | None:
-    """FastMCP's call metrics when ``settings.otel``, imported only then.
+def _call_metrics(settings: TelemetrySettings | None) -> _CallMetrics | None:
+    """FastMCP's call metrics, with resource reads, when ``settings.otel``: imported
+    only then.
 
     Never raises.
     """
     try:
         if settings is None or not settings.otel:
             return None
-        from fastmcp.server.middleware.usage import UsageMiddleware
+        from ._metrics import _CallMetrics
 
-        return UsageMiddleware(user_id="omit")
+        return _CallMetrics(user_id="omit")
     except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
         log.error(
             "Call metrics did not start; serving without them: %s",

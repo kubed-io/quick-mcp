@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 from fastmcp import Client, FastMCP
+from gateway_server import KIT_TREE, over_http
+from plugin_server import write
 from pydantic import BaseModel, ValidationError
 
 import kubed.mcp
@@ -1880,7 +1882,9 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     from fastmcp.server.middleware import Middleware
     from fastmcp.server.middleware.usage import UsageMiddleware
 
+    from kubed.mcp._metrics import _CallMetrics, _ReadObserver
     from kubed.mcp.app import _CallScope
+    from kubed.mcp.gateway import _TakeThePrefix
 
     class Given(Middleware):
         pass
@@ -1898,9 +1902,11 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     kinds = _middleware(mcp)
     # The metrics, then the call's slot: every other layer, the plugin layer's
     # included, runs inside both, in the order it was given.
-    assert kinds[:2] == [UsageMiddleware, _CallScope]
-    assert kinds.count(UsageMiddleware) == 1
+    assert kinds[:2] == [_CallMetrics, _CallScope]
+    assert kinds.count(_CallMetrics) == 1
     assert kinds.index(Given) < kinds.index(Added)
+    # The read observer sees the plain URI, under the pin.
+    assert kinds[kinds.index(_TakeThePrefix) + 1] is _ReadObserver
 
 
 def test_otel_off_adds_no_call_metrics() -> None:
@@ -1911,22 +1917,22 @@ def test_otel_off_adds_no_call_metrics() -> None:
     mcp = QuickMCP("plain", config={"telemetry": TelemetrySettings()})
     kinds = _middleware(mcp)
     assert UsageMiddleware not in kinds
+    assert "_ReadObserver" not in [kind.__name__ for kind in kinds]
     assert kinds[0] is _CallScope
 
 
 async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serves(
     traced, monkeypatch, caplog
 ) -> None:
-    import fastmcp.server.middleware.usage as usage
-
+    import kubed.mcp._metrics as metrics
     from kubed.mcp.app import _CallScope
 
-    real = usage.UsageMiddleware
+    real = metrics._CallMetrics
 
     def broken(**kwargs):
         raise RuntimeError("https://user:s3cret@otlp.example.com")
 
-    monkeypatch.setattr(usage, "UsageMiddleware", broken)
+    monkeypatch.setattr(metrics, "_CallMetrics", broken)
     mcp = served("unbuilt", TelemetrySettings(otel=True))
     kinds = _middleware(mcp)
     assert real not in kinds
@@ -1941,6 +1947,265 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
         )
     ]
     assert_safe(caplog.records, "s3cret")
+
+
+# -- resource reads (TEL-21) --------------------------------------------------
+
+
+def reads(points: list) -> list[tuple[str | None, int]]:
+    """Each ``resources/read`` point's template label, with its count."""
+    return [
+        (p.attributes.get("mcp.resource.template"), p.count)
+        for p in points
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+
+
+def resourced(name: str) -> QuickMCP:
+    mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)})
+
+    @mcp.resource("data://items/{id}")
+    def item(id: str) -> str:
+        return id
+
+    @mcp.resource("data://about")
+    def about() -> str:
+        return "about"
+
+    return mcp
+
+
+async def test_reads_of_one_template_are_one_series(metered) -> None:
+    async with Client(resourced("templated").server) as client:
+        await client.read_resource("data://items/1")
+        await client.read_resource("data://items/2")
+    assert reads(duration_points(metered, "templated")) == [("data://items/{id}", 2)]
+
+
+async def test_a_static_read_is_labelled_by_its_uri(metered) -> None:
+    async with Client(resourced("static").server) as client:
+        await client.read_resource("data://about")
+    assert reads(duration_points(metered, "static")) == [("data://about", 1)]
+
+
+async def test_a_read_that_matches_nothing_has_only_the_error_label(metered) -> None:
+    from fastmcp.exceptions import MCPError
+
+    async with Client(resourced("missing").server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://nope")
+    (point,) = [
+        p
+        for p in duration_points(metered, "missing")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert "mcp.resource.template" not in point.attributes
+    # Resource not found is invalid params, which the conventions don't count as an error.
+    assert point.attributes["rpc.status_code"] == "-32602"
+    assert "error.type" not in point.attributes
+
+
+async def test_a_failed_template_read_is_labelled_by_its_template(metered) -> None:
+    from fastmcp.exceptions import MCPError, ResourceError
+
+    mcp = resourced("failed-read")
+
+    @mcp.resource("data://broken/{id}")
+    def broken(id: str) -> str:
+        raise ResourceError("no")
+
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://broken/1")
+    (point,) = [
+        p
+        for p in duration_points(metered, "failed-read")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert point.attributes["mcp.resource.template"] == "data://broken/{id}"
+    assert (point.attributes["rpc.status_code"], point.attributes["error.type"]) == (
+        "-32603",
+        "-32603",
+    )
+
+
+async def test_a_failed_static_read_has_no_template_label(metered) -> None:
+    from fastmcp.exceptions import MCPError, ResourceError
+
+    mcp = resourced("failed-static")
+
+    @mcp.resource("data://bad")
+    def bad() -> str:
+        raise ResourceError("no")
+
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://bad")
+    (point,) = [
+        p
+        for p in duration_points(metered, "failed-static")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert "mcp.resource.template" not in point.attributes
+    assert (point.attributes["rpc.status_code"], point.attributes["error.type"]) == (
+        "-32603",
+        "-32603",
+    )
+
+
+async def test_a_static_read_a_template_also_matches_is_labelled_by_it(
+    metered,
+) -> None:
+    mcp = resourced("shadowed")
+
+    @mcp.resource("data://items/fixed")
+    def fixed() -> str:
+        return "fixed"
+
+    async with Client(mcp.server) as client:
+        (content,) = await client.read_resource("data://items/fixed")
+    # The static resource answered, and the template labels it.
+    assert content.text == "fixed"
+    assert reads(duration_points(metered, "shadowed")) == [("data://items/{id}", 1)]
+
+
+async def test_a_plugin_skill_read_under_a_prefix_is_labelled_without_it(
+    metered, tmp_path
+) -> None:
+    mcp = QuickMCP(
+        "kit-reads",
+        header_prefix="Kb",
+        config={"telemetry": TelemetrySettings(otel=True)},
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
+        await client.read_resource("kb+skill://lib/guide/references/a.md")
+        await client.read_resource("kb+skill://lib/guide/references/a.md")
+    assert reads(duration_points(metered, "kit-reads")) == [
+        ("skill://lib/guide/references/a.md", 2)
+    ]
+
+
+async def test_overlapping_reads_keep_their_own_templates(metered) -> None:
+    mcp = resourced("overlap")
+
+    @mcp.resource("data://slow/{id}")
+    async def slow(id: str) -> str:
+        await asyncio.sleep(0.05)
+        return id
+
+    async with Client(mcp.server) as client:
+        await asyncio.gather(
+            client.read_resource("data://slow/1"),
+            client.read_resource("data://items/1"),
+        )
+    assert sorted(reads(duration_points(metered, "overlap"))) == [
+        ("data://items/{id}", 1),
+        ("data://slow/{id}", 1),
+    ]
+
+
+async def test_tools_and_prompts_are_recorded_as_before(metered) -> None:
+    mcp = resourced("mixed")
+    mcp.tool(lambda: "pong", name="ping")
+    mcp.prompt(lambda: "hello", name="greet")
+    async with Client(mcp.server) as client:
+        await client.call_tool("ping", {})
+        await client.get_prompt("greet")
+        await client.read_resource("data://about")
+    points = duration_points(metered, "mixed")
+    kinds = sorted(p.attributes["mcp.method.name"] for p in points)
+    assert kinds == ["prompts/get", "resources/read", "tools/call"]
+    tool = next(p for p in points if p.attributes["mcp.method.name"] == "tools/call")
+    assert "mcp.resource.template" not in tool.attributes
+
+
+def test_usage_middleware_still_has_what_the_reads_use() -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    from kubed.mcp._metrics import _CallMetrics, _Labelled
+
+    assert callable(getattr(UsageMiddleware, "_record", None))
+    assert isinstance(_CallMetrics(user_id="omit")._duration, _Labelled)
+
+
+class Recorded:
+    """A histogram that keeps the attributes of each point."""
+
+    def __init__(self) -> None:
+        self.points: list[object] = []
+
+    def record(self, amount: float, attributes: object = None) -> None:
+        self.points.append(attributes)
+
+
+def test_the_call_metrics_copy_and_still_label() -> None:
+    import copy
+
+    from opentelemetry.metrics import NoOpMeterProvider
+
+    from kubed.mcp._metrics import (
+        _MATCHED,
+        _TEMPLATE,
+        _CallMetrics,
+        _Labelled,
+        _Matched,
+    )
+
+    # An SDK histogram holds a lock, so a plain UsageMiddleware can't be deep-copied
+    # under one either: a no-op provider keeps this about the wrapper alone.
+    metrics = _CallMetrics(user_id="omit", meter_provider=NoOpMeterProvider())
+    assert isinstance(copy.copy(metrics._duration), _Labelled)
+    assert isinstance(copy.deepcopy(metrics)._duration, _Labelled)
+    labelled = _Labelled(Recorded())
+    for twin in (copy.copy(labelled), copy.deepcopy(labelled)):
+        token = _MATCHED.set(_Matched("data://items/{id}"))
+        try:
+            twin.record(1.0, {_TEMPLATE: ""})
+        finally:
+            _MATCHED.reset(token)
+        assert twin._histogram.points[-1] == {_TEMPLATE: "data://items/{id}"}
+
+
+def _without_record(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    monkeypatch.delattr(UsageMiddleware, "_record")
+
+
+def _without_duration(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    real = UsageMiddleware.__init__
+
+    def init(self, **options) -> None:
+        real(self, **options)
+        del self._duration
+
+    monkeypatch.setattr(UsageMiddleware, "__init__", init)
+
+
+@pytest.mark.parametrize("change", [_without_record, _without_duration])
+async def test_a_changed_usage_middleware_is_one_warning_and_reads_pass_through(
+    change, monkeypatch, caplog
+) -> None:
+    from kubed.mcp._metrics import _CallMetrics, _Labelled
+
+    change(monkeypatch)
+    metrics = _CallMetrics(user_id="omit")
+    assert not isinstance(getattr(metrics, "_duration", None), _Labelled)
+
+    async def call_next(context: object) -> str:
+        return "read"
+
+    assert await metrics.on_read_resource(object(), call_next) == "read"
+    records = [r for r in caplog.records if r.name == "kubed.mcp._metrics"]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (
+            logging.WARNING,
+            "Resource reads are not in the call metrics: FastMCP's UsageMiddleware has changed",
+        )
+    ]
 
 
 # -- the start line -----------------------------------------------------------
