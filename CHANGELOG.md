@@ -25,6 +25,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Config sections:** declare pydantic sections with `@config("key")`, register them with `QuickMCP(sections=...)`, inject each with `Inject[Section]`, and write the whole config's JSON Schema with `config_schema()`.
+- **Config from a file, env vars and flags:** `QuickMCP(argv=sys.argv[1:])` loads one YAML file (`CONFIG_FILE` or `--config-file`) and the env var and flag each `Field(env=..., arg=...)` names; a test passes `environ=`.
+- Type a config secret `SecretStr`, `SecretBytes` or `Secret[T]` and read it with `get_secret_value()`, and mark a field `NoDecode` to get its env var or flag as raw text.
+- `mcp.config_sources` says which source set each config item, and quick-mcp never shows a secret in its own errors, logs or dumps.
+- **Components:** subclass `Component` and pass `QuickMCP(components=[...])` to give part of a server its own config section, its objects in the container, and a start and stop around serving.
+- Every server has the built-in config sections `serving`, `telemetry` and `delivery`, set by `TRANSPORT`, `HOST`, `PORT`, `LOG_LEVEL`, `TELEMETRY_*` and `DELIVERY_*` or their `--` flags; subclass `ServingSettings`, `TelemetrySettings` or `DeliverySettings` to change one.
+- `QuickMCP(hooks={"serving": fn})` builds a built-in's section from the server's own config, in place of its env vars, flags and file keys, and `config_schema(hooked=["serving"])` writes that server's schema.
+- Set `mcp.auth` after construction, until the server starts serving.
+- At start, telemetry logs one line naming the signals that started and where they go, or `telemetry: off`.
+- With `otel` on, a log line written inside a span ends with `trace_id=… span_id=…`, so Loki can link it to its trace.
+- An unreachable Pyroscope is logged once, and so is its recovery: the server checks it on the push interval.
+- Call metrics include `resources/read`, labelled by `mcp.resource.template`.
+
+### Changed
+
+- **BREAKING:** `QuickMCP(config=...)` now takes the config's values, a mapping or section instances, and the config's classes go in `sections=`. The loaded config is `mcp.config`, injectable as `Config` or by section, and no longer as `type(config)`.
+- **BREAKING:** `run()` takes no serving settings, `run(port=...)` is a `TypeError`, and `Serving` is gone: set `serving` in the config (`TRANSPORT`, `--port`, a `serving:` file key) or through `hooks={"serving": ...}`; `run()` applies `serving.log_level` to the root logger.
+- **BREAKING:** `Telemetry` is gone: a server reads telemetry's settings with `Inject[TelemetrySettings]`.
+- **BREAKING:** `TelemetrySettings.profiles` is a `SecretStr`: read it with `get_secret_value()`.
+- **BREAKING:** the config's boot line is logged when the server starts, not when `QuickMCP(...)` is built.
+- **BREAKING:** `serving`, `telemetry` and `delivery` are the built-ins' keys and their env vars and flags are taken: a server's own section there must subclass the built-in's class, and its own `PORT`, `HOST`, `TRANSPORT`, `LOG_LEVEL`, `TELEMETRY_*` or `DELIVERY_*` clashes unless it hooks that built-in.
+- **BREAKING:** a config's `delivery.listed` is a comma string, `skills,prompts`, not a list.
+- **BREAKING:** a section subclass that redefines a field with an `env` or `arg` must restate them in its `Field(...)`, or the config is refused with a `TypeError`.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added

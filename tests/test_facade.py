@@ -92,12 +92,19 @@ SOURCES = {
 # Names this package defines rather than re-exports.
 OWN = {
     "kubed.mcp": {
+        "Component",
+        "Config",
         "Delivery",
+        "DeliverySettings",
+        "Field",
         "Inject",
+        "NoDecode",
         "QuickMCP",
-        "Serving",
-        "Telemetry",
+        "ServingSettings",
+        "Source",
         "TelemetrySettings",
+        "config",
+        "config_schema",
         "lookup",
     },
     "kubed.mcp.protocol": {"AdvertiseLegacyExtensions", "types"},
@@ -183,10 +190,25 @@ def _fresh(code: str) -> dict:
         "import kubed.mcp.telemetry",
         "from kubed.mcp import telemetry",
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
+        "from kubed.mcp import Config, Field, NoDecode, Source, config, config_schema",
+        "from kubed.mcp import Component, DeliverySettings, ServingSettings",
+        "from kubed.mcp import Config, Field, config, config_schema\n"
+        "@config('recording')\n"
+        "class Recording(Config):\n"
+        "    inbox: str | None = Field(None, doc='Where', env='RECORDING_INBOX')\n"
+        "assert config_schema(Recording)['properties']['recording']",
     ],
 )
 def test_importing_kubed_mcp_imports_no_fastmcp(code: str) -> None:
-    assert _fresh(code) == {"loaded": ["kubed.mcp.telemetry"], "missing_from_dir": []}
+    assert _fresh(code) == {
+        "loaded": [
+            "kubed.mcp._builtins",
+            "kubed.mcp._config",
+            "kubed.mcp.components",
+            "kubed.mcp.telemetry",
+        ],
+        "missing_from_dir": [],
+    }
 
 
 def test_the_first_fastmcp_name_used_imports_it() -> None:
@@ -225,8 +247,19 @@ def test_a_submodule_still_imports_from_the_package() -> None:
     assert protocol is importlib.import_module("kubed.mcp.protocol")
 
 
-def test_telemetry_imports_only_pydantic_and_the_standard_library() -> None:
-    spec = importlib.util.find_spec("kubed.mcp.telemetry")
+@pytest.mark.parametrize(
+    "module, extra, allowed",
+    [
+        ("kubed.mcp.telemetry", set(), {"_config"}),
+        ("kubed.mcp._config", {"yaml"}, set()),
+        ("kubed.mcp._builtins", set(), {"_config", "telemetry", "components"}),
+        ("kubed.mcp.components", set(), set()),
+    ],
+)
+def test_the_config_modules_import_only_pydantic_and_the_standard_library(
+    module: str, extra: set[str], allowed: set[str]
+) -> None:
+    spec = importlib.util.find_spec(module)
     assert spec is not None and spec.origin is not None
     tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
 
@@ -254,5 +287,5 @@ def test_telemetry_imports_only_pydantic_and_the_standard_library() -> None:
                 walk(node.orelse)
 
     walk(tree.body)
-    assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"}
-    assert relative == []
+    assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"} | extra
+    assert set(relative) <= allowed

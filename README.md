@@ -38,16 +38,18 @@ pip install kubed-mcp
 Import it as `kubed.mcp`:
 
 ```python
+import sys
+
 from kubed.mcp import Inject, QuickMCP
 
-mcp = QuickMCP("grid", config=settings)
+mcp = QuickMCP("grid", argv=sys.argv[1:])
 mcp.singleton(Grid)
 mcp.add_plugin("plugin/")  # its skills, commands and agents
 
 @mcp.tool
 async def navigate(url: str, grid: Inject[Grid]) -> dict: ...
 
-mcp.run()
+mcp.run()  # TRANSPORT, HOST, PORT and LOG_LEVEL, or --transport, --host, --port and --log-level
 ```
 
 ---
