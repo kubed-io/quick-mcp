@@ -45,7 +45,13 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.skills import Skill, SkillManifest
 from fastmcp.skills import extension as _extension
-from fastmcp.skills.provider import SkillCatalogProvider, SkillFileResource
+from fastmcp.skills.provider import (
+    SkillCatalogProvider,
+    SkillFileResource,
+    SkillManifestProvider,
+    # FastMCP 4.2.6's private row builder, imported so that a row is exactly FastMCP's.
+    _file_resource,
+)
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import INVALID_PARAMS, PaginatedRequestParams
 from pydantic import Field, ValidationError
@@ -458,6 +464,23 @@ def _without_unserved(manifest: SkillManifest) -> SkillManifest:
     return manifest.model_copy(update={"files": files})
 
 
+def _manifests(catalogue: Mapping[str, Skill]) -> dict[str, SkillManifest]:
+    """Each skill's manifest, as FastMCP's ``SkillCatalogProvider.load_manifests`` reads
+    it. This is the one place a skill's ``_manifest`` is read."""
+    return {path: skill._manifest for path, skill in catalogue.items()}
+
+
+def _entries(
+    provider: SkillManifestProvider, manifests: Mapping[str, SkillManifest]
+) -> tuple[SkillFileResource, ...]:
+    """One row per skill that has a ``SKILL.md``: FastMCP's row for it, and no other."""
+    return tuple(
+        _file_resource(provider, path, manifest, ENTRY, manifest.files[ENTRY])
+        for path, manifest in manifests.items()
+        if ENTRY in manifest.files
+    )
+
+
 class _SkillFile(SkillFileResource):
     """A skill's file other than its ``SKILL.md``, read as text when it is a text
     file (PLUG-75) and as a blob of its bytes otherwise."""
@@ -532,11 +555,9 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
         return sorted(rows, key=lambda row: row["uri"])
 
     async def _list_resources(self) -> list[Resource]:
-        return [
-            r
-            for r in await super()._list_resources()
-            if isinstance(r, SkillFileResource) and r.file_path == ENTRY
-        ]
+        """Each skill's ``SKILL.md`` row alone, made from the manifests FastMCP loads
+        once per request (SKL-8, SKL-19)."""
+        return list(_entries(self, await self._request_manifests()))
 
     async def _get_resource(
         self, uri: str, version: VersionSpec | None = None
