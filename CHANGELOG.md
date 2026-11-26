@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A plugin set a view serves is what that same request reads, not the next one.
+
+## [0.4.1] - 2026-11-26
+
 ### Added
 
 - `kubed.mcp.gateway.unprefixed(uri, prefix)` takes a gateway prefix off an address.
@@ -32,10 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `skills/get` and `resources/directory/read` resolve `.` and `..` segments as `resources/read` does, on a direct connection as well as behind a gateway.
-
-### Fixed
-
-- A plugin set a view serves is what that same request reads, not the next one.
 
 ## [0.4.0] - 2026-11-26
 
