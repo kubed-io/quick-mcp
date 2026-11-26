@@ -9,15 +9,29 @@ from __future__ import annotations
 
 import dataclasses
 import keyword
+import re
+import types
 import typing
 import warnings
-from collections.abc import Callable, Iterable, Mapping
-from typing import Any, NamedTuple, TypeVar
+import weakref
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from typing import Annotated, Any, Literal, NamedTuple, TypeVar
 
-from pydantic import BaseModel, ConfigDict, RootModel, ValidationError, create_model
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    RootModel,
+    Secret,
+    SecretBytes,
+    SecretStr,
+    ValidationError,
+    create_model,
+)
 from pydantic import Field as _PydanticField
 from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
-from pydantic.json_schema import PydanticJsonSchemaWarning
+from pydantic.fields import FieldInfo
+from pydantic.json_schema import GenerateJsonSchema, PydanticJsonSchemaWarning
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -122,11 +136,12 @@ def Field(
 
     ``doc`` is the field's description. ``env`` is the environment variable and ``arg``
     the command-line flag that set it, taken literally: nothing derives or prefixes
-    them. ``sensitive=True`` marks a value that is kept out of the schema, which never
-    writes its default, and out of ``repr`` and ``str``, unless ``repr=`` says
-    otherwise. A dump still holds it. They are written to the field's
-    ``json_schema_extra``, and only the ones given. Every other keyword goes to
-    pydantic.
+    them. A sensitive item is one whose type is a secret type, ``SecretStr``,
+    ``SecretBytes`` or ``Secret[T]``: pydantic masks it in ``repr``, ``str`` and every
+    dump, ``get_secret_value()`` reads it, and the schema never writes its default.
+    ``sensitive=True`` says so, and is refused at composition on a field with no
+    secret type. They are written to the field's ``json_schema_extra``, and only the
+    ones given. Every other keyword goes to pydantic.
 
     Raises:
         TypeError: ``env`` or ``arg`` isn't a non-empty ``str``, or ``description``
@@ -150,7 +165,6 @@ def Field(
         extra[name] = value
     if sensitive:
         extra["sensitive"] = True
-        kwargs.setdefault("repr", False)
     if doc is not None:
         kwargs["description"] = doc
     if extra:
@@ -160,12 +174,42 @@ def Field(
     return _PydanticField(default, **kwargs)
 
 
+class NoDecode:
+    """Marks a field whose env var or flag reaches its validators as the raw text.
+
+    Written as ``Annotated[list[str], NoDecode]``. Without it, a list, tuple, set, dict
+    or model field reads its env var or flag as JSON. With it, the text is passed as it
+    is, so the field's own ``mode="before"`` validator can split it as it likes.
+    """
+
+
+class _Item(NamedTuple):
+    """One field of the composed config, reached from the top through model fields.
+
+    ``loc`` is the keys its value is validated under, ``attrs`` the attribute names
+    that read it back from the loaded config, and ``path`` the dotted ``loc``. A
+    ``leaf`` is a field the walk doesn't descend into. ``env`` and ``arg`` are the names
+    that set it, as written, ``sensitive`` says a secret type is in its annotation, and
+    ``takes`` says how a raw value from an env var or a flag decodes.
+    """
+
+    loc: tuple[str, ...]
+    attrs: tuple[str, ...]
+    path: str
+    leaf: bool
+    env: str | None
+    arg: str | None
+    sensitive: bool
+    takes: Literal["string", "array", "object"]
+
+
 class _Composition(NamedTuple):
-    """What ``_compose`` returns: the model, who holds each key, and who lost one."""
+    """What ``_compose`` returns: the model, who holds and lost each key, its items."""
 
     model: type[Config]
     held: dict[str | None, type[BaseModel]]
     replaced: dict[str | None, tuple[type[BaseModel], ...]]
+    items: tuple[_Item, ...]
 
 
 def _where(key: str | None) -> str:
@@ -204,18 +248,89 @@ def _register(
         )
 
 
-def _models_in(annotation: object) -> Iterable[type]:
-    """The classes an annotation reaches: itself, and the arguments of its generics."""
+def _parts(annotation: object) -> Iterable[object]:
+    """Every node of an annotation: itself, then the arguments of its generics.
+
+    A NewType and a type alias are followed to what they name. ``Annotated`` metadata,
+    such as a nested ``FieldInfo``, is a node too.
+    """
     if hasattr(annotation, "__supertype__"):  # a NewType
-        yield from _models_in(annotation.__supertype__)
+        yield from _parts(annotation.__supertype__)
         return
     if hasattr(annotation, "__value__") and not isinstance(annotation, type):
-        yield from _models_in(annotation.__value__)  # a TypeAliasType
+        yield from _parts(annotation.__value__)  # a TypeAliasType
         return
-    if isinstance(annotation, type):
-        yield annotation
+    yield annotation
     for arg in typing.get_args(annotation):
-        yield from _models_in(arg)
+        yield from _parts(arg)
+
+
+def _models_in(annotation: object) -> Iterable[type]:
+    """The classes an annotation reaches: itself, and the arguments of its generics."""
+    return (part for part in _parts(annotation) if isinstance(part, type))
+
+
+def _is_secret(annotation: object) -> bool:
+    """Whether an annotation is a secret type, which pydantic masks wherever it prints.
+
+    That is ``SecretStr``, ``SecretBytes``, ``Secret[T]``, or a subclass of any of them.
+    """
+    origin = typing.get_origin(annotation) or annotation
+    return isinstance(origin, type) and issubclass(
+        origin, (SecretStr, SecretBytes, Secret)
+    )
+
+
+# Per class, as pydantic's own per-class data is. Weak, so a composed model that's
+# dropped isn't kept alive.
+_SENSITIVE: weakref.WeakKeyDictionary[type, frozenset[str]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sensitive_fields(cls: type[BaseModel]) -> frozenset[str]:
+    """The names of ``cls``'s fields with a secret type anywhere in the annotation.
+
+    ``SecretStr | None``, ``list[SecretStr]`` and ``dict[str, SecretStr]`` all count. A
+    field that holds another model isn't sensitive for that model's fields.
+    """
+    names = _SENSITIVE.get(cls)
+    if names is None:
+        names = frozenset(
+            name
+            for name, info in cls.model_fields.items()
+            if any(_is_secret(part) for part in _parts(info.annotation))
+        )
+        _SENSITIVE[cls] = names
+    return names
+
+
+# The keywords ``Field`` writes that only mean something on the field itself.
+_ITEM_KEYWORDS = ("env", "arg", "sensitive")
+
+
+def _check_item_keywords(cls: type[BaseModel], name: str, path: str) -> None:
+    """Refuse item keywords that would silently do nothing, or a false ``sensitive``."""
+    info = cls.model_fields[name]
+    for part in _parts(info.annotation):
+        if isinstance(part, FieldInfo) and isinstance(part.json_schema_extra, dict):
+            given = [k for k in _ITEM_KEYWORDS if k in part.json_schema_extra]
+            if given:
+                written = " and ".join(f"{k}=" for k in given)
+                raise TypeError(
+                    f"{path}: {written} in a Field inside the annotation is never "
+                    "read: put Field(...) on the field itself"
+                )
+    extra = info.json_schema_extra
+    if (
+        isinstance(extra, dict)
+        and extra.get("sensitive")
+        and name not in _sensitive_fields(cls)
+    ):
+        raise TypeError(
+            f"{path}: sensitive=True needs a secret type: use SecretStr, "
+            "SecretBytes or Secret[T]"
+        )
 
 
 def _is_typed_dict(cls: object) -> bool:
@@ -261,6 +376,7 @@ def _check_strict(
                 ) from exc
         prefix = "" if path == "the root section" else f"{path}."
         for name, info in cls.model_fields.items():
+            _check_item_keywords(cls, name, f"{prefix}{name}")
             for inner in _models_in(info.annotation):
                 _check_strict(inner, f"{prefix}{name}", seen)
     elif dataclasses.is_dataclass(cls) or _is_typed_dict(cls):
@@ -270,6 +386,207 @@ def _check_strict(
         )
 
 
+def _strip(annotation: object) -> object:
+    """The annotation under any ``Annotated``, NewType and type alias wrapping it."""
+    while True:
+        if typing.get_origin(annotation) is Annotated:
+            annotation = typing.get_args(annotation)[0]
+        elif hasattr(annotation, "__supertype__"):
+            annotation = annotation.__supertype__
+        elif hasattr(annotation, "__value__") and not isinstance(annotation, type):
+            annotation = annotation.__value__
+        else:
+            return annotation
+
+
+def _members(annotation: object) -> tuple[object, ...] | None:
+    """A union's members other than ``None``, or ``None`` when it isn't a union."""
+    if typing.get_origin(annotation) not in (typing.Union, types.UnionType):
+        return None
+    return tuple(m for m in typing.get_args(annotation) if m is not type(None))
+
+
+def _model_typed(annotation: object) -> type[BaseModel] | None:
+    """The one model class a field holds, past ``Annotated`` and a ``None``, or None.
+
+    A union of several models, a list, dict or tuple of models and a secret aren't
+    model-typed.
+    """
+    annotation = _strip(annotation)
+    members = _members(annotation)
+    if members is not None:
+        if len(members) != 1:
+            return None
+        annotation = _strip(members[0])
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
+
+
+def _kind(annotation: object) -> Literal["string", "array", "object"]:
+    """How a raw value for ``annotation`` decodes: as text, a JSON array or object."""
+    annotation = _strip(annotation)
+    members = _members(annotation)
+    if members is not None:
+        kinds = {_kind(m) for m in members}
+        return kinds.pop() if len(kinds) == 1 else "string"
+    origin = typing.get_origin(annotation) or annotation
+    if not isinstance(origin, type):
+        return "string"
+    if issubclass(origin, Secret):  # Secret[T] decodes as T
+        args = typing.get_args(annotation) or next(
+            (
+                typing.get_args(base)
+                for base in getattr(origin, "__orig_bases__", ())
+                if isinstance(typing.get_origin(base), type)
+                and issubclass(typing.get_origin(base), Secret)
+            ),
+            (),
+        )
+        return _kind(args[0]) if args else "string"
+    if issubclass(origin, (SecretStr, SecretBytes, str, bytes, bytearray)):
+        return "string"
+    if issubclass(origin, (BaseModel, Mapping)):
+        return "object"
+    if issubclass(origin, (Sequence, AbstractSet)):
+        return "array"
+    return "string"
+
+
+def _takes(info: FieldInfo) -> Literal["string", "array", "object"]:
+    """How a field's raw value decodes. ``NoDecode`` anywhere on it makes it text."""
+    marks = (*info.metadata, *_parts(info.annotation))
+    if any(m is NoDecode or isinstance(m, NoDecode) for m in marks):
+        return "string"
+    return _kind(info.annotation)
+
+
+def _walk_items(
+    cls: type[BaseModel],
+    loc: tuple[str, ...],
+    attrs: tuple[str, ...],
+    on_path: frozenset[type],
+    items: list[_Item],
+    direct: set[type],
+    held_in: dict[type, str],
+) -> None:
+    """Add an item for each of ``cls``'s fields, descending into model-typed ones.
+
+    ``direct`` collects the models descended into. ``held_in`` collects, for each model
+    a leaf's annotation reaches, the path of the first leaf that holds it.
+    """
+    for name, info in cls.model_fields.items():
+        alias = info.validation_alias
+        here = (*loc, alias if isinstance(alias, str) else name)
+        names = (*attrs, name)
+        path = ".".join(here)
+        inner = _model_typed(info.annotation)
+        leaf = inner is None or inner in on_path
+        extra = info.json_schema_extra
+        if not isinstance(extra, dict):
+            extra = {}
+        items.append(
+            _Item(
+                loc=here,
+                attrs=names,
+                path=path,
+                leaf=leaf,
+                env=extra.get("env"),
+                arg=extra.get("arg"),
+                sensitive=name in _sensitive_fields(cls),
+                takes=_takes(info),
+            )
+        )
+        if inner is not None and not leaf:
+            direct.add(inner)
+            _walk_items(inner, here, names, on_path | {inner}, items, direct, held_in)
+        else:
+            for model in _models_in(info.annotation):
+                if issubclass(model, BaseModel):
+                    held_in.setdefault(model, path)
+
+
+# A flag is ``--`` and a name that doesn't start with ``-``, with no space or ``=``.
+_FLAG = re.compile(r"--[^-\s=][^\s=]*")
+# The names quick-mcp reads itself, for the config file.
+_RESERVED = {"env": "CONFIG_FILE", "arg": "--config-file"}
+_NAME_KIND = {"env": "env var", "arg": "flag"}
+
+
+def _check_names(items: Iterable[_Item]) -> None:
+    """Refuse a malformed name, one of quick-mcp's own, or one declared twice."""
+    declared: dict[tuple[str, str], str] = {}
+    for item in items:
+        for kind, name in (("env", item.env), ("arg", item.arg)):
+            if name is None:
+                continue
+            if kind == "arg" and not (isinstance(name, str) and _FLAG.fullmatch(name)):
+                raise TypeError(
+                    f"{item.path}: arg={name!r} isn't a flag: a flag starts with '--', "
+                    "then a name with no space or '='"
+                )
+            if kind == "env" and not (
+                isinstance(name, str) and name and "=" not in name and "\0" not in name
+            ):
+                raise TypeError(
+                    f"{item.path}: env={name!r} isn't an env var name: it must be a "
+                    "non-empty str with no '=' or NUL character"
+                )
+            if name == _RESERVED[kind]:
+                raise ValueError(
+                    f"{item.path}: the {_NAME_KIND[kind]} {name} is quick-mcp's own: "
+                    "it reads it for the config file"
+                )
+            first = declared.setdefault((kind, name), item.path)
+            if first != item.path:
+                raise ValueError(
+                    f"The {_NAME_KIND[kind]} {name!r} is declared by both {first} "
+                    f"and {item.path}"
+                )
+
+
+def _check_held(held_in: dict[type, str], direct: set[type]) -> None:
+    """Refuse a name on a field of a model reached only through a container or union.
+
+    Such a field has no one path a value could be set at. A model also reached as a
+    model-typed field keeps its names, which set it there. The models below a held
+    model, at any depth, are held too.
+    """
+    queue = list(held_in)
+    while queue:
+        cls = queue.pop(0)
+        for info in cls.model_fields.values():
+            for model in _models_in(info.annotation):
+                if issubclass(model, BaseModel) and model not in held_in:
+                    held_in[model] = held_in[cls]
+                    queue.append(model)
+    for cls, path in held_in.items():
+        if cls in direct:
+            continue
+        for name, info in cls.model_fields.items():
+            extra = info.json_schema_extra
+            if not isinstance(extra, dict):
+                continue
+            for kind in ("env", "arg"):
+                if kind in extra:
+                    raise TypeError(
+                        f"{path}: {cls.__qualname__}.{name} can't be set by name, as "
+                        f"{cls.__qualname__} is reached only through a list, dict, "
+                        f"tuple or union: drop its {kind}={extra[kind]!r}"
+                    )
+
+
+def _items(model: type[BaseModel], root: type[BaseModel] | None) -> tuple[_Item, ...]:
+    """The composed model's items, depth first in declaration order, checked."""
+    items: list[_Item] = []
+    direct: set[type] = {model} if root is None else {model, root}
+    held_in: dict[type, str] = {}
+    _walk_items(model, (), (), frozenset({model}), items, direct, held_in)
+    _check_names(items)
+    _check_held(held_in, direct)
+    return tuple(items)
+
+
 _NOT_ITERABLE = "sections= takes an iterable of section classes, such as a list"
 
 
@@ -277,7 +594,9 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     """Register the sections of every source and compose them into one config model.
 
     ``_BUILTINS`` come first, then each source in order. The most derived class wins
-    a key.
+    a key. Every field reached through model fields is recorded as an item, and the
+    names items declare are checked here, so ``config_schema`` refuses what a server
+    refuses.
     """
     held: dict[str | None, type[BaseModel]] = {}
     replaced: dict[str | None, list[type[BaseModel]]] = {}
@@ -334,6 +653,7 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
         model,
         held,
         {key: tuple(losers) for key, losers in replaced.items()},
+        _items(model, root),
     )
 
 
@@ -559,24 +879,50 @@ def _scrub(node: object, *, names: bool = False) -> None:
                 _scrub(value, names=not names and key in _NAME_MAPS)
 
 
+class _Schema(GenerateJsonSchema):
+    """Pydantic's schema, with ``"sensitive": true`` on every field of a secret type.
+
+    Pydantic marks ``SecretStr`` and ``SecretBytes`` as ``writeOnly``, but not
+    ``Secret[T]``, so the mark is written from each model's fields rather than read from
+    pydantic's output. ``_scrub`` then drops every marked property's default and
+    examples.
+    """
+
+    def model_schema(self, schema: Any) -> Any:
+        json_schema = super().model_schema(schema)
+        cls = schema["cls"]
+        properties = json_schema.get("properties")
+        if not isinstance(properties, dict):
+            return json_schema
+        for name in _sensitive_fields(cls):
+            alias = cls.model_fields[name].validation_alias
+            prop = properties.get(alias if isinstance(alias, str) else name)
+            if isinstance(prop, dict):
+                prop["sensitive"] = True
+        return json_schema
+
+
 def config_schema(*sections: type[BaseModel]) -> dict[str, Any]:
     """The JSON Schema of the config that ``sections`` compose, without a server.
 
     The built-in sections are composed first and every registration rule applies, so a
     bad section raises what ``QuickMCP(sections=...)`` would. ``Field(doc=)`` appears as
-    ``description``, ``env``, ``arg`` and ``sensitive`` as written, and a section that
-    forbids unknown keys as ``additionalProperties: false``. The default of a sensitive
-    field is left out, and so is any default that is a JSON object or sits on a
-    model-typed field, which could hold one.
+    ``description``, ``env`` and ``arg`` as written, every field of a secret type as
+    ``sensitive: true``, and a section that forbids unknown keys as
+    ``additionalProperties: false``. The default of a sensitive field is left out, and
+    so is any default that is a JSON object or sits on a model-typed field, which could
+    hold one.
 
     Raises:
-        TypeError: A section isn't a marked, strict pydantic model.
-        ValueError: Two sections claim one key, or a key clashes with the root.
+        TypeError: A section isn't a marked, strict pydantic model, or an item's name
+            or ``sensitive=True`` can't be used.
+        ValueError: Two sections claim one key, a key clashes with the root, or two
+            items declare one name.
     """
     with warnings.catch_warnings():
         # Pydantic's warning about a default it can't write prints the default, and
         # the scrub leaves every such default out of the schema anyway.
         warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
-        schema = _compose([sections]).model.model_json_schema()
+        schema = _compose([sections]).model.model_json_schema(schema_generator=_Schema)
     _scrub(schema)
     return schema

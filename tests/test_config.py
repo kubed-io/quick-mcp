@@ -22,6 +22,7 @@ from pydantic import (
     ImportString,
     Json,
     RootModel,
+    SecretStr,
     ValidationError,
     field_validator,
     model_serializer,
@@ -271,6 +272,7 @@ def test_field_writes_doc_env_arg_and_sensitive() -> None:
     info = Field("x", doc="A doc", env="A_ENV", arg="--a", sensitive=True)
     assert info.description == "A doc"
     assert info.json_schema_extra == {"env": "A_ENV", "arg": "--a", "sensitive": True}
+    assert info.repr is True  # a secret type masks itself, so repr is pydantic's
     bare = Field(doc="d")
     assert bare.json_schema_extra is None  # no item given, nothing written
     assert bare.is_required()  # no default given: required, as pydantic's Field
@@ -485,7 +487,7 @@ class Required(Config):
 
 @config("secretive")
 class Secretive(Config):
-    token: str = Field("dflt", sensitive=True)
+    token: SecretStr = Field(SecretStr("dflt"), sensitive=True)
 
 
 class Unregistered(Config):
@@ -797,7 +799,7 @@ class KeyedHolder(Config):
 
 
 class Serial(Config):
-    token: str = Field("dflt", sensitive=True)
+    token: SecretStr = Field(SecretStr("dflt"), sensitive=True)
 
     @model_serializer
     def _flat(self) -> str:
@@ -812,7 +814,7 @@ class HoldsSerial(Config):
 
 @config("examples")
 class Exampled(Config):
-    secret: str = Field("x", sensitive=True, examples=["dflt"])
+    secret: SecretStr = Field(SecretStr("x"), sensitive=True, examples=["dflt"])
     shown: str = Field("y", examples=[{"default": {"a": 1}, "k": 2}])
 
 
@@ -947,16 +949,14 @@ def test_the_composed_class_is_not_a_key() -> None:
 
 @config("hushed")
 class Hushed(Config):
-    token: str = Field("hunter2", sensitive=True)
-    shown: str = Field("visible", sensitive=True, repr=True)
+    token: SecretStr = SecretStr("hunter2")
 
 
-def test_a_sensitive_field_is_kept_out_of_every_repr() -> None:
+def test_a_secret_is_kept_out_of_every_repr() -> None:
     loaded = _load([[Root, Hushed]], {"hushed": {"token": "s3cret"}}).config
     for text in (repr(loaded), str(loaded), repr(loaded.hushed), str(loaded.hushed)):
         assert "s3cret" not in text
         assert "hunter2" not in text
-    assert "visible" in repr(loaded.hushed)  # the caller's own repr= wins
 
 
 @config("tagged")
@@ -992,7 +992,7 @@ class Opaque:
 
 @config("opaque")
 class HoldsOpaque(Config):
-    thing: Any = Field(Opaque(), sensitive=True)
+    thing: Any = Field(Opaque())
 
 
 def test_the_schema_warns_nothing_about_a_sensitive_default(recwarn) -> None:
