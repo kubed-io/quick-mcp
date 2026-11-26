@@ -286,7 +286,9 @@ def _split_userinfo(rest: str) -> tuple[str | None, str] | None:
 
 
 def _where(address: str) -> str:
-    """The host a Pyroscope address names, with its port: never userinfo, path or query.
+    """The host an address names, with its port: never userinfo, path or query.
+
+    It serves the profiles address and the OTLP endpoints.
 
     An address without ``://`` is read as ``//<address>``. Userinfo ends at the last
     ``@``, so a password with an unencoded ``/`` is never shown. An ``@`` after a ``?``
@@ -329,6 +331,34 @@ def _where(address: str) -> str:
         return nothing
     shown = f"[{host}]" if ":" in host else host
     return f"{shown}:{port}" if port is not None else shown
+
+
+def _endpoint(kind: str) -> str:
+    """Where OTLP sends ``kind`` (``traces``, ``metrics`` or ``logs``): host and port.
+
+    The per-signal variable wins, then ``OTEL_EXPORTER_OTLP_ENDPOINT``, as the
+    exporter resolves them. An empty variable counts as unset and a blank one doesn't,
+    so a blank one shows ``an address with no host``. With neither set it shows
+    ``default``. Never raises.
+    """
+    own = os.environ.get(f"OTEL_EXPORTER_OTLP_{kind.upper()}_ENDPOINT")
+    value = own or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    return _where(value) if value else "default"
+
+
+def _exporters(kind: str, names: str) -> str:
+    """The exporters ``names`` lists for ``kind``, each OTLP one with its endpoint.
+
+    ``names`` is split on ``,`` and each entry trimmed, as the SDK does. An entry
+    starting with ``otlp`` (case-sensitive) is followed by `` (<endpoint>)``; the
+    others are shown as they are. Entries are joined with ``,`` and no space. Never
+    raises.
+    """
+    entries = [name.strip() for name in names.split(",")]
+    return ",".join(
+        f"{name} ({_endpoint(kind)})" if name.startswith("otlp") else name
+        for name in entries
+    )
 
 
 def _ready(address: str) -> tuple[str, str | None]:
@@ -512,7 +542,7 @@ def _start_line(signals: _Signals | None, settings: TelemetrySettings | None) ->
     """The one line a start logs: which signals started and where they go.
 
     Reads only the handle, the settings and ``os.environ``. Never shows a credential:
-    profiles are named by host and port alone.
+    profiles and OTLP endpoints are named by host and port alone.
     """
     parts: list[str] = []
     if (
@@ -524,7 +554,8 @@ def _start_line(signals: _Signals | None, settings: TelemetrySettings | None) ->
         parts.append(f"profiles \u2192 {_where(settings.profiles.get_secret_value())}")
     if signals is not None and signals._otel is not None:
         exporters = ", ".join(
-            f"{kind} {(os.environ.get(variable) or '').strip() or default}"
+            f"{kind} "
+            + _exporters(kind, (os.environ.get(variable) or "").strip() or default)
             for kind, variable, default in (
                 ("traces", "OTEL_TRACES_EXPORTER", "otlp"),
                 ("metrics", "OTEL_METRICS_EXPORTER", "otlp"),
