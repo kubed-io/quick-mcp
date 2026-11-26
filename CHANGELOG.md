@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Config sections:** declare pydantic sections with `@config("key")`, register them with `QuickMCP(sections=...)`, inject each with `Inject[Section]`, and write the whole config's JSON Schema with `config_schema()`.
+- **Config from a file, env vars and flags:** `QuickMCP(argv=sys.argv[1:])` loads one YAML file (`CONFIG_FILE` or `--config-file`) and the env var and flag each `Field(env=..., arg=...)` names; a test passes `environ=`.
+- Type a config secret `SecretStr`, `SecretBytes` or `Secret[T]` and read it with `get_secret_value()`, and mark a field `NoDecode` to get its env var or flag as raw text.
+- `mcp.config_sources` says which source set each config item, and quick-mcp never shows a secret in its own errors, logs or dumps.
 
 ### Changed
 

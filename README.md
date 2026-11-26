@@ -38,6 +38,8 @@ pip install kubed-mcp
 Import it as `kubed.mcp`:
 
 ```python
+import sys
+
 from kubed.mcp import Config, Inject, QuickMCP, config
 
 @config()
@@ -46,7 +48,7 @@ class Settings(Config):
     host: str = "0.0.0.0"
     port: int = 8000
 
-mcp = QuickMCP("grid", sections=[Settings])
+mcp = QuickMCP("grid", sections=[Settings], argv=sys.argv[1:])
 mcp.singleton(Grid)
 mcp.add_plugin("plugin/")  # its skills, commands and agents
 

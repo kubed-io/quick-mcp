@@ -12,6 +12,9 @@ from typing import Annotated, Any, Optional
 
 import pytest
 from pydantic import (
+    AliasChoices,
+    AliasPath,
+    ConfigDict,
     Json,
     Secret,
     SecretStr,
@@ -325,6 +328,44 @@ def test_a_self_referencing_model_ends_the_walk() -> None:
     assert "chain.head.val" in items and items["chain.head.next"].leaf
 
 
+@pytest.mark.parametrize(
+    "alias",
+    [AliasChoices("x", "xx"), AliasPath("x", 0), AliasChoices(AliasPath("x", 0))],
+)
+@pytest.mark.parametrize("name", [{"env": "CHOSEN_X"}, {"arg": "--chosen-x"}])
+def test_a_named_item_with_an_alias_that_is_not_a_string_is_refused(
+    alias, name
+) -> None:
+    section = config("chosen")(
+        create_model(
+            "Chosen", __base__=Config, x=(int, Field(0, validation_alias=alias, **name))
+        )
+    )
+    with pytest.raises(
+        TypeError,
+        match=r"^chosen\.x: a named item takes a plain string alias or none",
+    ):
+        _compose([[section]])
+
+
+@config("routes")
+class Routes(Config):
+    a: Secret[dict[str, int]] | None = Field(
+        None, validation_alias=AliasChoices("k", "keys")
+    )
+    b: Secret[dict[str, int]] | None = Field(
+        None, validation_alias=AliasChoices(AliasPath("bb", 0), "z")
+    )
+    c: Secret[dict[str, int]] | None = Field(None, validation_alias=AliasPath("cc", 0))
+
+
+def test_the_schema_marks_a_secret_under_the_key_pydantic_writes() -> None:
+    props = config_schema(Routes)["$defs"]["Routes"]["properties"]
+    assert list(props) == ["k", "z", "c"]
+    for prop in props.values():
+        assert prop["sensitive"] is True and "default" not in prop
+
+
 def test_the_schema_marks_every_secret_and_writes_no_default() -> None:
     schema = config_schema(Rec, Marked)
     props = schema["$defs"]["Rec"]["properties"]
@@ -399,6 +440,32 @@ def test_a_default_instance_keeps_its_values_under_a_layer() -> None:
         ).config.telemetry.limits.burst
         == 5
     )
+
+
+@config("made")
+class Made(Config):
+    limits: Limits = Field(default_factory=lambda: Limits(burst=5))
+
+
+def _never(data: dict[str, Any]) -> Limits:
+    raise AssertionError("a factory that takes the validated data was called")
+
+
+@config("fromdata")
+class FromData(Config):
+    n: int = 0
+    limits: Limits = Field(default_factory=_never)
+
+
+def test_a_factory_default_keeps_its_values_under_a_layer() -> None:
+    limits = load(Made, environ={"TELEMETRY_RATE": "9"}).config.made.limits
+    assert (limits.burst, limits.rate) == (5, 9)
+    assert load(Made).config.made.limits.burst == 5
+
+
+def test_a_factory_that_takes_the_validated_data_is_never_called() -> None:
+    limits = load(FromData, environ={"TELEMETRY_RATE": "9"}).config.fromdata.limits
+    assert (limits.burst, limits.rate) == (1, 9)
 
 
 def test_a_nested_name_beats_the_model_field_that_holds_it() -> None:
@@ -498,6 +565,8 @@ def test_a_missing_file_is_the_only_error(tmp_path) -> None:
         (b"port: [1\nname: s3cret\n", r"is not valid YAML at line \d+, column \d+"),
         (b"- 1\n", r"must be a mapping, not a list"),
         (b"when: 2020-02-30\n", r"is not valid YAML"),  # a constructor's ValueError
+        (b"port: !!timestamp 's3cret'\n", r"is not valid YAML"),  # AttributeError
+        (b"a: &x {b: *x, s3cret: 1}\n", r"is not valid YAML"),  # refers to itself
     ],
 )
 def test_a_named_file_that_cannot_be_used_stops_the_load(
@@ -587,6 +656,31 @@ def test_a_short_or_malformed_flag_is_counted_as_a_positional(argv, count) -> No
     )
     assert "s3cret" not in message and "-v" not in message
     assert ("(arg --tokn): no item takes this flag" in message) == ("--tokn=x" in argv)
+
+
+@pytest.mark.parametrize(
+    "argv, count",
+    [
+        (["--", "--port", "1"], 2),
+        (["--port", "2", "--", "--tokn=s3cret", "-s3cret"], 2),
+        (["--", "--"], 1),
+        (["--nope", "--", "s3cret"], 1),
+    ],
+)
+def test_every_token_after_a_bare_double_dash_is_a_positional(argv, count) -> None:
+    with pytest.raises(ValueError) as caught:
+        load(argv=argv)
+    message = str(caught.value)
+    assert (
+        f"  the arguments (arg): no item takes a positional argument, got {count}; "
+        "a server passes argv=sys.argv[1:]" in message
+    )
+    assert "s3cret" not in message and "--port" not in message
+    assert ("no item takes this flag" in message) == ("--nope" in argv)
+
+
+def test_a_bare_double_dash_alone_is_no_positional() -> None:
+    assert load(argv=["--port", "2", "--"]).config.port == 2
 
 
 def test_a_positional_says_to_pass_argv_from_one() -> None:
@@ -798,6 +892,15 @@ def test_the_boot_line_lists_only_what_is_not_default(caplog) -> None:
     ]
 
 
+def test_the_boot_line_is_not_built_when_info_is_off(caplog, monkeypatch) -> None:
+    def refuse(*args: object) -> str:
+        raise AssertionError("the boot line was built")
+
+    monkeypatch.setattr("kubed.mcp._config._boot_line", refuse)
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.config"):
+        assert load(environ={"PORT": "9000"}).config.port == 9000
+
+
 def test_a_load_that_fails_logs_no_boot_line(caplog) -> None:
     with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
         load(environ={"PORT": "x"})
@@ -913,6 +1016,59 @@ def test_a_dict_key_named_like_a_field_still_stops_at_a_secret() -> None:
         _load([[Entries]], {"d": {"d": {"a": {"s": {"s3cretkey": "x"}}}}})
     message = str(caught.value)
     assert "  d.d.a.s (code): " in message and "s3cretkey" not in message
+
+
+@config("byname")
+class ByName(Config):
+    model_config = ConfigDict(validate_by_name=True)
+    keys: Secret[dict[str, int]] | None = Field(None, validation_alias="Keys")
+
+
+@config("populated")
+class Populated(Config):
+    model_config = ConfigDict(populate_by_name=True)
+    keys: Secret[dict[str, int]] | None = Field(None, validation_alias="Keys")
+
+
+@pytest.mark.parametrize(
+    "section, values, path",
+    [
+        (Routes, {"routes": {"k": {"s3cretkey": "x"}}}, "routes.k"),
+        (Routes, {"routes": {"keys": {"s3cretkey": "x"}}}, "routes.keys"),
+        (Routes, {"routes": {"bb": [{"s3cretkey": "x"}]}}, "routes.bb"),
+        (Routes, {"routes": {"z": {"s3cretkey": "x"}}}, "routes.z"),
+        (Routes, {"routes": {"cc": [{"s3cretkey": "x"}]}}, "routes.cc"),
+        (ByName, {"byname": {"keys": {"s3cretkey": "x"}}}, "byname.keys"),
+        (ByName, {"byname": {"Keys": {"s3cretkey": "x"}}}, "byname.Keys"),
+        (Populated, {"populated": {"keys": {"s3cretkey": "x"}}}, "populated.keys"),
+    ],
+)
+def test_the_path_stops_at_a_secret_under_any_key_it_accepts(
+    section, values, path
+) -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[section]], values)
+    message = str(caught.value)
+    assert f"\n  {path} (code): " in message and "s3cretkey" not in message
+
+
+class Knobs(Config):
+    burst: int = Field(1, validation_alias=AliasChoices("b", "bb"))
+    rate: int = Field(2, env="KNOBS_RATE")
+
+
+@config("knobs")
+class KnobsSection(Config):
+    knobs: Knobs = Knobs(b=5)
+
+
+def test_a_default_instance_merges_under_the_key_its_field_accepts(tmp_path) -> None:
+    knobs = load(KnobsSection, environ={"KNOBS_RATE": "9"}).config.knobs.knobs
+    assert (knobs.burst, knobs.rate) == (5, 9)
+    f = tmp_path / "c.yaml"
+    f.write_text("knobs:\n  knobs:\n    bb: 7\n")
+    knobs = load(KnobsSection, environ={"CONFIG_FILE": str(f)}).config.knobs.knobs
+    assert (knobs.burst, knobs.rate) == (7, 2)
 
 
 def test_a_section_error_with_several_names_below_it_names_the_kind_only() -> None:

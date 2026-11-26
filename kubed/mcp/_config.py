@@ -25,6 +25,8 @@ from typing import Annotated, Any, Literal, NamedTuple, TypeVar
 
 import yaml
 from pydantic import (
+    AliasChoices,
+    AliasPath,
     BaseModel,
     ConfigDict,
     Json,
@@ -318,8 +320,24 @@ _ITEM_KEYWORDS = ("env", "arg", "sensitive")
 
 
 def _check_item_keywords(cls: type[BaseModel], name: str, path: str) -> None:
-    """Refuse item keywords that would silently do nothing, or a false ``sensitive``."""
+    """Refuse item keywords that would silently do nothing, or a false ``sensitive``.
+
+    A name on a field whose alias isn't a ``str`` is refused too: the name's value is
+    written under one key, and such a field takes its value under others.
+    """
     info = cls.model_fields[name]
+    alias = info.validation_alias
+    named = [
+        k
+        for k in ("env", "arg")
+        if isinstance(info.json_schema_extra, dict) and k in info.json_schema_extra
+    ]
+    if named and not (alias is None or isinstance(alias, str)):
+        written = " and ".join(f"{k}=" for k in named)
+        raise TypeError(
+            f"{path}: a named item takes a plain string alias or none, not an "
+            f"{type(alias).__name__}: drop its {written} or its validation_alias"
+        )
     for part in _parts(info.annotation):
         if isinstance(part, FieldInfo) and isinstance(part.json_schema_extra, dict):
             given = [k for k in _ITEM_KEYWORDS if k in part.json_schema_extra]
@@ -488,8 +506,7 @@ def _walk_items(
     a leaf's annotation reaches, the path of the first leaf that holds it.
     """
     for name, info in cls.model_fields.items():
-        alias = info.validation_alias
-        here = (*loc, alias if isinstance(alias, str) else name)
+        here = (*loc, _key(cls, name, info))
         names = (*attrs, name)
         path = ".".join(here)
         inner = _model_typed(info.annotation)
@@ -747,9 +764,10 @@ def _path(loc: tuple[int | str, ...], model: type[BaseModel]) -> str:
     """Join a pydantic ``loc``: names with ``.``, indexes as ``[i]``, up to a secret.
 
     The walk keeps a set of model classes that only grows, starting with ``model``. A
-    ``str`` part that is the key of a field of any class in the set is written. If that
-    field is sensitive the path ends after it, so no dict key or index below a secret
-    prints, at any depth. Otherwise the model classes the field's annotation reaches,
+    ``str`` part that is a first key of a field of any class in the set (``_accepts``)
+    is written. If that field is sensitive the path ends after it, so no dict key or
+    index below a secret prints, at any depth. Otherwise the model classes the field's
+    annotation reaches,
     through ``Optional``, ``Annotated``, unions, lists, tuples, sets and dict values,
     join the set. Any other part, an index, a dict key or a union tag, is written and
     leaves the set as it is. A dict key that is also a field's name is taken for the
@@ -771,7 +789,7 @@ def _path(loc: tuple[int | str, ...], model: type[BaseModel]) -> str:
             (cls, name)
             for cls in at
             for name, info in cls.model_fields.items()
-            if _key(name, info) == part
+            if part in _accepts(cls, name, info)
         ]
         if not fields:
             continue
@@ -853,13 +871,19 @@ def _merge(low: Any, high: Any) -> Any:
     """``high`` over ``low``: mappings key by key at every depth, else ``high`` whole.
 
     A model instance under a mapping counts as its fields, keyed as it validates, so
-    the keys the mapping doesn't set keep the instance's values.
+    the keys the mapping doesn't set keep the instance's values. A field the mapping
+    sets under another key it accepts takes the mapping's value alone, and one that
+    accepts no key a value can be written under takes its class default.
     """
     if not isinstance(high, Mapping):
         return high
     if isinstance(low, BaseModel):
-        fields = type(low).model_fields.items()
-        low = {_key(name, info): getattr(low, name) for name, info in fields}
+        instance, cls = low, type(low)
+        low = {}
+        for name, info in cls.model_fields.items():
+            key, accepted = _key(cls, name, info), _accepts(cls, name, info)
+            if key in accepted and not any(k in high for k in accepted if k != key):
+                low[key] = getattr(instance, name)
     if not isinstance(low, Mapping):
         return high
     merged = dict(low)
@@ -868,28 +892,89 @@ def _merge(low: Any, high: Any) -> Any:
     return merged
 
 
-def _key(name: str, info: FieldInfo) -> str:
-    """The key a field validates under: its alias when that is a name, else its own."""
+def _by_alias(cls: type[BaseModel]) -> bool:
+    return cls.model_config.get("validate_by_alias", True) is not False
+
+
+def _schema_key(name: str, info: FieldInfo) -> str:
+    """The property a field is under in pydantic's schema, which writes it by alias.
+
+    That is its ``str`` alias, else the first of its ``AliasChoices`` that is a ``str``
+    or an ``AliasPath`` of one ``str``, else its name.
+    """
     alias = info.validation_alias
-    return alias if isinstance(alias, str) else name
+    choices = alias.choices if isinstance(alias, AliasChoices) else [alias]
+    for choice in choices:
+        if isinstance(choice, str):
+            return choice
+        if isinstance(choice, AliasPath) and len(choice.path) == 1:
+            return str(choice.path[0])
+    return name
+
+
+def _key(cls: type[BaseModel], name: str, info: FieldInfo) -> str:
+    """The one key a field of ``cls`` is written under: its schema property's name.
+
+    A model that doesn't validate by alias takes the field's name.
+    """
+    return _schema_key(name, info) if _by_alias(cls) else name
+
+
+def _accepts(cls: type[BaseModel], name: str, info: FieldInfo) -> tuple[str, ...]:
+    """Every first key a field of ``cls`` takes its value under.
+
+    That is its ``str`` alias, the first element of an ``AliasPath`` and of each
+    ``AliasChoices`` choice, and its name when it has no alias or ``cls`` validates by
+    name (``validate_by_name`` or ``populate_by_name``). A model that doesn't validate
+    by alias takes the name alone.
+    """
+    alias = info.validation_alias
+    if alias is None or not _by_alias(cls):
+        return (name,)
+    choices = alias.choices if isinstance(alias, AliasChoices) else [alias]
+    keys = [c if isinstance(c, str) else c.path[0] for c in choices]
+    settings = cls.model_config
+    if settings.get("validate_by_name") or settings.get("populate_by_name"):
+        keys.append(name)
+    return tuple(dict.fromkeys(k for k in keys if isinstance(k, str)))
+
+
+def _default_instance(info: FieldInfo) -> BaseModel | None:
+    """A field's default when it's a model instance, or a no-argument factory makes one.
+
+    A ``default_factory`` that takes no argument is called, once. One that takes the
+    validated data is never called.
+    """
+    if isinstance(info.default, BaseModel):
+        return info.default
+    if info.default_factory is None or info.default_factory_takes_validated_data:
+        return None
+    made = info.get_default(call_default_factory=True)
+    return made if isinstance(made, BaseModel) else None
 
 
 def _over_defaults(model: type[BaseModel], data: Mapping[str, Any]) -> dict[str, Any]:
     """``data`` over the defaults that are model instances, at every depth.
 
-    A model-typed field whose data is a mapping, and whose default is an instance, gets
-    the instance's values for the keys the data leaves out. A ``default_factory`` is
-    never called.
+    A model-typed field whose data is a mapping, under any key the field accepts, and
+    whose default is an instance, gets the instance's values for the keys the data
+    leaves out. A ``default_factory`` that takes no argument is called once, only then,
+    and its result merged over the same way when it is an instance. Pydantic calls it
+    itself when the field is absent, so it runs once per load either way. A factory that
+    takes the validated data is never called here.
     """
     merged = dict(data)
     for name, info in model.model_fields.items():
-        key = _key(name, info)
-        value = merged.get(key)
         inner = _model_typed(info.annotation)
-        if inner is None or not isinstance(value, Mapping):
+        if inner is None:
             continue
-        if isinstance(info.default, BaseModel):
-            value = _merge(info.default, value)
+        key = next((k for k in _accepts(model, name, info) if k in merged), None)
+        if key is None or not isinstance(merged[key], Mapping):
+            continue
+        value = merged[key]
+        default = _default_instance(info)
+        if default is not None:
+            value = _merge(default, value)
         merged[key] = _over_defaults(inner, value)
     return merged
 
@@ -998,8 +1083,12 @@ def _read_argv(
     unknown flag, reported by that text. Without an ``=``, the token after it is its
     value when that has no flag's shape, even one starting with ``-``, and is never
     shown. Every other leftover, a short flag or a bare ``-`` included, is counted
-    with the positionals and never quoted.
+    with the positionals and never quoted. So is every token after a bare ``--``,
+    which argparse never sees, whatever its version does with one.
     """
+    argv = list(argv)
+    end = argv.index("--") if "--" in argv else len(argv)
+    argv, after = argv[:end], argv[end + 1 :]
     parser = _Parser(
         prog="server",  # never read from sys.argv
         add_help=False,
@@ -1011,7 +1100,7 @@ def _read_argv(
             parser.add_argument(item.arg, dest=f"item{index}")
     parser.add_argument(_RESERVED["arg"], dest="config_file")
     try:
-        parsed, extras = parser.parse_known_args(list(argv))
+        parsed, extras = parser.parse_known_args(argv)
     except _ArgvError as exc:
         return {}, None, [f"  the arguments ({Source('arg')}): {exc}"], True
 
@@ -1022,7 +1111,7 @@ def _read_argv(
         if f"item{index}" in found
     }
     errors: list[str] = []
-    positionals = 0
+    positionals = len(after)
     at = 0
     while at < len(extras):
         token = extras[at]
@@ -1063,8 +1152,9 @@ def _read_file(path: str) -> tuple[_Layer | None, str | None]:
     if text is not None:
         try:
             data = yaml.safe_load(text)
-        # A ValueError is a constructor's, such as a bad date, and quotes the value.
-        except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        # Whatever the loader raises: a constructor's ValueError, such as a bad date,
+        # quotes the value, and a bad tag's value can end in an AttributeError.
+        except Exception as exc:  # noqa: BLE001  # CFG-9: never the exception's text
             mark = getattr(exc, "problem_mark", None)
             trouble = "is not valid YAML"
             if mark is not None:
@@ -1074,9 +1164,14 @@ def _read_file(path: str) -> tuple[_Layer | None, str | None]:
             data = {}
         if not isinstance(data, dict):
             trouble = f"must be a mapping, not a {type(data).__name__}"
+        else:
+            try:
+                data = _unblank(data)
+            except RecursionError:  # an anchor whose mapping holds itself
+                trouble = "is not valid YAML"
     if trouble is not None:
         return None, f"  config file {path} {trouble}"
-    return _Layer("file", _unblank(data), (((), path),)), None
+    return _Layer("file", data, (((), path),)), None
 
 
 # Error types whose pydantic text can carry the input, and the fixed text said instead.
@@ -1293,7 +1388,8 @@ def _load(
     record = types.MappingProxyType(
         {item.path: _source(item.loc, layers) for item in leaves}
     )
-    _LOG.info("%s", _boot_line(leaves, loaded, record))
+    if _LOG.isEnabledFor(logging.INFO):
+        _LOG.info("%s", _boot_line(leaves, loaded, record))
     return _Loaded(loaded, provided, record)
 
 
@@ -1366,8 +1462,7 @@ class _Schema(GenerateJsonSchema):
         if not isinstance(properties, dict):
             return json_schema
         for name in _sensitive_fields(cls):
-            alias = cls.model_fields[name].validation_alias
-            prop = properties.get(alias if isinstance(alias, str) else name)
+            prop = properties.get(_schema_key(name, cls.model_fields[name]))
             if isinstance(prop, dict):
                 prop["sensitive"] = True
         return json_schema
