@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The telemetry start line shows where each OTLP exporter sends, as host and port.
 
+### Fixed
+
+- A `subscriptions/listen` stream no longer shows as a server span lasting as long as the stream.
+
 ## [0.4.2] - 2026-11-26
 
 ### Fixed

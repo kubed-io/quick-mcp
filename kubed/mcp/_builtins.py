@@ -115,7 +115,8 @@ class _ServingComponent(Component):
 class _TelemetryComponent(Component):
     """Takes ``telemetry``: the call metrics at registration, the signals while serving.
 
-    Off imports nothing: neither FastMCP's metrics nor a signal's package.
+    Off imports nothing: neither FastMCP's metrics nor a signal's package. Registration
+    always keeps a ``subscriptions/listen`` stream out of the server spans (TEL-22).
 
     The lifespan may be entered again before an earlier entry has exited, so each
     start's handle is kept on a stack, None when another start owns the process's
@@ -130,6 +131,12 @@ class _TelemetryComponent(Component):
         self._signals: list[_Signals | None] = []
 
     def register(self, mcp: QuickMCP, section: BaseModel | None) -> None:
+        # A listen stream is the client's connection, not an operation (TEL-22): left
+        # out of the server spans whatever the settings, as FastMCP traces under any
+        # tracer provider.
+        from ._listen import _leave_listen_untraced
+
+        _leave_listen_untraced(mcp.server)
         # Outermost, ahead of the scopes, to record what the client received, the
         # call slot's teardown included (TEL-16).
         metrics = _call_metrics(cast("TelemetrySettings | None", section))
