@@ -5,17 +5,23 @@ from __future__ import annotations
 import argparse
 import ast
 import logging
+import sys
+import types
 import typing
 from pathlib import Path
 from typing import Literal
 
 import fastmcp.server.server
 import pytest
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
+from starlette.testclient import TestClient
 
 import kubed.mcp
 import kubed.mcp.app
+import kubed.mcp.telemetry
 from kubed.mcp import (
+    Component,
+    Config,
     DeliverySettings,
     Field,
     QuickMCP,
@@ -26,6 +32,8 @@ from kubed.mcp import (
     config_schema,
 )
 from kubed.mcp._config import _compose
+from kubed.mcp.auth import TokenVerifier
+from kubed.mcp.container import Container
 
 pytestmark = pytest.mark.unit
 
@@ -353,3 +361,217 @@ def test_no_section_is_found_by_attribute_name() -> None:
             ):
                 first = ast.unparse(node.args[0]).lower()
                 assert "config" not in first, f"{path.name}:{node.lineno}"
+
+
+# -- a server's component
+
+LOG = logging.getLogger("tests.components")
+EVENTS: list[str] = []
+
+
+@config("backend")
+class Backend(Config):
+    url: str = "mem://"
+
+
+class Unmarked(Config):
+    """A section with no ``@config`` of its own."""
+
+    url: str = "mem://"
+
+
+class StartFailed(RuntimeError):
+    """A ``Recorder``'s start failing: none of FastMCP's own errors is one."""
+
+
+class Recorder(Component):
+    section = Backend
+
+    def __init__(
+        self, tag: str, *, fail_start: bool = False, fail_stop: bool = False
+    ) -> None:
+        self.tag, self.fail_start, self.fail_stop = tag, fail_start, fail_stop
+
+    def register(self, mcp, section) -> None:
+        EVENTS.append(f"register {self.tag} {section.url}")
+
+    async def start(self, section) -> None:
+        LOG.info("start %s", self.tag)
+        EVENTS.append(f"start {self.tag} {section.url}")
+        if self.fail_start:
+            raise StartFailed("https://user:s3cret@x")
+
+    async def stop(self) -> None:
+        EVENTS.append(f"stop {self.tag}")
+        if self.fail_stop:
+            raise RuntimeError("https://user:s3cret@x")
+
+
+def _holds(error: BaseException | None, kind: type[BaseException]) -> bool:
+    """Whether ``error``, its cause or context, or a member of an exception group's
+    ``exceptions``, at any depth, is a ``kind``: FastMCP may wrap a lifespan's error."""
+    seen: set[int] = set()
+    todo = [error]
+    while todo:
+        each = todo.pop()
+        if each is None or id(each) in seen:
+            continue
+        seen.add(id(each))
+        if isinstance(each, kind):
+            return True
+        todo += [each.__cause__, each.__context__]
+        todo += list(getattr(each, "exceptions", ()))
+    return False
+
+
+async def test_a_component_gets_its_section_and_starts_and_stops_in_order() -> None:
+    EVENTS.clear()
+    mcp = QuickMCP(
+        "t",
+        components=[Recorder("a"), Recorder("b")],
+        config={"backend": {"url": "redis://r"}},
+    )
+    assert EVENTS == ["register a redis://r", "register b redis://r"]
+    async with Client(mcp.server):
+        assert EVENTS[2:] == ["start a redis://r", "start b redis://r"]
+    assert EVENTS[4:] == ["stop b", "stop a"]
+
+
+async def test_a_raising_stop_is_logged_by_type_and_the_others_still_stop(
+    caplog,
+) -> None:
+    EVENTS.clear()
+    mcp = QuickMCP(
+        "t", components=[Recorder("a"), Recorder("b", fail_stop=True)], environ={}
+    )
+    async with Client(mcp.server):
+        pass
+    assert EVENTS[-2:] == ["stop b", "stop a"]
+    (record,) = [r for r in caplog.records if r.name == "kubed.mcp.components"]
+    assert (record.levelno, record.getMessage()) == (
+        logging.ERROR,
+        "Recorder did not stop cleanly: RuntimeError",
+    )
+    assert "s3cret" not in caplog.text
+
+
+async def test_a_raising_start_stops_those_started_and_fails_the_boot(
+    monkeypatch, caplog
+) -> None:
+    EVENTS.clear()
+    closed: list[bool] = []
+
+    async def aclose(self) -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(Container, "aclose", aclose)
+    monkeypatch.setattr(kubed.mcp.telemetry, "_running", None)
+    fake = types.ModuleType("pyroscope")
+    fake.configure = lambda **kw: EVENTS.append("profiles started")
+    fake.shutdown = lambda: EVENTS.append("profiles stopped")
+    monkeypatch.setitem(sys.modules, "pyroscope", fake)
+    mcp = QuickMCP(
+        "t",
+        components=[Recorder("a"), Recorder("b", fail_start=True), Recorder("c")],
+        config={"telemetry": {"profiles": "http://p:4040"}},
+    )
+    with pytest.raises(BaseException) as caught:
+        async with Client(mcp.server):
+            pass
+    assert _holds(caught.value, StartFailed)
+    assert [e for e in EVENTS if not e.startswith("register")] == [
+        "profiles started",
+        "start a mem://",
+        "start b mem://",
+        "stop a",
+        "profiles stopped",
+    ]
+    assert closed == [True]
+    assert "s3cret" not in caplog.text
+
+
+def test_components_takes_component_instances() -> None:
+    for bad in (Recorder, object()):
+        with pytest.raises(TypeError, match=r"components= takes Component instances"):
+            QuickMCP("t", components=[bad], environ={})
+
+
+def test_a_components_section_needs_its_own_config_mark() -> None:
+    class Bare(Component):
+        section = Unmarked
+
+    with pytest.raises(TypeError, match=r"no @config of its own"):
+        QuickMCP("t", components=[Bare()], environ={})
+
+
+def test_a_component_with_no_section_gets_none() -> None:
+    seen: list[object] = []
+
+    class Plain(Component):
+        def register(self, mcp, section) -> None:
+            seen.append(section)
+
+    QuickMCP("t", components=[Plain()], environ={})
+    assert seen == [None]
+
+
+# -- order
+
+
+async def test_the_boot_line_is_logged_at_each_start_before_the_components(
+    caplog,
+) -> None:
+    with caplog.at_level(logging.INFO):
+        mcp = QuickMCP("t", components=[Recorder("a")], environ={"PORT": "9000"})
+        # Nothing at construction.
+        assert not [r for r in caplog.records if r.name == "kubed.mcp.config"]
+        for _ in range(2):
+            async with Client(mcp.server):
+                pass
+    names = ("kubed.mcp.config", "tests.components")
+    lines = [r.getMessage() for r in caplog.records if r.name in names]
+    assert lines == ["config: serving.port=9000 (env PORT)", "start a"] * 2
+
+
+# -- auth
+
+
+class Refuse(TokenVerifier):
+    async def verify_token(self, token: str):
+        return None
+
+
+def test_auth_set_after_construction_is_enforced() -> None:
+    mcp = QuickMCP("t", environ={})
+    assert mcp.auth is None
+    mcp.auth = Refuse()
+    assert mcp.server.auth is mcp.auth
+    client = TestClient(mcp.server.http_app())
+    answer = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={"accept": "application/json, text/event-stream"},
+    )
+    assert answer.status_code == 401
+
+
+def test_a_component_can_set_auth_in_register() -> None:
+    class Door(Component):
+        def register(self, mcp, section) -> None:
+            mcp.auth = Refuse()
+
+    assert isinstance(QuickMCP("t", components=[Door()], environ={}).auth, Refuse)
+
+
+def test_auth_is_fixed_once_run_is_called(ran) -> None:
+    mcp = QuickMCP("t", environ={})
+    mcp.run()
+    with pytest.raises(RuntimeError, match=r"auth is fixed once serving starts"):
+        mcp.auth = Refuse()
+
+
+async def test_auth_is_fixed_inside_the_lifespan() -> None:
+    mcp = QuickMCP("t", environ={})
+    async with Client(mcp.server):
+        with pytest.raises(RuntimeError, match=r"auth is fixed once serving starts"):
+            mcp.auth = Refuse()

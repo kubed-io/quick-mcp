@@ -11,7 +11,6 @@ import argparse
 import dataclasses
 import json
 import keyword
-import logging
 import os
 import re
 import types
@@ -783,14 +782,18 @@ class Source(NamedTuple):
 
 
 class _Loaded(NamedTuple):
-    """What ``_load`` returns: the config, what to inject for each class, its sources.
+    """What ``_load`` returns: the config, what to inject for each class, its sources
+    and its boot line.
 
-    ``sources`` maps each leaf item's path to where its value came from.
+    ``sources`` maps each leaf item's path to where its value came from. ``boot_line``
+    names each item not at its default, its value and its source: the server logs it
+    each time serving starts.
     """
 
     config: Config
     provided: dict[type, object]
     sources: Mapping[str, Source]
+    boot_line: str
 
 
 def _bad_values(what: str) -> TypeError:
@@ -1331,7 +1334,6 @@ def _given(
     raise _bad_values(f"an instance of {type(values).__qualname__}")
 
 
-_LOG = logging.getLogger("kubed.mcp.config")
 _ANY = TypeAdapter(Any)
 
 
@@ -1477,9 +1479,9 @@ def _load(
     given are kept as given.
 
     Each leaf item's path maps, in item order and read-only, to the source its value
-    came from. A load that validates logs one ``INFO`` line on ``kubed.mcp.config``
-    naming each item not at its default, its value and its source, with a sensitive
-    item's value as ``***``.
+    came from. A load that validates builds its boot line, which names each item not at
+    its default, its value and its source, with a sensitive item's value as ``***``.
+    The load logs nothing: the server logs the line each time serving starts.
 
     A load error names each path and its source, and a path stops at a sensitive
     field. Pydantic's own texts never carry the input, but a server's own validator
@@ -1568,9 +1570,7 @@ def _load(
     record = types.MappingProxyType(
         {item.path: _source(item.loc, layers) for item in leaves}
     )
-    if _LOG.isEnabledFor(logging.INFO):
-        _LOG.info("%s", _boot_line(leaves, loaded, record))
-    return _Loaded(loaded, provided, record)
+    return _Loaded(loaded, provided, record, _boot_line(leaves, loaded, record))
 
 
 # Schema keywords whose value maps a name to a schema, so a name there is data.

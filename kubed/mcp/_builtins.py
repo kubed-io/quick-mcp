@@ -1,18 +1,25 @@
-"""The sections every server has: ``serving``, ``telemetry`` and ``delivery``.
+"""The sections every server has, ``serving``, ``telemetry`` and ``delivery``, and the
+components that take them.
 
 ``_config`` composes ``BUILTINS`` first in every config, so each server reads them, and
 ``config_schema()`` shows them, with no ``QuickMCP``. A server changes one by
-subclassing it under the same key. This module imports no FastMCP.
+subclassing it under the same key. ``_builtin_components`` makes each server's own
+components for them, registered and started before the server's. This module imports
+no FastMCP.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel
 
 from ._config import Config, Field, config
-from .telemetry import TelemetrySettings
+from .components import Component
+from .telemetry import TelemetrySettings, _call_metrics, _Signals, _start_signals
+
+if TYPE_CHECKING:
+    from .app import QuickMCP
 
 
 @config("serving")
@@ -83,3 +90,56 @@ BUILTINS: tuple[type[BaseModel], ...] = (
     TelemetrySettings,
     DeliverySettings,
 )
+
+
+class _ServingComponent(Component):
+    """Takes ``serving``, which ``QuickMCP.run()`` reads: it does nothing else."""
+
+    section = ServingSettings
+
+
+class _TelemetryComponent(Component):
+    """Takes ``telemetry``: the call metrics at registration, the signals while serving.
+
+    Off imports nothing: neither FastMCP's metrics nor a signal's package.
+
+    The lifespan may be entered again before an earlier entry has exited, so each
+    start's handle is kept on a stack, None when another start owns the process's
+    signals, and each stop takes one off. The owning handle is stopped by the last
+    stop, whichever entry exits last.
+    """
+
+    section = TelemetrySettings
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._signals: list[_Signals | None] = []
+
+    def register(self, mcp: QuickMCP, section: BaseModel | None) -> None:
+        # Outermost, ahead of the scopes, to record what the client received, the
+        # call slot's teardown included (TEL-16).
+        metrics = _call_metrics(cast("TelemetrySettings | None", section))
+        if metrics is not None:
+            mcp.server.middleware.insert(0, metrics)
+
+    async def start(self, section: BaseModel | None) -> None:
+        # Never raises (TEL-6). None when another start owns the process's signals.
+        self._signals.append(
+            _start_signals(self._name, cast("TelemetrySettings | None", section))
+        )
+
+    async def stop(self) -> None:
+        signals = self._signals.pop() if self._signals else None
+        if signals is not None:
+            signals.stop()
+
+
+class _DeliveryComponent(Component):
+    """Takes ``delivery``, which the server's resolver reads: it does nothing else."""
+
+    section = DeliverySettings
+
+
+def _builtin_components(name: str) -> tuple[Component, Component, Component]:
+    """The built-in components of the server named ``name``, made for it alone."""
+    return _ServingComponent(), _TelemetryComponent(name), _DeliveryComponent()

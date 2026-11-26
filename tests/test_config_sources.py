@@ -882,31 +882,19 @@ def test_a_source_prints_as_it_appears_in_an_error() -> None:
 
 def test_the_boot_line_lists_only_what_is_not_default(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        load(
-            environ={"PORT": "9000", "RECORDING_TOKEN": "s3cret"},
-            argv=["--recording-inbox", "/in"],
-        )
-        load()
-    lines = [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"]
+        lines = [
+            load(
+                environ={"PORT": "9000", "RECORDING_TOKEN": "s3cret"},
+                argv=["--recording-inbox", "/in"],
+            ).boot_line,
+            load().boot_line,
+        ]
     assert lines == [
         'config: port=9000 (env PORT), recording.inbox="/in" (arg --recording-inbox), '
         "recording.token=*** (env RECORDING_TOKEN)",
         "config: all defaults",
     ]
-
-
-def test_the_boot_line_is_not_built_when_info_is_off(caplog, monkeypatch) -> None:
-    def refuse(*args: object) -> str:
-        raise AssertionError("the boot line was built")
-
-    monkeypatch.setattr("kubed.mcp._config._boot_line", refuse)
-    with caplog.at_level(logging.WARNING, logger="kubed.mcp.config"):
-        assert load(environ={"PORT": "9000"}).config.port == 9000
-
-
-def test_a_load_that_fails_logs_no_boot_line(caplog) -> None:
-    with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
-        load(environ={"PORT": "x"})
+    # The lifespan logs it, at each start: a load logs nothing.
     assert not [r for r in caplog.records if r.name == "kubed.mcp.config"]
 
 
@@ -916,13 +904,11 @@ class Loose(Config):
     blob: bytes = b""
 
 
-def test_a_value_json_cannot_write_is_named_by_its_type(caplog) -> None:
+def test_a_value_json_cannot_write_is_named_by_its_type() -> None:
     values = {"loose": {"thing": SimpleNamespace(t="s3cret"), "blob": b"\xffs3cret"}}
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        _load([[Loose]], values)
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    assert _load([[Loose]], values).boot_line == (
         'config: loose.thing="<SimpleNamespace>" (code), loose.blob="<bytes>" (code)'
-    ]
+    )
 
 
 class Login(BaseModel):
@@ -949,18 +935,16 @@ class Logins(Config):
     one: Login | None = Field(None)
 
 
-def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth(caplog) -> None:
+def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth() -> None:
     environ = {
         "LOGINS_CREDS": '[{"name": "a", "token": "S3CRET-LIST"}]',
         "LOGINS_DEEP": '{"x": {"creds": [{"name": "b", "token": "S3CRET-DEEP"}]}}',
     }
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        loaded = load(Logins, environ=environ).config
-    assert loaded.logins.creds[0].token.get_secret_value() == "S3CRET-LIST"
-    assert "S3CRET" not in caplog.text
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    loaded = load(Logins, environ=environ)
+    assert loaded.config.logins.creds[0].token.get_secret_value() == "S3CRET-LIST"
+    assert loaded.boot_line == (
         "config: logins.creds=*** (env LOGINS_CREDS), logins.deep=*** (env LOGINS_DEEP)"
-    ]
+    )
 
 
 needs_type_params = pytest.mark.skipif(
@@ -979,7 +963,7 @@ def _generic_aliases() -> tuple[Any, Any]:
 
 
 @needs_type_params
-def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret(caplog) -> None:
+def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret() -> None:
     many, pair = _generic_aliases()
 
     @config("aliased")
@@ -991,14 +975,12 @@ def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret(caplog) -> None
         "ALIASED_CREDS": '[{"name": "a", "token": "S3CRET-MANY"}]',
         "ALIASED_NAMED": '{"x": {"name": "b", "token": "S3CRET-PAIR"}}',
     }
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        loaded = load(Aliased, environ=environ).config
-    assert loaded.aliased.named["x"].token.get_secret_value() == "S3CRET-PAIR"
-    assert "S3CRET" not in caplog.text
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    loaded = load(Aliased, environ=environ)
+    assert loaded.config.aliased.named["x"].token.get_secret_value() == "S3CRET-PAIR"
+    assert loaded.boot_line == (
         "config: aliased.creds=*** (env ALIASED_CREDS), "
         "aliased.named=*** (env ALIASED_NAMED)"
-    ]
+    )
 
 
 @needs_type_params
@@ -1246,10 +1228,8 @@ def test_a_scalar_for_a_model_inside_json_names_the_env_var() -> None:
 # -- boot line
 
 
-def test_the_boot_line_masks_a_revealing_serializer_held_by_any(caplog) -> None:
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        _load([[Loose]], {"loose": {"thing": Login(name="a", token="S3CRET")}})
-    assert "S3CRET" not in caplog.text
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+def test_the_boot_line_masks_a_revealing_serializer_held_by_any() -> None:
+    loaded = _load([[Loose]], {"loose": {"thing": Login(name="a", token="S3CRET")}})
+    assert loaded.boot_line == (
         'config: loose.thing={"name":"a","token":"**********"} (code)'
-    ]
+    )

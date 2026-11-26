@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import json
@@ -23,7 +24,8 @@ from pydantic import BaseModel, ValidationError
 
 import kubed.mcp
 import kubed.mcp.telemetry
-from kubed.mcp import Inject, QuickMCP, TelemetrySettings, config
+from kubed.mcp import Component, Inject, QuickMCP, TelemetrySettings, config
+from kubed.mcp._builtins import _TelemetryComponent
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
 
@@ -247,12 +249,38 @@ async def test_profiles_stop_when_the_lifespan_fails(pyroscope) -> None:
         yield
 
     run = _with_teardown(
-        Container(), lifespan, name="t", telemetry=TelemetrySettings(profiles=ADDRESS)
+        Container(),
+        lifespan,
+        parts=[(_TelemetryComponent("t"), TelemetrySettings(profiles=ADDRESS))],
+        boot_line="config: all defaults",
+        on_enter=lambda: None,
     )
     with pytest.raises(RuntimeError, match="boom"):
         async with run(FastMCP("t")):
             pass
     assert EVENTS == ["profiles started", "lifespan up", "profiles stopped"]
+
+
+class Slow(Component):
+    """Starts slowly, so a second lifespan entry arrives while the first starts."""
+
+    async def start(self, section) -> None:
+        await asyncio.sleep(0.05)
+
+
+async def test_two_entries_at_once_start_and_stop_the_profiles_once(pyroscope) -> None:
+    mcp = served("twice", TelemetrySettings(profiles=ADDRESS), components=[Slow()])
+
+    async def enter() -> None:
+        async with Client(mcp.server) as client:
+            await client.call_tool("ping", {})
+
+    await asyncio.gather(enter(), enter())
+    assert [e for e in EVENTS if e.startswith("profiles")] == [
+        "profiles started",
+        "profiles stopped",
+    ]
+    assert kubed.mcp.telemetry._running is None
 
 
 @pytest.mark.parametrize(

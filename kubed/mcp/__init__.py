@@ -6,11 +6,11 @@ touches, re-exported as the same objects, so ``isinstance`` and pydantic keep wo
 Protocol plumbing is in ``kubed.mcp.protocol``, auth in ``kubed.mcp.auth`` and the
 request's headers and query in ``kubed.mcp.request``.
 
-Every name but ``Config``, ``DeliverySettings``, ``Field``, ``NoDecode``,
-``ServingSettings``, ``Source``, ``TelemetrySettings``, ``config`` and ``config_schema``
-resolves on first use, so importing ``kubed.mcp`` loads no FastMCP until one of them is
-used, and a config module can declare its sections and write their schema without
-loading FastMCP.
+Every name but ``Component``, ``Config``, ``DeliverySettings``, ``Field``,
+``NoDecode``, ``ServingSettings``, ``Source``, ``TelemetrySettings``, ``config`` and
+``config_schema`` resolves on first use, so importing ``kubed.mcp`` loads no FastMCP
+until one of them is used, and a config module can declare its sections and
+components and write their schema without loading FastMCP.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from ._builtins import DeliverySettings, ServingSettings
 from ._config import Config, Field, NoDecode, Source, config, config_schema
+from .components import Component
 from .telemetry import TelemetrySettings
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 __version__ = version("kubed-mcp")
 
 __all__ = [
+    "Component",
     "Config",
     "Context",
     "Delivery",

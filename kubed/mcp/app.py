@@ -14,13 +14,15 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.middleware import Middleware
 from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
-from ._builtins import DeliverySettings, ServingSettings
+from ._builtins import DeliverySettings, ServingSettings, _builtin_components
 from ._config import Config, Source, _load
 from ._handshake import _Describe
+from .components import Component, _start_all, _stop_all
 from .container import (
     _CALL,
     SERVING,
@@ -52,7 +54,6 @@ from .plugins import (
     View,
     _PinScope,
 )
-from .telemetry import TelemetrySettings, _call_metrics, _start_signals
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -95,30 +96,42 @@ def _signed_as(
     return sign
 
 
+_BOOT = logging.getLogger("kubed.mcp.config")
+
+_AUTH_FIXED = "auth is fixed once serving starts: set mcp.auth before run()"
+
+
 def _with_teardown(
     container: Container,
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[Any]] | None,
     *,
-    name: str,
-    telemetry: TelemetrySettings | None,
+    parts: Sequence[tuple[Component, BaseModel | None]],
+    boot_line: str,
+    on_enter: Callable[[], None],
 ) -> Callable[[FastMCP], AbstractAsyncContextManager[Any]]:
-    """The server's lifespan, with telemetry started before it and stopped after it.
+    """The server's lifespan, with the components started before it and stopped after.
 
-    The container is torn down last, after telemetry has stopped.
+    On every entry: ``on_enter`` runs, the boot line is logged, each component starts
+    in order, the server's ``lifespan`` runs, the started components stop in reverse,
+    and the container is torn down last. A start that raises stops those already
+    started, tears the container down and fails the boot with its error.
     """
 
     @asynccontextmanager
     async def run(server: FastMCP) -> AsyncIterator[Any]:
-        signals = _start_signals(name, telemetry)
         try:
-            if lifespan is None:
-                yield {}
-            else:
-                async with lifespan(server) as state:
-                    yield state
+            on_enter()
+            _BOOT.info("%s", boot_line)
+            started = await _start_all(parts)
+            try:
+                if lifespan is None:
+                    yield {}
+                else:
+                    async with lifespan(server) as state:
+                        yield state
+            finally:
+                await _stop_all(started)
         finally:
-            if signals is not None:
-                signals.stop()
             await container.aclose()
 
     return run
@@ -136,6 +149,28 @@ def quiet_fastmcp_logging() -> None:
     logger.propagate = True
 
 
+def _components(components: Iterable[Component]) -> tuple[Component, ...]:
+    """``components=`` as a tuple, each one checked to be a ``Component`` instance."""
+    if isinstance(components, (Component, type)) or not isinstance(
+        components, Iterable
+    ):
+        raise TypeError(
+            "components= takes Component instances in a sequence, got "
+            + _what(components)
+        )
+    checked = tuple(components)
+    for each in checked:
+        if not isinstance(each, Component):
+            raise TypeError(f"components= takes Component instances, got {_what(each)}")
+    return checked
+
+
+def _what(value: object) -> str:
+    if isinstance(value, type):
+        return f"the class {value.__qualname__}"
+    return f"an instance of {type(value).__qualname__}"
+
+
 class QuickMCP:
     """A FastMCP server and a container, built by a factory and run by ``run()``.
 
@@ -145,9 +180,12 @@ class QuickMCP:
 
     ``sections`` are the config classes the server takes, each stamped with ``@config``,
     beside the built-in ``serving``, ``telemetry`` and ``delivery`` sections every
-    server has: a subclass under one of their keys replaces it. ``config`` gives their
-    values in code: a mapping, a section instance, or an iterable of them. The config
-    loads first thing in ``__init__``, so a bad one stops construction, and
+    server has: a subclass under one of their keys replaces it. ``components`` are
+    ``Component`` instances: each one's ``section`` is composed with them, each
+    registers at the end of construction, after the built-in components, and each
+    starts when serving starts and stops when it ends (``Component``). ``config``
+    gives their values in code: a mapping, a section instance, or an iterable of them.
+    The config loads first thing in ``__init__``, so a bad one stops construction, and
     ``mcp.config`` is the loaded instance. Each section class resolves
     by ``Inject[...]``, and ``Inject[Config]`` is the whole config.
 
@@ -163,32 +201,50 @@ class QuickMCP:
         name: str,
         *,
         sections: Iterable[type[BaseModel]] = (),
+        components: Iterable[Component] = (),
         config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
         argv: Sequence[str] | None = None,
         environ: Mapping[str, str] | None = None,
         header_prefix: str | None = None,
         **fastmcp_options: Any,
     ):
-        loaded = _load([sections], config, argv=argv, environ=environ)
+        components = _components(components)
+        loaded = _load(
+            [[c.section for c in components if c.section is not None], sections],
+            config,
+            argv=argv,
+            environ=environ,
+        )
         header_prefix = _header_prefix(header_prefix)
+        self._serving = False
         self._container = Container()
         self._config = loaded.config
         self._config_sources = loaded.sources
         self._provided = loaded.provided
-        telemetry = cast(TelemetrySettings, self._provided[TelemetrySettings])
+        parts = [
+            (
+                c,
+                None
+                if c.section is None
+                else cast(BaseModel, loaded.provided[c.section]),
+            )
+            for c in (*_builtin_components(name), *components)
+        ]
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
             name,
             lifespan=_with_teardown(
                 self._container,
                 lifespan,
-                name=name,
-                telemetry=telemetry,
+                parts=parts,
+                boot_line=loaded.boot_line,
+                on_enter=self._serving_starts,
             ),
             **fastmcp_options,
         )
         # _CallScope is outermost but for the call metrics, so every other middleware
-        # and handler shares one call's slot (APP-6). The metrics go in last, below.
+        # and handler shares one call's slot (APP-6). The telemetry component puts the
+        # metrics in at registration, below.
         self.server.middleware.insert(0, _CallScope(self._container))
         SERVING[self.server] = self._container
         for key, value in loaded.provided.items():
@@ -216,15 +272,34 @@ class QuickMCP:
         # Inside the pin, so the prefix it takes off is the one the pinned build
         # writes; outside NameTheIndex and every provider, so none sees a prefix.
         self.server.middleware.insert(3, _TakeThePrefix())
-        # The call metrics go first, after the scopes above are placed by their index
-        # from _CallScope, to record what the client received, the slot's teardown
-        # included (TEL-16).
-        if (metrics := _call_metrics(telemetry)) is not None:
-            self.server.middleware.insert(0, metrics)
         # Inside the resolution, so the handshake echoes and is written for this
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
         self.add_middleware(_Describe(lambda: self._instructions))
+        # Last, so a component's middleware goes in after the scopes above are placed
+        # by their index: the built-ins first, then the server's, in order.
+        for component, section in parts:
+            component.register(self, section)
+
+    def _serving_starts(self) -> None:
+        """Serving has started: ``run()`` was called, or the lifespan entered."""
+        self._serving = True
+
+    @property
+    def auth(self) -> AuthProvider | None:
+        """The server's auth provider, ``mcp.server.auth``: None serves without auth.
+
+        Set it before serving starts, from the server's build code or a component's
+        ``register``: FastMCP reads it when it builds the HTTP app. Once ``run()`` is
+        called or the lifespan entered, setting it raises ``RuntimeError``.
+        """
+        return self.server.auth
+
+    @auth.setter
+    def auth(self, provider: AuthProvider | None) -> None:
+        if self._serving:
+            raise RuntimeError(_AUTH_FIXED)
+        self.server.auth = provider
 
     @property
     def config(self) -> Config:
@@ -520,7 +595,10 @@ class QuickMCP:
         ``uvicorn_config``) and are not used on stdio. The log level is never
         passed on: given one, FastMCP's run puts its own handlers back on its logger
         and stops it propagating, for the life of the process.
+
+        Serving starts here, so ``mcp.auth`` is fixed from this call on.
         """
+        self._serving_starts()
         serving = cast(ServingSettings, self._provided[ServingSettings])
         root = logging.getLogger()
         if not root.handlers:
