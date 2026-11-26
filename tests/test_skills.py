@@ -15,6 +15,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.skills import SkillsClientExtension
+from fastmcp.skills.provider import SkillManifestProvider
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
 from skill_server import (
     DEMO,
@@ -28,11 +29,12 @@ from skill_server import (
     served,
 )
 
-from kubed.mcp import QuickMCP
+from kubed.mcp import QuickMCP, skills
 from kubed.mcp.protocol import MCPError
 from kubed.mcp.skills import (
     EntryOnlySkillProvider,
     Skill,
+    SkillFileResource,
     SkillsExtension,
     load_skill,
     serve,
@@ -169,6 +171,42 @@ async def test_the_listing_names_the_skill_once():
     rows = [r for r in listed if str(r.uri).startswith("skill://")]
     assert [str(r.uri) for r in rows] == [ENTRY_URI]
     assert rows[0].description == description()
+
+
+async def test_the_listing_builds_one_row_per_skill(monkeypatch):
+    """Not a resource per file and a manifest per skill, only to drop them."""
+    made = []
+    plain = skills._file_resource
+
+    def counted(provider, path, manifest, file_path, file):
+        made.append(file_path)
+        return plain(provider, path, manifest, file_path, file)
+
+    monkeypatch.setattr(skills, "_file_resource", counted)
+    async with Client(demo().server) as client:
+        made.clear()  # connecting lists the skills once itself
+        await client.list_resources()
+    assert made == ["SKILL.md"]  # demo-skill has four files
+
+
+async def test_the_rows_are_fastmcps():
+    mcp = demo()
+    provider = next(
+        p for p in mcp.server.providers if isinstance(p, skills.EntryOnlySkillProvider)
+    )
+    oracle = [
+        skills._wire(r)
+        for r in await SkillManifestProvider._list_resources(provider)
+        if isinstance(r, SkillFileResource) and r.file_path == skills.ENTRY
+    ]
+    async with Client(mcp.server) as client:
+        got = [
+            r.model_dump(by_alias=True, exclude_none=True, mode="json")
+            for r in await client.list_resources()
+            if str(r.uri).startswith("skill://")
+        ]
+    assert oracle
+    assert got == oracle
 
 
 async def test_no_skill_template_is_listed():
