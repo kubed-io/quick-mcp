@@ -1972,6 +1972,111 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
     assert_safe(caplog.records, "s3cret")
 
 
+# -- subscriptions/listen (TEL-22) --------------------------------------------
+
+
+def server_span_names(spans) -> list[str]:
+    from opentelemetry.trace import SpanKind
+
+    return [s.name for s in spans.get_finished_spans() if s.kind is SpanKind.SERVER]
+
+
+async def listened_and_called(mcp: QuickMCP) -> None:
+    async with Client(mcp.server) as client, client.listen(tools_list_changed=True):
+        await client.call_tool("ping", {})
+
+
+async def test_a_listen_stream_has_no_server_span_or_duration_point(
+    metered, spans
+) -> None:
+    await listened_and_called(served("listened", TelemetrySettings(otel=True)))
+    names = server_span_names(spans)
+    assert "subscriptions/listen" not in names
+    assert "tools/call ping" in names
+    methods = [
+        p.attributes.get("mcp.method.name")
+        for p in duration_points(metered, "listened")
+    ]
+    # The call metrics never time listen today; this pins it against one that would.
+    assert "subscriptions/listen" not in methods
+    assert "tools/call" in methods
+
+
+async def test_a_listen_stream_is_left_out_under_someone_elses_provider(
+    traced, spans
+) -> None:
+    await listened_and_called(served("listened-off", TelemetrySettings()))
+    names = server_span_names(spans)
+    assert "subscriptions/listen" not in names
+    assert "tools/call ping" in names
+
+
+async def test_the_listen_middleware_stands_ahead_of_fastmcps_seam() -> None:
+    from fastmcp.server.low_level import FastMCPServerMiddleware
+
+    from kubed.mcp._listen import _ListenUntraced
+
+    mcp = served("ordered", TelemetrySettings())
+    kinds = [type(m) for m in mcp.server._mcp_server.middleware]
+    assert kinds[:2] == [_ListenUntraced, FastMCPServerMiddleware]
+
+
+@pytest.mark.parametrize(
+    ("method", "request_id", "mode"),
+    [
+        ("subscriptions/listen", 1, "propagation_only"),
+        ("tools/call", 2, "native"),
+        ("subscriptions/listen", None, "native"),
+    ],
+)
+async def test_only_a_listen_request_is_traced_by_propagation_alone(
+    method, request_id, mode
+) -> None:
+    from fastmcp.telemetry import telemetry_mode
+
+    from kubed.mcp._listen import _ListenUntraced
+
+    seen = []
+
+    async def call_next(ctx):
+        seen.append(telemetry_mode())
+        return "result"
+
+    ctx = types.SimpleNamespace(method=method, request_id=request_id)
+    assert await _ListenUntraced()(ctx, call_next) == "result"
+    assert seen == [mode]
+
+
+async def test_a_changed_fastmcp_server_warns_once_and_still_serves(caplog) -> None:
+    from fastmcp.server.low_level import FastMCPServerMiddleware
+
+    from kubed.mcp._listen import _leave_listen_untraced
+
+    mcp = served("changed", TelemetrySettings())
+    middleware = mcp.server._mcp_server.middleware
+    middleware[:] = [
+        m for m in middleware if not isinstance(m, FastMCPServerMiddleware)
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp._listen"):
+        _leave_listen_untraced(mcp.server)
+    warnings = [r for r in caplog.records if r.name == "kubed.mcp._listen"]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert "no FastMCPServerMiddleware" in warnings[0].getMessage()
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+
+
+def test_a_server_without_a_low_level_server_warns_once(caplog) -> None:
+    from kubed.mcp._listen import _leave_listen_untraced
+
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp._listen"):
+        _leave_listen_untraced(types.SimpleNamespace())
+    warnings = [r for r in caplog.records if r.name == "kubed.mcp._listen"]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert "AttributeError" in warnings[0].getMessage()
+
+
 # -- resource reads (TEL-21) --------------------------------------------------
 
 
