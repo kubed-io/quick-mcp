@@ -92,12 +92,16 @@ SOURCES = {
 # Names this package defines rather than re-exports.
 OWN = {
     "kubed.mcp": {
+        "Config",
         "Delivery",
+        "Field",
         "Inject",
         "QuickMCP",
         "Serving",
         "Telemetry",
         "TelemetrySettings",
+        "config",
+        "config_schema",
         "lookup",
     },
     "kubed.mcp.protocol": {"AdvertiseLegacyExtensions", "types"},
@@ -183,10 +187,19 @@ def _fresh(code: str) -> dict:
         "import kubed.mcp.telemetry",
         "from kubed.mcp import telemetry",
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
+        "from kubed.mcp import Config, Field, config, config_schema",
+        "from kubed.mcp import Config, Field, config, config_schema\n"
+        "@config('recording')\n"
+        "class Recording(Config):\n"
+        "    inbox: str | None = Field(None, doc='Where', env='RECORDING_INBOX')\n"
+        "assert config_schema(Recording)['properties']['recording']",
     ],
 )
 def test_importing_kubed_mcp_imports_no_fastmcp(code: str) -> None:
-    assert _fresh(code) == {"loaded": ["kubed.mcp.telemetry"], "missing_from_dir": []}
+    assert _fresh(code) == {
+        "loaded": ["kubed.mcp._config", "kubed.mcp.telemetry"],
+        "missing_from_dir": [],
+    }
 
 
 def test_the_first_fastmcp_name_used_imports_it() -> None:
@@ -225,8 +238,11 @@ def test_a_submodule_still_imports_from_the_package() -> None:
     assert protocol is importlib.import_module("kubed.mcp.protocol")
 
 
-def test_telemetry_imports_only_pydantic_and_the_standard_library() -> None:
-    spec = importlib.util.find_spec("kubed.mcp.telemetry")
+@pytest.mark.parametrize("module", ["kubed.mcp.telemetry", "kubed.mcp._config"])
+def test_the_config_modules_import_only_pydantic_and_the_standard_library(
+    module: str,
+) -> None:
+    spec = importlib.util.find_spec(module)
     assert spec is not None and spec.origin is not None
     tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
 

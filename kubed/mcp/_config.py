@@ -483,3 +483,75 @@ def _load(
         for each in (cls, *composition.replaced.get(key, ())):
             provided[each] = value
     return _Loaded(loaded, provided)
+
+
+# Schema keywords whose value maps a name to a schema, so a name there is data.
+_NAME_MAPS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+# Keywords whose value is data, not a schema: nothing in it is a keyword.
+_DATA = frozenset({"default", "examples", "enum", "const"})
+
+
+def _holds_object(value: object) -> bool:
+    """Whether a JSON value is, or holds anywhere inside it, an object."""
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, list) and any(_holds_object(item) for item in value)
+
+
+def _reaches_model(node: object, *, names: bool = False) -> bool:
+    """Whether a schema, below its data, refers to another schema through a ``$ref``."""
+    if isinstance(node, list):
+        return any(_reaches_model(item) for item in node)
+    if not isinstance(node, dict):
+        return False
+    if not names and "$ref" in node:
+        return True
+    return any(
+        _reaches_model(value, names=not names and key in _NAME_MAPS)
+        for key, value in node.items()
+        if names or key not in _DATA
+    )
+
+
+def _scrub(node: object, *, names: bool = False) -> None:
+    """Remove, in place, every default that could print a secret.
+
+    That is the default of a sensitive field, with its examples, and any default that
+    holds a JSON object or sits on a field whose type is a model, since a model instance
+    written as a default may carry a sensitive item, and a serializer may write it as
+    anything. ``names`` marks a map from names to schemas, whose keys aren't keywords.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _scrub(item)
+    elif isinstance(node, dict):
+        if not names:
+            if node.get("sensitive") is True:
+                node.pop("default", None)
+                node.pop("examples", None)
+            elif "default" in node and (
+                _holds_object(node["default"]) or _reaches_model(node)
+            ):
+                del node["default"]
+        for key, value in node.items():
+            if names or key not in _DATA:
+                _scrub(value, names=not names and key in _NAME_MAPS)
+
+
+def config_schema(*sections: type[BaseModel]) -> dict[str, Any]:
+    """The JSON Schema of the config that ``sections`` compose, without a server.
+
+    The built-in sections are composed first and every registration rule applies, so a
+    bad section raises what ``QuickMCP(sections=...)`` would. ``Field(doc=)`` appears as
+    ``description``, ``env``, ``arg`` and ``sensitive`` as written, and a section that
+    forbids unknown keys as ``additionalProperties: false``. The default of a sensitive
+    field is left out, and so is any default that is a JSON object or sits on a
+    model-typed field, which could hold one.
+
+    Raises:
+        TypeError: A section isn't a marked, strict pydantic model.
+        ValueError: Two sections claim one key, or a key clashes with the root.
+    """
+    schema = _compose([sections]).model.model_json_schema()
+    _scrub(schema)
+    return schema

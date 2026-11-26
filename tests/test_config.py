@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import json
 import uuid
 import zoneinfo
 from types import MappingProxyType
@@ -19,12 +20,13 @@ from pydantic import (
     Json,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import TypeAliasType, TypedDict
 
 import kubed.mcp._config
-from kubed.mcp._config import Config, Field, _compose, _load, config
+from kubed.mcp._config import Config, Field, _compose, _load, config, config_schema
 
 pytestmark = pytest.mark.unit
 
@@ -775,3 +777,120 @@ def test_an_instance_of_a_replaced_root_class_names_the_winner() -> None:
 def test_an_instance_goes_to_the_most_derived_matching_key() -> None:
     child = Child()
     assert _load([[RootOf, XOfRoot]], [child]).config.x is child
+
+
+# -- schema
+
+
+@config()
+class Holder(Config):
+    inner: Secretive = Secretive()
+
+
+@config("holder")
+class KeyedHolder(Config):
+    inner: Secretive = Secretive()
+
+
+class Serial(Config):
+    token: str = Field("dflt", sensitive=True)
+
+    @model_serializer
+    def _flat(self) -> str:
+        return f"tok:{self.token}"
+
+
+@config("serial")
+class HoldsSerial(Config):
+    one: Serial = Serial()
+    many: list[Serial] = Field([Serial()])
+
+
+@config("examples")
+class Exampled(Config):
+    secret: str = Field("x", sensitive=True, examples=["dflt"])
+    shown: str = Field("y", examples=[{"default": {"a": 1}, "k": 2}])
+
+
+@config("listing")
+class Listing(Config):
+    inners: list[Secretive] = Field([Secretive()])
+    plain: list[int] = Field([1, 2])
+    pair: dict[str, int] = Field({"a": 1})
+
+
+@config("named")
+class Named(Config):
+    default: dict[str, int] | None = None
+    sensitive: str = "visible"
+
+
+def test_one_schema_covers_every_section() -> None:
+    schema = config_schema(Root, Recording)
+    assert schema["title"] == "Config"
+    assert set(schema["properties"]) == {"name", "recording"}
+    inbox = schema["$defs"]["Recording"]["properties"]["inbox"]
+    assert inbox["description"] == "Where recordings go"
+    assert inbox["env"] == "RECORDING_INBOX" and inbox["arg"] == "--recording-inbox"
+    assert "sensitive" not in inbox
+
+
+def test_every_object_forbids_unknown_keys() -> None:
+    schema = config_schema(Root, Recording, Nest)
+    assert schema["additionalProperties"] is False
+    assert all(d["additionalProperties"] is False for d in schema["$defs"].values())
+
+
+@pytest.mark.parametrize(
+    "sections",
+    [(Secretive,), (Holder,), (KeyedHolder,), (Listing, Secretive), (HoldsSerial,)],
+)
+def test_a_sensitive_default_is_never_written(sections) -> None:
+    schema = config_schema(*sections)
+    assert "dflt" not in json.dumps(schema)
+    tokens = [
+        d["properties"]["token"]
+        for d in schema["$defs"].values()
+        if "token" in d["properties"]
+    ]
+    assert tokens and all(t["sensitive"] is True for t in tokens)
+
+
+def test_a_plain_default_is_kept() -> None:
+    schema = config_schema(Root, Listing)
+    assert schema["properties"]["name"]["default"] == "flow"
+    assert schema["$defs"]["Listing"]["properties"]["plain"]["default"] == [1, 2]
+
+
+def test_an_object_default_is_dropped_even_without_a_secret() -> None:
+    props = config_schema(Listing)["$defs"]["Listing"]["properties"]
+    assert "default" not in props["pair"]
+    assert "default" not in props["inners"]
+
+
+def test_a_field_named_default_or_sensitive_survives() -> None:
+    props = config_schema(Named)["$defs"]["Named"]["properties"]
+    assert set(props) == {"default", "sensitive"}
+    assert props["sensitive"]["default"] == "visible"
+
+
+def test_a_sensitive_field_loses_its_examples() -> None:
+    props = config_schema(Exampled)["$defs"]["Exampled"]["properties"]
+    assert "examples" not in props["secret"] and props["secret"]["sensitive"] is True
+
+
+def test_data_values_are_left_intact() -> None:
+    props = config_schema(Exampled)["$defs"]["Exampled"]["properties"]
+    assert props["shown"]["examples"] == [{"default": {"a": 1}, "k": 2}]
+
+
+def test_a_bad_section_raises_what_compose_raises() -> None:
+    with pytest.raises(TypeError, match="no @config of its own"):
+        config_schema(Unstamped)
+    with pytest.raises(ValueError, match="claimed by both"):
+        config_schema(Base, Other)
+
+
+def test_the_schema_includes_the_built_ins(monkeypatch) -> None:
+    monkeypatch.setattr(kubed.mcp._config, "_BUILTINS", (Base,))
+    assert "base" in config_schema()["properties"]
