@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 import inspect
 import json
@@ -19,13 +18,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from config_server import Duck
 from fastmcp import Client, FastMCP
 from pydantic import BaseModel, ValidationError
 
 import kubed.mcp
 import kubed.mcp.telemetry
-from kubed.mcp import Inject, QuickMCP, TelemetrySettings
+from kubed.mcp import Inject, QuickMCP, TelemetrySettings, config
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
 
@@ -112,7 +110,7 @@ async def make_monitor():
 
 
 def served(name: str, telemetry: object, **options) -> QuickMCP:
-    mcp = QuickMCP(name, sections=[Duck], config={"telemetry": telemetry}, **options)
+    mcp = QuickMCP(name, config={"telemetry": telemetry}, **options)
     mcp.singleton(Monitor, make_monitor)
 
     @mcp.tool
@@ -186,7 +184,10 @@ def test_settings_embed_as_a_configs_telemetry_section() -> None:
             }
         }
     )
-    assert config.telemetry.profiles == "http://pyroscope.example.com:4040"
+    assert (
+        config.telemetry.profiles.get_secret_value()
+        == "http://pyroscope.example.com:4040"
+    )
     assert config.telemetry.tags == {"team": "a"}
     assert Section().telemetry.tags is not Section().telemetry.tags
 
@@ -257,7 +258,6 @@ async def test_profiles_stop_when_the_lifespan_fails(pyroscope) -> None:
 @pytest.mark.parametrize(
     "telemetry",
     [
-        None,
         TelemetrySettings(),
         TelemetrySettings(profiles=""),
         TelemetrySettings(profiles=ADDRESS, profile_cpu=False, profile_memory=False),
@@ -271,7 +271,7 @@ async def test_profiles_off_import_nothing(monkeypatch, telemetry) -> None:
 
 
 async def test_a_config_without_telemetry_imports_nothing(monkeypatch) -> None:
-    # A server with no telemetry section.
+    # A server given no telemetry values: the built-in section's defaults.
     monkeypatch.delitem(sys.modules, "pyroscope", raising=False)
     mcp = QuickMCP("plain")
     async with Client(mcp.server):
@@ -412,11 +412,14 @@ async def test_profiles_start_again_once_the_owner_has_stopped(pyroscope) -> Non
     ]
 
 
+@config("telemetry")
+class OwnTelemetry(TelemetrySettings):
+    sampler: str = "always"
+
+
 async def test_a_servers_own_section_satisfies_telemetry(pyroscope) -> None:
-    section = argparse.Namespace(
-        profiles=ADDRESS, profile_cpu=True, profile_memory=False, otel=False, tags={}
-    )
-    async with Client(served("own", section).server):
+    section = OwnTelemetry(profiles=ADDRESS, profile_memory=False)
+    async with Client(served("own", section, sections=[OwnTelemetry]).server):
         pass
     assert pyroscope[0]["mem_enabled"] is False
 
@@ -442,11 +445,16 @@ async def test_a_module_missing_inside_configure_is_a_failed_start_not_a_missing
     assert_safe(caplog.records, "s3cret")
 
 
-async def test_a_section_missing_an_attribute_is_a_logged_error_and_the_server_serves(
-    pyroscope, caplog
+async def test_a_start_that_raises_is_a_logged_error_and_the_server_serves(
+    pyroscope, monkeypatch, caplog
 ) -> None:
     secret = "https://user:s3cret@pyroscope.example.com"
-    mcp = served("partial", argparse.Namespace(profiles=secret))
+
+    def refuse(name, settings):
+        raise AttributeError(f"no profiles at {secret}")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_profiles", refuse)
+    mcp = served("partial", TelemetrySettings(profiles=secret))
     async with Client(mcp.server) as client:
         assert (await client.call_tool("ping", {})).data == "pong"
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
@@ -1667,7 +1675,6 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
 
     mcp = QuickMCP(
         "ordered",
-        sections=[Duck],
         config={"telemetry": TelemetrySettings(otel=True)},
         middleware=[Given()],
     )
@@ -1681,15 +1688,12 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     assert kinds.index(Given) < kinds.index(Added)
 
 
-@pytest.mark.parametrize(
-    "telemetry", [None, TelemetrySettings(), argparse.Namespace(profiles=None)]
-)
-def test_otel_off_adds_no_call_metrics(telemetry) -> None:
+def test_otel_off_adds_no_call_metrics() -> None:
     from fastmcp.server.middleware.usage import UsageMiddleware
 
     from kubed.mcp.app import _CallScope
 
-    mcp = QuickMCP("plain", sections=[Duck], config={"telemetry": telemetry})
+    mcp = QuickMCP("plain", config={"telemetry": TelemetrySettings()})
     kinds = _middleware(mcp)
     assert UsageMiddleware not in kinds
     assert kinds[0] is _CallScope

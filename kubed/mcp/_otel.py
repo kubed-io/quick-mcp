@@ -36,7 +36,7 @@ from opentelemetry.instrumentation.logging.handler import (
 )
 from opentelemetry.metrics._internal import _ProxyMeterProvider
 
-from .telemetry import Telemetry
+from .telemetry import TelemetrySettings
 
 log = logging.getLogger(__name__)
 
@@ -391,7 +391,9 @@ class _Otel:
         _stopped = True
 
 
-def start(name: str, settings: Telemetry, profiles: ModuleType | None) -> _Otel | None:
+def start(
+    name: str, settings: TelemetrySettings, profiles: ModuleType | None
+) -> _Otel | None:
     """Configure OpenTelemetry for the server ``name``. Never raises.
 
     ``profiles`` is pyroscope when profiles started, else ``None``.

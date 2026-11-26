@@ -13,7 +13,6 @@ from types import MappingProxyType
 from typing import Annotated, Any, Literal, NewType
 
 import pytest
-from config_server import Duck
 from fastmcp import Client
 from pydantic import (
     BaseModel,
@@ -237,6 +236,7 @@ class UnfrozenRoot(Config):
     name: str = "x"
 
 
+@pytest.mark.usefixtures("no_builtins")
 def test_config_stamps_the_key_and_returns_the_class() -> None:
     class Fresh(Config):
         pass
@@ -299,6 +299,7 @@ def test_field_passes_other_keywords_to_pydantic() -> None:
 # -- composing
 
 
+@pytest.mark.usefixtures("no_builtins")
 def test_a_root_and_keyed_sections_compose() -> None:
     composed = _compose([[Root, Recording]])
     assert set(composed.model.model_fields) == {"name", "recording"}
@@ -333,6 +334,7 @@ def test_a_section_with_a_required_field_is_required() -> None:
     assert not _compose([[Recording]]).model.model_fields["recording"].is_required()
 
 
+@pytest.mark.usefixtures("no_builtins")
 def test_a_composition_without_a_root_has_only_keyed_fields() -> None:
     composed = _compose([[Recording]])
     assert set(composed.model.model_fields) == {"recording"}
@@ -367,7 +369,7 @@ def test_the_same_class_again_is_a_no_op() -> None:
 
 
 def test_a_servers_subclass_replaces_a_built_in(monkeypatch) -> None:
-    monkeypatch.setattr(kubed.mcp._config, "_BUILTINS", (Base,))
+    monkeypatch.setattr(kubed.mcp._config, "_builtin_sections", lambda: (Base,))
     composed = _compose([[Sub]])
     assert composed.held["base"] is Sub
     assert composed.replaced["base"] == (Base,)
@@ -575,6 +577,7 @@ class Settings:
     port: int = 8000
 
 
+@pytest.mark.usefixtures("no_builtins")
 def test_no_sections_load_an_empty_config() -> None:
     loaded = _load([[]], None, environ={})
     assert type(loaded.config).model_fields == {}
@@ -831,6 +834,7 @@ class Named(Config):
     sensitive: str = "visible"
 
 
+@pytest.mark.usefixtures("no_builtins")
 def test_one_schema_covers_every_section() -> None:
     schema = config_schema(Root, Recording)
     assert schema["title"] == "Config"
@@ -898,7 +902,7 @@ def test_a_bad_section_raises_what_compose_raises() -> None:
 
 
 def test_the_schema_includes_the_built_ins(monkeypatch) -> None:
-    monkeypatch.setattr(kubed.mcp._config, "_BUILTINS", (Base,))
+    monkeypatch.setattr(kubed.mcp._config, "_builtin_sections", lambda: (Base,))
     assert "base" in config_schema()["properties"]
 
 
@@ -914,8 +918,12 @@ def test_the_config_is_there_right_after_construction_and_frozen() -> None:
         mcp.config = None  # no setter
 
 
-def test_a_server_with_no_sections_has_an_empty_config() -> None:
-    assert type(QuickMCP("t", environ={}).config).model_fields == {}
+def test_a_server_with_no_sections_has_only_the_built_ins() -> None:
+    assert set(type(QuickMCP("t", environ={}).config).model_fields) == {
+        "serving",
+        "telemetry",
+        "delivery",
+    }
 
 
 def test_a_bad_config_stops_construction() -> None:
@@ -941,9 +949,9 @@ async def test_sections_and_the_config_are_injected_by_class() -> None:
 
 
 def test_the_composed_class_is_not_a_key() -> None:
-    # The composed class isn't a key: Duck and Config resolve, it doesn't.
-    mcp = QuickMCP("t", sections=[Duck], environ={})
-    assert mcp._container.knows(Duck) and mcp._container.knows(Config)
+    # The composed class isn't a key: Root and Config resolve, it doesn't.
+    mcp = QuickMCP("t", sections=[Root], environ={})
+    assert mcp._container.knows(Root) and mcp._container.knows(Config)
     assert not mcp._container.knows(type(mcp.config))
 
 

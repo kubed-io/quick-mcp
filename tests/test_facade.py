@@ -94,13 +94,13 @@ OWN = {
     "kubed.mcp": {
         "Config",
         "Delivery",
+        "DeliverySettings",
         "Field",
         "Inject",
         "NoDecode",
         "QuickMCP",
-        "Serving",
+        "ServingSettings",
         "Source",
-        "Telemetry",
         "TelemetrySettings",
         "config",
         "config_schema",
@@ -199,7 +199,11 @@ def _fresh(code: str) -> dict:
 )
 def test_importing_kubed_mcp_imports_no_fastmcp(code: str) -> None:
     assert _fresh(code) == {
-        "loaded": ["kubed.mcp._config", "kubed.mcp.telemetry"],
+        "loaded": [
+            "kubed.mcp._builtins",
+            "kubed.mcp._config",
+            "kubed.mcp.telemetry",
+        ],
         "missing_from_dir": [],
     }
 
@@ -241,11 +245,15 @@ def test_a_submodule_still_imports_from_the_package() -> None:
 
 
 @pytest.mark.parametrize(
-    "module, extra",
-    [("kubed.mcp.telemetry", set()), ("kubed.mcp._config", {"yaml"})],
+    "module, extra, allowed",
+    [
+        ("kubed.mcp.telemetry", set(), {"_config"}),
+        ("kubed.mcp._config", {"yaml"}, set()),
+        ("kubed.mcp._builtins", set(), {"_config", "telemetry"}),
+    ],
 )
 def test_the_config_modules_import_only_pydantic_and_the_standard_library(
-    module: str, extra: set[str]
+    module: str, extra: set[str], allowed: set[str]
 ) -> None:
     spec = importlib.util.find_spec(module)
     assert spec is not None and spec.origin is not None
@@ -276,4 +284,4 @@ def test_the_config_modules_import_only_pydantic_and_the_standard_library(
 
     walk(tree.body)
     assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"} | extra
-    assert relative == []
+    assert set(relative) <= allowed

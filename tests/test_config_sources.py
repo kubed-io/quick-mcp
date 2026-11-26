@@ -25,7 +25,6 @@ from pydantic import (
     model_validator,
 )
 
-from kubed.mcp import QuickMCP
 from kubed.mcp._config import (
     Config,
     Field,
@@ -37,7 +36,8 @@ from kubed.mcp._config import (
     config_schema,
 )
 
-pytestmark = pytest.mark.unit
+# Serve (PORT, --port) and Tel (the key telemetry) would clash with the built-ins.
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_builtins")]
 
 
 # -- items
@@ -1185,39 +1185,7 @@ def test_a_section_error_with_several_names_below_it_names_the_kind_only() -> No
         load(Pair, environ={"PAIR_A": "1", "PAIR_B": "2"})
 
 
-# -- a server's sources
-
-
-def test_a_server_reads_only_the_flags_and_env_it_is_given(monkeypatch) -> None:
-    monkeypatch.setenv("PORT", "1")
-    mcp = QuickMCP("t", sections=[Serve], argv=["--port", "2"], environ={})
-    assert mcp.config.port == 2
-    assert mcp.config_sources["port"] == Source("arg", "--port")
-    assert QuickMCP("t", sections=[Serve], environ={"PORT": "3"}).config.port == 3
-
-
-def test_a_server_built_without_environ_reads_the_process_env(monkeypatch) -> None:
-    monkeypatch.setenv("PORT", "4")
-    mcp = QuickMCP("t", sections=[Serve])
-    assert mcp.config_sources["port"] == Source("env", "PORT")
-
-
-def test_config_with_argv_or_environ_is_a_type_error_through_the_server() -> None:
-    with pytest.raises(TypeError, match="config= reads no flags or env vars"):
-        QuickMCP("t", sections=[Serve], config={"port": 1}, argv=["--port", "2"])
-
-
-def test_a_bad_flag_stops_construction_without_exiting() -> None:
-    with pytest.raises(ValueError, match=r"the arguments \(arg --nope\)"):
-        QuickMCP("t", sections=[Serve], argv=["--nope"], environ={})
-
-
-def test_config_sources_is_read_only() -> None:
-    mcp = QuickMCP("t", sections=[Serve], environ={})
-    with pytest.raises(AttributeError):
-        mcp.config_sources = {}
-    with pytest.raises(TypeError):
-        mcp.config_sources["port"] = Source("code")
+# -- the public names
 
 
 def test_the_public_names_are_the_modules_own() -> None:

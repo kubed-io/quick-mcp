@@ -11,13 +11,14 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
 from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
+from ._builtins import DeliverySettings, ServingSettings
 from ._config import Config, Source, _load
 from ._handshake import _Describe
 from .container import (
@@ -51,7 +52,7 @@ from .plugins import (
     View,
     _PinScope,
 )
-from .telemetry import Telemetry, _call_metrics, _start_signals
+from .telemetry import TelemetrySettings, _call_metrics, _start_signals
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -59,17 +60,6 @@ R = TypeVar("R")
 
 # ``singleton``'s ``instance`` when none is given: ``None`` may be one.
 _UNSET: Any = object()
-
-
-class Serving(Protocol):
-    """The three settings ``QuickMCP.run()`` reads: none of the rest of a config."""
-
-    @property
-    def transport(self) -> str: ...
-    @property
-    def host(self) -> str: ...
-    @property
-    def port(self) -> int: ...
 
 
 class _CallScope(Middleware):
@@ -110,7 +100,7 @@ def _with_teardown(
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[Any]] | None,
     *,
     name: str,
-    telemetry: Telemetry | None,
+    telemetry: TelemetrySettings | None,
 ) -> Callable[[FastMCP], AbstractAsyncContextManager[Any]]:
     """The server's lifespan, with telemetry started before it and stopped after it.
 
@@ -153,10 +143,12 @@ class QuickMCP:
     input is also read as ``Kb-*``, which wins (DLV-16). An invalid ``header_prefix``
     raises ``ValueError``.
 
-    ``sections`` are the config classes the server takes, each stamped with ``@config``.
-    ``config`` gives their values in code: a mapping, a section instance, or an iterable
-    of them. The config loads first thing in ``__init__``, so a bad one stops
-    construction, and ``mcp.config`` is the loaded instance. Each section class resolves
+    ``sections`` are the config classes the server takes, each stamped with ``@config``,
+    beside the built-in ``serving``, ``telemetry`` and ``delivery`` sections every
+    server has: a subclass under one of their keys replaces it. ``config`` gives their
+    values in code: a mapping, a section instance, or an iterable of them. The config
+    loads first thing in ``__init__``, so a bad one stops construction, and
+    ``mcp.config`` is the loaded instance. Each section class resolves
     by ``Inject[...]``, and ``Inject[Config]`` is the whole config.
 
     ``argv`` is the server's flags, ``sys.argv[1:]`` from its entry point: None reads
@@ -182,7 +174,8 @@ class QuickMCP:
         self._container = Container()
         self._config = loaded.config
         self._config_sources = loaded.sources
-        telemetry = getattr(self._config, "telemetry", None)
+        self._provided = loaded.provided
+        telemetry = cast(TelemetrySettings, self._provided[TelemetrySettings])
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
             name,
@@ -214,7 +207,7 @@ class QuickMCP:
         # The inputs resolve once per request, inside _CallScope and outside the pin, so
         # the build key's prefix is the one this request resolved.
         self._resolver = _Resolver(
-            header_prefix, getattr(self._config, "delivery", None)
+            header_prefix, cast(DeliverySettings, self._provided[DeliverySettings])
         )
         _RESOLVERS[self.server] = self._resolver
         self.server.middleware.insert(1, _ResolveScope(self._resolver))
@@ -515,30 +508,32 @@ class QuickMCP:
         """Ends every session built for ``value``, in reverse creation order."""
         await self._container.end_session(value)
 
-    def run(self, serving: Serving | None = None, **http_options: Any) -> None:
-        """Serves until the process stops, as ``serving`` says, or the config when None.
+    def run(self, **http_options: Any) -> None:
+        """Serves until the process stops, as the config's ``serving`` section says.
+
+        Its ``transport``, ``host`` and ``port`` come from the loaded config, so from
+        ``config=``, or the file, env vars and flags the server was built with. Its
+        ``log_level`` is set on the root logger, which gets ``logging.basicConfig()``'s
+        handler first only when it has none.
 
         ``http_options`` go to FastMCP's HTTP transport (``path``, ``middleware``,
         ``uvicorn_config``) and are not used on stdio. The log level is never
         passed on: given one, FastMCP's run puts its own handlers back on its logger
         and stops it propagating, for the life of the process.
         """
-        settings: Any = serving
-        if settings is None:
-            settings = self._config
-            if not all(hasattr(settings, n) for n in ("transport", "host", "port")):
-                raise TypeError(
-                    "run() needs a Serving: pass one, or register a root section "
-                    "with transport, host and port"
-                )
+        serving = cast(ServingSettings, self._provided[ServingSettings])
+        root = logging.getLogger()
+        if not root.handlers:
+            logging.basicConfig()
+        root.setLevel(serving.log_level)
         quiet_fastmcp_logging()
-        if settings.transport == "stdio":
+        if serving.transport == "stdio":
             self.server.run(transport="stdio", show_banner=False)
             return
         self.server.run(
-            transport=settings.transport,
-            host=settings.host,
-            port=settings.port,
+            transport=serving.transport,
+            host=serving.host,
+            port=serving.port,
             show_banner=False,
             **http_options,
         )

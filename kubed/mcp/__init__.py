@@ -6,10 +6,11 @@ touches, re-exported as the same objects, so ``isinstance`` and pydantic keep wo
 Protocol plumbing is in ``kubed.mcp.protocol``, auth in ``kubed.mcp.auth`` and the
 request's headers and query in ``kubed.mcp.request``.
 
-Every name but ``Config``, ``Field``, ``NoDecode``, ``Source``, ``Telemetry``,
-``TelemetrySettings``, ``config`` and ``config_schema`` resolves on first use, so
-importing ``kubed.mcp`` loads no FastMCP until one of them is used, and a config module
-can declare its sections and write their schema without loading FastMCP.
+Every name but ``Config``, ``DeliverySettings``, ``Field``, ``NoDecode``,
+``ServingSettings``, ``Source``, ``TelemetrySettings``, ``config`` and ``config_schema``
+resolves on first use, so importing ``kubed.mcp`` loads no FastMCP until one of them is
+used, and a config module can declare its sections and write their schema without
+loading FastMCP.
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ from importlib import import_module
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
+from ._builtins import DeliverySettings, ServingSettings
 from ._config import Config, Field, NoDecode, Source, config, config_schema
-from .telemetry import Telemetry, TelemetrySettings
+from .telemetry import TelemetrySettings
 
 if TYPE_CHECKING:
     from fastmcp.dependencies import Depends
@@ -45,7 +47,7 @@ if TYPE_CHECKING:
     from fastmcp.utilities.types import Image
     from mcp_types import TextContent
 
-    from .app import QuickMCP, Serving
+    from .app import QuickMCP
     from .delivery import Delivery
     from .inject import Inject, lookup
 
@@ -55,6 +57,7 @@ __all__ = [
     "Config",
     "Context",
     "Delivery",
+    "DeliverySettings",
     "Depends",
     "FastMCPError",
     "Field",
@@ -72,9 +75,8 @@ __all__ = [
     "ResourceError",
     "ResourceResult",
     "ResourceTemplate",
-    "Serving",
+    "ServingSettings",
     "Source",
-    "Telemetry",
     "TelemetrySettings",
     "TextContent",
     "TextResource",
@@ -104,7 +106,6 @@ _LAZY: dict[str, str] = {
     "ResourceError": "fastmcp.exceptions",
     "ResourceResult": "fastmcp.resources",
     "ResourceTemplate": "fastmcp.resources",
-    "Serving": ".app",
     "TextContent": "mcp_types",
     "TextResource": "fastmcp.resources",
     "ToolError": "fastmcp.exceptions",

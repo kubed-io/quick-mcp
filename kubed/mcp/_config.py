@@ -52,9 +52,6 @@ _STAMP = "__kubed_config_key__"
 # "No default given" for ``Field``, so ``None`` stays a usable default.
 _UNSET: Any = object()
 
-# The sections every server has. Empty until a built-in section exists.
-_BUILTINS: tuple[type[BaseModel], ...] = ()
-
 
 class Config(BaseModel):
     """The base a section may subclass. It refuses unknown keys.
@@ -63,6 +60,17 @@ class Config(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+
+def _builtin_sections() -> tuple[type[BaseModel], ...]:
+    """The sections every server has, composed before its own.
+
+    Imported here, not at the top: ``_builtins`` defines them with this module's
+    ``Config``, ``Field`` and ``config``.
+    """
+    from ._builtins import BUILTINS
+
+    return BUILTINS
 
 
 class _Top(Config):
@@ -383,6 +391,51 @@ def _check_item_keywords(cls: type[BaseModel], name: str, path: str) -> None:
             f"{path}: sensitive=True needs a secret type: use SecretStr, "
             "SecretBytes or Secret[T]"
         )
+    _check_inherited_names(cls, name, path)
+
+
+def _names_of(info: FieldInfo) -> dict[str, str]:
+    """The ``env`` and ``arg`` a field was given, by keyword."""
+    extra = info.json_schema_extra
+    if not isinstance(extra, dict):
+        return {}
+    return {k: extra[k] for k in ("env", "arg") if k in extra}
+
+
+def _check_inherited_names(cls: type[BaseModel], name: str, path: str) -> None:
+    """Refuse a field that drops an ``env`` or ``arg`` a model base's field gave it.
+
+    Pydantic drops a parent field's metadata when a subclass redefines the field, so
+    a bare redefinition would lose the names that set it, at any depth of the chain.
+    Each keyword is compared on its own, with the nearest model base whose field of
+    the same name has that keyword. The error lists every keyword dropped and names
+    the nearest base that has any of them. Restating either under another name is
+    allowed.
+    """
+    kept = _names_of(cls.model_fields[name])
+    dropped: dict[str, str] = {}
+    nearest: type[BaseModel] | None = None
+    for base in cls.__mro__[1:]:
+        if not (isinstance(base, type) and issubclass(base, BaseModel)):
+            continue
+        field = base.model_fields.get(name)
+        given = {} if field is None else _names_of(field)
+        for kind in ("env", "arg"):
+            if kind in kept or kind in dropped or kind not in given:
+                continue
+            dropped[kind] = given[kind]
+            nearest = nearest or base
+    if nearest is None:
+        return
+    # In the keyword order, whichever base each one came from.
+    dropped = {k: dropped[k] for k in ("env", "arg") if k in dropped}
+    written = " and ".join(f"{k}={v!r}" for k, v in dropped.items())
+    restated = ", ".join(f"{k}={v!r}" for k, v in dropped.items())
+    them = "them" if len(dropped) > 1 else "it"
+    raise TypeError(
+        f"{path}: redefines {nearest.__qualname__}.{name} without its "
+        f"{written}: restate Field(..., {restated}) to keep {them}"
+    )
 
 
 def _is_typed_dict(cls: object) -> bool:
@@ -649,8 +702,8 @@ _NOT_ITERABLE = "sections= takes an iterable of section classes, such as a list"
 def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     """Register the sections of every source and compose them into one config model.
 
-    ``_BUILTINS`` come first, then each source in order. The most derived class wins
-    a key. Every field reached through model fields is recorded as an item, and the
+    The built-in sections come first, then each source in order. The most derived class
+    wins a key. Every field reached through model fields is recorded as an item, and the
     names items declare are checked here, so ``config_schema`` refuses what a server
     refuses.
     """
@@ -658,7 +711,7 @@ def _compose(sources: Iterable[Iterable[type[BaseModel]]]) -> _Composition:
     replaced: dict[str | None, list[type[BaseModel]]] = {}
     if not isinstance(sources, Iterable):
         raise TypeError(_NOT_ITERABLE)
-    for source in (_BUILTINS, *sources):
+    for source in (_builtin_sections(), *sources):
         if isinstance(source, BaseModel):
             raise TypeError(
                 f"sections= takes classes, got an instance of "

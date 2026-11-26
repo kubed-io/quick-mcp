@@ -10,9 +10,11 @@ import logging
 import os
 from collections.abc import Mapping
 from types import ModuleType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import SecretStr
+
+from ._config import Config, Field, config
 
 if TYPE_CHECKING:
     from fastmcp.server.middleware import Middleware
@@ -20,57 +22,51 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class Telemetry(Protocol):
-    """What a config's ``telemetry`` section provides.
-
-    ``TelemetrySettings`` satisfies it, and so does a server's own section.
-    """
-
-    @property
-    def profiles(self) -> str | None: ...
-    @property
-    def profile_cpu(self) -> bool: ...
-    @property
-    def profile_memory(self) -> bool: ...
-    @property
-    def otel(self) -> bool: ...
-    @property
-    def tags(self) -> dict[str, str]: ...
-
-
-class TelemetrySettings(BaseModel):
-    """A ``telemetry`` section a server's config can embed.
+@config("telemetry")
+class TelemetrySettings(Config):
+    """The ``telemetry`` section, registered in every server.
 
     ``profiles`` is the address of the Pyroscope server. Setting it turns profiles
     on; there is no separate enabled flag. ``profile_cpu`` and ``profile_memory``
     choose which profiles are sent. ``otel`` turns OpenTelemetry on, configured by
     the standard ``OTEL_*`` variables. ``tags`` are labels added to every profile
     and resource attributes on every trace and metric. An unknown key is an error,
-    so a typo stops the boot; a server's own section may subclass it to add keys.
+    so a typo stops the boot. A server's own subclass, marked ``@config("telemetry")``,
+    replaces it to add keys.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    profiles: str | None = Field(
-        default=None,
-        description="Pyroscope server address; setting it turns profiles on.",
+    profiles: SecretStr | None = Field(
+        None,
+        doc="Pyroscope server address; setting it turns profiles on.",
+        env="TELEMETRY_PROFILES",
+        arg="--telemetry-profiles",
     )
     profile_cpu: bool = Field(
-        default=True, description="Sample CPU while profiles are on."
+        True,
+        doc="Sample CPU while profiles are on.",
+        env="TELEMETRY_PROFILE_CPU",
+        arg="--telemetry-profile-cpu",
     )
     profile_memory: bool = Field(
-        default=True, description="Sample allocations while profiles are on."
+        True,
+        doc="Sample allocations while profiles are on.",
+        env="TELEMETRY_PROFILE_MEMORY",
+        arg="--telemetry-profile-memory",
     )
     otel: bool = Field(
-        default=False,
-        description="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+        False,
+        doc="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+        env="TELEMETRY_OTEL",
+        arg="--telemetry-otel",
     )
     tags: dict[str, str] = Field(
         default_factory=dict,
-        description=(
+        doc=(
             "Labels on every profile, and resource attributes on every trace "
             "and metric."
         ),
+        env="TELEMETRY_TAGS",
+        arg="--telemetry-tags",
     )
 
 
@@ -105,7 +101,7 @@ class _Signals:
 _running: _Signals | None = None
 
 
-def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
+def _start_signals(name: str, settings: TelemetrySettings | None) -> _Signals | None:
     """Start what ``settings`` turns on, unless a start already owns the process.
 
     Returns a handle only to the call that started something. Never raises.
@@ -142,7 +138,7 @@ def _profile_tags(tags: Mapping[str, str]) -> dict[str, str]:
     return labels
 
 
-def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
+def _start_profiles(name: str, settings: TelemetrySettings) -> ModuleType | None:
     """Configure pyroscope, imported only here so an install without it still works."""
     if not settings.profiles or not (settings.profile_cpu or settings.profile_memory):
         return None
@@ -151,7 +147,7 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
 
         started = pyroscope.configure(
             application_name=_service_name(name),
-            server_address=settings.profiles,
+            server_address=settings.profiles.get_secret_value(),
             cpu_enabled=settings.profile_cpu,
             mem_enabled=settings.profile_memory,
             tags=_profile_tags(settings.tags),
@@ -182,7 +178,7 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
 
 
 def _start_otel(
-    name: str, settings: Telemetry, profiles: ModuleType | None
+    name: str, settings: TelemetrySettings, profiles: ModuleType | None
 ) -> object | None:
     """Start OpenTelemetry when ``settings.otel``, imported only then. Never raises."""
     try:
@@ -210,13 +206,13 @@ def _start_otel(
     return _otel.start(name, settings, profiles)
 
 
-def _call_metrics(settings: Telemetry | None) -> Middleware | None:
-    """FastMCP's call metrics when ``settings.otel``, imported only then. Never raises.
+def _call_metrics(settings: TelemetrySettings | None) -> Middleware | None:
+    """FastMCP's call metrics when ``settings.otel``, imported only then.
 
-    A section with no ``otel`` is off here: the lifespan logs that section's error.
+    Never raises.
     """
     try:
-        if settings is None or not getattr(settings, "otel", False):
+        if settings is None or not settings.otel:
             return None
         from fastmcp.server.middleware.usage import UsageMiddleware
 

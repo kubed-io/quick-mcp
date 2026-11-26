@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import kubed.mcp._config
 from kubed.mcp import request
 from kubed.mcp._config import _compose
 
@@ -18,9 +19,19 @@ def forget_warnings():
 @pytest.fixture(autouse=True)
 def no_config_from_the_runner(monkeypatch):
     """A server built without ``environ=`` reads ``CONFIG_FILE`` and the built-in
-    items' env vars from the process, and a CI runner may have set any of them: each
-    test starts with none of them set."""
+    sections' env vars from the process (``TRANSPORT``, ``HOST``, ``PORT``,
+    ``LOG_LEVEL`` and the ``TELEMETRY_*`` and ``DELIVERY_*`` ones, which
+    ``_compose([]).items`` yields), and a CI runner may have set any of them: each test
+    starts with none of them set."""
     monkeypatch.delenv("CONFIG_FILE", raising=False)
     for item in _compose([]).items:
         if item.env is not None:
             monkeypatch.delenv(item.env, raising=False)
+
+
+@pytest.fixture
+def no_builtins(monkeypatch):
+    """No built-in sections, for tests of composition that name their own ``PORT`` or
+    ``telemetry`` key, or assert a composition's exact keys. A ``QuickMCP`` can't be
+    built under it: it reads the built-in sections by class."""
+    monkeypatch.setattr(kubed.mcp._config, "_builtin_sections", lambda: ())
