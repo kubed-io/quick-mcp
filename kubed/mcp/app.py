@@ -9,14 +9,16 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
+from pydantic import BaseModel
 from starlette.routing import WebSocketRoute
 
+from ._config import Config, _load
 from ._handshake import _Describe
 from .container import (
     _CALL,
@@ -150,20 +152,28 @@ class QuickMCP:
     ``header_prefix`` names the server's own headers: with ``"Kb"``, every ``X-MCP-*``
     input is also read as ``Kb-*``, which wins (DLV-16). An invalid ``header_prefix``
     raises ``ValueError``.
+
+    ``sections`` are the config classes the server takes, each stamped with ``@config``.
+    ``config`` gives their values in code: a mapping, a section instance, or an iterable
+    of them. The config loads first thing in ``__init__``, so a bad one stops
+    construction, and ``mcp.config`` is the loaded instance. Each section class resolves
+    by ``Inject[...]``, and ``Inject[Config]`` is the whole config.
     """
 
     def __init__(
         self,
         name: str,
         *,
-        config: object | None = None,
+        sections: Iterable[type[BaseModel]] = (),
+        config: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None = None,
         header_prefix: str | None = None,
         **fastmcp_options: Any,
     ):
+        loaded = _load([sections], config)
         header_prefix = _header_prefix(header_prefix)
         self._container = Container()
-        self._config = config
-        telemetry = getattr(config, "telemetry", None)
+        self._config = loaded.config
+        telemetry = getattr(self._config, "telemetry", None)
         lifespan = fastmcp_options.pop("lifespan", None)
         self.server = FastMCP(
             name,
@@ -179,8 +189,8 @@ class QuickMCP:
         # and handler shares one call's slot (APP-6). The metrics go in last, below.
         self.server.middleware.insert(0, _CallScope(self._container))
         SERVING[self.server] = self._container
-        if config is not None:
-            self._container.values[type(config)] = config
+        for key, value in loaded.provided.items():
+            self._container.provide(key, value)
         # FastMCP's own, unchanged.
         self.prompt = self.server.prompt
         self.add_middleware = self.server.add_middleware
@@ -194,7 +204,9 @@ class QuickMCP:
         self._plugins = Plugins(self.server)
         # The inputs resolve once per request, inside _CallScope and outside the pin, so
         # the build key's prefix is the one this request resolved.
-        self._resolver = _Resolver(header_prefix, getattr(config, "delivery", None))
+        self._resolver = _Resolver(
+            header_prefix, getattr(self._config, "delivery", None)
+        )
         _RESOLVERS[self.server] = self._resolver
         self.server.middleware.insert(1, _ResolveScope(self._resolver))
         # Inside the resolution, outside everything that reads plugins.
@@ -211,6 +223,11 @@ class QuickMCP:
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
         self.add_middleware(_Describe(lambda: self._instructions))
+
+    @property
+    def config(self) -> Config:
+        """The config loaded at construction: read-only, and never reloaded."""
+        return self._config
 
     @_signed_as(FastMCP.resource)
     def resource(self, uri: Any, *args: Any, **kwargs: Any) -> Any:
@@ -491,9 +508,14 @@ class QuickMCP:
         passed on: given one, FastMCP's run puts its own handlers back on its logger
         and stops it propagating, for the life of the process.
         """
-        settings: Any = serving if serving is not None else self._config
+        settings: Any = serving
         if settings is None:
-            raise TypeError("run() needs a Serving: pass one, or QuickMCP(config=...)")
+            settings = self._config
+            if not all(hasattr(settings, n) for n in ("transport", "host", "port")):
+                raise TypeError(
+                    "run() needs a Serving: pass one, or register a root section "
+                    "with transport, host and port"
+                )
         quiet_fastmcp_logging()
         if settings.transport == "stdio":
             self.server.run(transport="stdio", show_banner=False)

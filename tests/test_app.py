@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pytest
+from config_server import Duck
 from fastmcp import Client
 from fastmcp.server.transforms import Namespace
 from fastmcp.utilities.tests import asgi_server
@@ -490,12 +491,11 @@ async def test_override_replaces_what_a_key_resolves_to() -> None:
     assert "Grid" not in BUILT
 
 
-async def test_the_config_is_injectable_as_its_own_type() -> None:
-    settings = Settings(port=9000)
-    mcp = QuickMCP("configured", config=settings)
+async def test_the_root_section_is_injectable() -> None:
+    mcp = QuickMCP("configured", sections=[Duck], config={"port": 9000})
 
     @mcp.tool
-    def port(settings: Inject[Settings]) -> int:
+    def port(settings: Inject[Duck]) -> int:
         return settings.port
 
     async with Client(mcp.server) as client:
@@ -604,7 +604,7 @@ def test_run_reads_an_argparse_namespace(ran) -> None:
 
 
 def test_run_falls_back_to_the_config_and_passes_http_options(ran) -> None:
-    QuickMCP("configured", config=Settings()).run(path="/mcp")
+    QuickMCP("configured", sections=[Duck]).run(path="/mcp")
     assert ran[0]["port"] == 8000
     assert ran[0]["path"] == "/mcp"
 

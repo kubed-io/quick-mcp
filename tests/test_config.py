@@ -12,6 +12,8 @@ from types import MappingProxyType
 from typing import Annotated, Literal, NewType
 
 import pytest
+from config_server import Duck
+from fastmcp import Client
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -26,6 +28,7 @@ from pydantic import (
 from typing_extensions import TypeAliasType, TypedDict
 
 import kubed.mcp._config
+from kubed.mcp import Inject, QuickMCP
 from kubed.mcp._config import Config, Field, _compose, _load, config, config_schema
 
 pytestmark = pytest.mark.unit
@@ -894,3 +897,48 @@ def test_a_bad_section_raises_what_compose_raises() -> None:
 def test_the_schema_includes_the_built_ins(monkeypatch) -> None:
     monkeypatch.setattr(kubed.mcp._config, "_BUILTINS", (Base,))
     assert "base" in config_schema()["properties"]
+
+
+# -- a server's config
+
+
+def test_the_config_is_there_right_after_construction_and_frozen() -> None:
+    mcp = QuickMCP("t", sections=[Root, Recording], config={"name": "kb"})
+    assert mcp.config.name == "kb"
+    with pytest.raises(ValidationError):
+        mcp.config.name = "other"
+    with pytest.raises(AttributeError):
+        mcp.config = None  # no setter
+
+
+def test_a_server_with_no_sections_has_an_empty_config() -> None:
+    assert type(QuickMCP("t").config).model_fields == {}
+
+
+def test_a_bad_config_stops_construction() -> None:
+    with pytest.raises(ValueError, match=r"recording\.nope \(code\)"):
+        QuickMCP("t", sections=[Recording], config={"recording": {"nope": 1}})
+
+
+async def test_sections_and_the_config_are_injected_by_class() -> None:
+    mcp = QuickMCP("t", sections=[Root, Base, Sub])
+
+    @mcp.tool
+    def seen(
+        sub: Inject[Sub], base: Inject[Base], whole: Inject[Config], root: Inject[Root]
+    ) -> dict:
+        return {"sub": sub is base, "whole": whole is root is mcp.config, "b": base.b}
+
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("seen", {})).data == {
+            "sub": True,
+            "whole": True,
+            "b": 2,
+        }
+
+
+def test_the_composed_class_is_not_a_key() -> None:
+    # The composed class isn't a key: Duck and Config resolve, it doesn't.
+    mcp = QuickMCP("t", sections=[Duck])
+    assert mcp._container.knows(Duck) and mcp._container.knows(Config)
+    assert not mcp._container.knows(type(mcp.config))

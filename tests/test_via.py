@@ -7,6 +7,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from config_server import Duck
 from fastmcp import Client
 from gateway_server import over_http
 from plugin_server import ENTRY, copy
@@ -35,7 +36,10 @@ def config(resources=None, listed=None, via=None):
 def make(tmp_path, delivery=None, header_prefix=None) -> QuickMCP:
     """The demo plugin, beside a prompt, a resource and a catalogue of the server's own."""
     mcp = QuickMCP(
-        "t", config=SimpleNamespace(delivery=delivery), header_prefix=header_prefix
+        "t",
+        sections=[Duck],
+        config={"delivery": delivery},
+        header_prefix=header_prefix,
     )
     mcp.add_plugin(copy(tmp_path))
 
