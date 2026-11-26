@@ -7,6 +7,7 @@ something else configured first is kept, and only log records are given its trac
 provider something else set without a tracer provider is kept too: the stop shuts down
 only the providers ``initialize()`` set.
 With profiles on too, each root span tags the profile samples taken while it runs.
+Inside a span, a record's message ends with its trace and span ids.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from types import ModuleType
 from urllib.parse import quote
@@ -221,6 +222,81 @@ def _instrument_logging() -> bool:
     return instrumentor.is_instrumented_by_opentelemetry
 
 
+class _TracedRecord(logging.LogRecord):
+    """A record made inside a span: its message ends with ``_kubed_trace``."""
+
+    _kubed_trace: str
+
+    def getMessage(self) -> str:
+        message = super().getMessage()
+        # A QueueHandler bakes the formatted line into msg, ids and any traceback after
+        # them, and the copy asks again: the ids show once.
+        if self._kubed_trace in message:
+            return message
+        return message + self._kubed_trace
+
+
+class _TraceText:
+    """A record factory that puts the span's trace and span ids at the end of a message.
+
+    ``msg``, ``args`` and every handler and formatter stay as they were, so a handler
+    added later shows the ids too. The stop removes it before the logging instrumentor
+    does: that sets back the factory it found, which sits under this one, so removing
+    this one afterwards would bring the instrumentor's own back.
+    """
+
+    def __init__(self) -> None:
+        self._previous: Callable[..., logging.LogRecord] = logging.LogRecord
+        self._quiet = False
+        # Stored once, so "still ours" is an identity check.
+        self._factory = self._make
+
+    def install(self) -> None:
+        """Make records through this factory, on top of the one set now."""
+        self._previous = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(self._factory)
+
+    def remove(self) -> None:
+        """Put the previous factory back if this is still the one set. Never raises.
+
+        Else something set its own on top, and this one passes records through for good.
+        """
+        self._quiet = True
+        try:
+            if logging.getLogRecordFactory() is self._factory:
+                logging.setLogRecordFactory(self._previous)
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
+
+    def _make(self, *args: object, **kwargs: object) -> logging.LogRecord:
+        record = self._previous(*args, **kwargs)
+        try:
+            if self._quiet or type(record) is not logging.LogRecord:
+                return record
+            context = trace.get_current_span().get_span_context()
+            if context.is_valid:
+                record._kubed_trace = (
+                    f" trace_id={context.trace_id:032x} span_id={context.span_id:016x}"
+                )
+                record.__class__ = _TracedRecord
+        except Exception:  # noqa: BLE001  # a record is never lost to its ids
+            pass
+        return record
+
+
+def _trace_text() -> _TraceText | None:
+    """Install the factory that puts the ids in a line. Never raises."""
+    try:
+        text = _TraceText()
+        text.install()
+        return text
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error(
+            "OpenTelemetry did not put the trace in log lines: %s", type(error).__name__
+        )
+        return None
+
+
 def _shutdown(kind: str, provider: object) -> None:
     """Shut ``provider`` down, waiting at most ``_SHUTDOWN_SECONDS`` for it."""
     if kind == "meter":
@@ -352,14 +428,24 @@ class _Otel:
         owned: frozenset[str],
         logging_instrumented: bool,
         link: _ProfileLink | None = None,
+        text: _TraceText | None = None,
     ) -> None:
         self._owned = owned
         self._logging_instrumented = logging_instrumented
         self._link = link
+        self._text = text
 
     def stop(self) -> None:
-        """Close the link, uninstrument logging, stop our providers. Never raises."""
+        """Remove the ids, close the link, uninstrument logging, stop our providers.
+
+        Never raises. The ids go first: see ``_TraceText``.
+        """
         global _stopped
+        try:
+            if self._text is not None:
+                self._text.remove()
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
         try:
             if self._link is not None:
                 self._link.close()
@@ -418,7 +504,10 @@ def start(
                 )
                 instrumented = False
             return _Otel(
-                owned=frozenset(), logging_instrumented=instrumented, link=link
+                owned=frozenset(),
+                logging_instrumented=instrumented,
+                link=link,
+                text=_trace_text(),
             )
         instrumentor = LoggingInstrumentor()
         before = instrumentor.is_instrumented_by_opentelemetry
@@ -448,6 +537,7 @@ def start(
             logging_instrumented=instrumentor.is_instrumented_by_opentelemetry
             and not before,
             link=_link_profiles(trace.get_tracer_provider(), profiles),
+            text=_trace_text(),
         )
     except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
         log.error(

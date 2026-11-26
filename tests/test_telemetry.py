@@ -3,31 +3,45 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import http.client
+import http.server
 import importlib
 import inspect
+import io
 import json
 import logging
+import logging.handlers
 import os
+import queue
+import re
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 from fastmcp import Client, FastMCP
+from gateway_server import KIT_TREE, over_http
+from plugin_server import write
 from pydantic import BaseModel, ValidationError
 
 import kubed.mcp
 import kubed.mcp.telemetry
 from kubed.mcp import Component, Inject, QuickMCP, TelemetrySettings, config
 from kubed.mcp._builtins import _TelemetryComponent
+from kubed.mcp._otel import _TraceText
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
+from kubed.mcp.telemetry import _kind, _Probe, _start_signals
 
 ADDRESS = "http://pyroscope.example.com:4040"
 CHILD = Path(__file__).with_name("otel_child.py")
@@ -51,9 +65,12 @@ def _clean(monkeypatch) -> Iterator[None]:
         monkeypatch.delenv(name, raising=False)
     # _set_defaults writes os.environ directly, so the whole of it is put back.
     environ = dict(os.environ)
+    # A start whose stop the test never runs leaves its trace-text factory set.
+    factory = logging.getLogRecordFactory()
     _reset_otel()
     yield
     _reset_otel()
+    logging.setLogRecordFactory(factory)
     for name in [n for n in os.environ if n not in environ]:
         del os.environ[name]
     for name, value in environ.items():
@@ -234,6 +251,7 @@ async def test_profiles_start_before_the_lifespan_and_stop_before_the_container(
             "cpu_enabled": True,
             "mem_enabled": True,
             "tags": {},
+            "upload_interval": 10,
         }
     ]
     assert EVENTS[:2] == ["profiles started", "lifespan up"]
@@ -547,6 +565,7 @@ async def test_every_keyword_passed_is_one_configure_takes(request) -> None:
         "cpu_enabled",
         "mem_enabled",
         "tags",
+        "upload_interval",
     }
 
 
@@ -660,7 +679,11 @@ def test_the_real_configuration_exports_a_named_tagged_span() -> None:
     # TEL-15 on the initialize() path: the record carries the server span's trace.
     log_span = next(o for o in server if o["name"] == "tools/call log")
     trace_id = log_span["context"]["trace_id"].removeprefix("0x")
-    assert f"inside trace={trace_id}" in out.stderr
+    assert re.search(
+        rf"^inside trace_id={trace_id} span_id=[0-9a-f]{{16}} trace={trace_id}$",
+        out.stderr,
+        re.M,
+    )
     # The second server, otel on after the first stopped: served, and said why not.
     assert "second served pong" in out.stderr
     assert out.stderr.count("OpenTelemetry runs once per process") == 1
@@ -677,7 +700,10 @@ def test_otel_leaves_a_bare_root_logger_bare(mode) -> None:
         assert seen["handlers"] == []
         assert seen["level"] == logging.WARNING
     # So logging.lastResort still prints the tool's WARNING.
-    assert "inside" in out.stderr.splitlines()
+    assert any(
+        re.fullmatch(r"inside trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", line)
+        for line in out.stderr.splitlines()
+    )
     if mode == "bare-configured":
         # The child's own provider traced: initialize() never replaced it.
         server = [
@@ -1202,7 +1228,7 @@ async def test_log_records_carry_the_trace_and_root_keeps_its_handlers(
         for s in spans.get_finished_spans()
         if s.kind is SpanKind.SERVER and s.name == "tools/call log"
     ]
-    records = [r for r in keep.records if r.getMessage() == "inside"]
+    records = [r for r in keep.records if r.msg == "inside"]
     assert len(calls) == 1
     assert len(records) == 1
     assert records[0].otelTraceID == format(calls[0].context.trace_id, "032x")
@@ -1274,6 +1300,192 @@ async def test_logging_that_fails_to_instrument_still_keeps_the_trace(
     ]
     assert_safe(caplog.records, "s3cret")
     assert not LoggingInstrumentor().is_instrumented_by_opentelemetry
+
+
+# -- trace ids in the line (TEL-18) -------------------------------------------
+
+
+class Lines(logging.Handler):
+    """Keeps each record as its formatter writes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
+
+
+class as_json(logging.Formatter):
+    """A formatter that reads ``getMessage()``, as a JSON log formatter does."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({"level": record.levelname, "message": record.getMessage()})
+
+
+def iter_queue(source: queue.SimpleQueue) -> Iterator[logging.LogRecord]:
+    while True:
+        try:
+            yield source.get_nowait()
+        except queue.Empty:
+            return
+
+
+async def test_a_line_inside_a_span_ends_with_its_ids(traced, spans) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.trace import SpanKind
+
+    text, data, keep = Lines(), Lines(), Keep()
+    text.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    data.setFormatter(as_json())
+    mcp = served("ids", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def log() -> str:
+        logging.getLogger("tests.tool").warning("value %s", 5)
+        return "logged"
+
+    root = logging.getLogger()
+    for handler in (text, data, keep):
+        root.addHandler(handler)
+    try:
+        async with Client(mcp.server) as client:
+            await client.call_tool("log", {})
+            logging.getLogger("tests.tool").warning("outside")
+    finally:
+        for handler in (text, data, keep):
+            root.removeHandler(handler)
+        if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+            LoggingInstrumentor().uninstrument()
+    (record,) = [r for r in keep.records if r.msg == "value %s"]
+    ids = f" trace_id={record.otelTraceID} span_id={record.otelSpanID}"
+    assert re.fullmatch(r" trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", ids)
+    (call,) = [
+        s
+        for s in spans.get_finished_spans()
+        if s.kind is SpanKind.SERVER and s.name == "tools/call log"
+    ]
+    assert record.otelTraceID == format(call.context.trace_id, "032x")
+    assert f"WARNING value 5{ids}" in text.lines
+    assert "WARNING outside" in text.lines
+    messages = [json.loads(x) for x in data.lines]
+    assert {"level": "WARNING", "message": f"value 5{ids}"} in messages
+    assert {"level": "WARNING", "message": "outside"} in messages
+    assert (record.msg, record.args) == ("value %s", (5,))
+
+
+async def test_a_queue_handler_shows_the_ids_once(traced, spans) -> None:
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+
+    queued: queue.SimpleQueue = queue.SimpleQueue()
+    handler = logging.handlers.QueueHandler(queued)
+    mcp = served("queued", TelemetrySettings(otel=True))
+
+    @mcp.tool
+    def log() -> str:
+        logging.getLogger("tests.tool").warning("queued %s", 1)
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logging.getLogger("tests.tool").exception("failed %s", 2)
+        return "logged"
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        async with Client(mcp.server) as client:
+            await client.call_tool("log", {})
+    finally:
+        root.removeHandler(handler)
+        if LoggingInstrumentor().is_instrumented_by_opentelemetry:
+            LoggingInstrumentor().uninstrument()
+    recorded = list(iter_queue(queued))
+    records = [r for r in recorded if r.getMessage().startswith("queued 1")]
+    # As a QueueListener's handler does.
+    formatted = logging.Formatter("%(message)s").format(records[0])
+    assert formatted.count(" trace_id=") == 1
+    assert re.fullmatch(
+        r"queued 1 trace_id=[0-9a-f]{32} span_id=[0-9a-f]{16}", formatted
+    )
+    # The queued msg holds the ids, a newline and the traceback: still once.
+    (failed,) = [r for r in recorded if r.getMessage().startswith("failed 2")]
+    text = logging.Formatter("%(message)s").format(failed)
+    assert text.count(" trace_id=") == 1
+    assert "ValueError" in text
+
+
+def test_remove_puts_the_previous_factory_back(traced) -> None:
+    before = logging.getLogRecordFactory()
+    text = _TraceText()
+    text.install()
+    try:
+        assert logging.getLogRecordFactory() is not before
+    finally:
+        text.remove()
+    assert logging.getLogRecordFactory() is before
+
+
+def test_remove_after_another_factory_leaves_it_and_goes_quiet(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    text = _TraceText()
+    text.install()
+    ours = logging.getLogRecordFactory()
+    other = lambda *a, **kw: ours(*a, **kw)  # noqa: E731
+    logging.setLogRecordFactory(other)
+    try:
+        text.remove()
+        assert logging.getLogRecordFactory() is other
+        with provider.get_tracer("t").start_as_current_span("quiet"):
+            record = logging.getLogger("tests").makeRecord(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+        assert record.getMessage() == "m"
+    finally:
+        logging.setLogRecordFactory(before)
+
+
+class Special(logging.LogRecord):
+    """A record class some other library makes."""
+
+
+def test_a_record_of_another_class_is_left_alone(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(Special)
+    text = _TraceText()
+    text.install()
+    try:
+        with provider.get_tracer("t").start_as_current_span("special"):
+            record = logging.getLogger("tests").makeRecord(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+        assert type(record) is Special
+        assert record.getMessage() == "m"
+    finally:
+        text.remove()
+        logging.setLogRecordFactory(before)
+
+
+async def test_otel_off_installs_no_factory(traced) -> None:
+    provider, _ = traced
+    before = logging.getLogRecordFactory()
+    seen: list[object] = []
+    mcp = served("no-ids", TelemetrySettings())
+
+    @mcp.tool
+    def look() -> str:
+        seen.append(logging.getLogRecordFactory())
+        with provider.get_tracer("t").start_as_current_span("own"):
+            made = logging.getLogRecordFactory()(
+                "tests", logging.INFO, "f", 1, "m", (), None
+            )
+            seen.append(made.getMessage())
+        return "ok"
+
+    async with Client(mcp.server) as client:
+        await client.call_tool("look", {})
+    assert seen == [before, "m"]
 
 
 # Span profiles (TEL-14): with both signals on, each root span tags the profile samples
@@ -1693,7 +1905,9 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     from fastmcp.server.middleware import Middleware
     from fastmcp.server.middleware.usage import UsageMiddleware
 
+    from kubed.mcp._metrics import _CallMetrics, _ReadObserver
     from kubed.mcp.app import _CallScope
+    from kubed.mcp.gateway import _TakeThePrefix
 
     class Given(Middleware):
         pass
@@ -1711,9 +1925,11 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     kinds = _middleware(mcp)
     # The metrics, then the call's slot: every other layer, the plugin layer's
     # included, runs inside both, in the order it was given.
-    assert kinds[:2] == [UsageMiddleware, _CallScope]
-    assert kinds.count(UsageMiddleware) == 1
+    assert kinds[:2] == [_CallMetrics, _CallScope]
+    assert kinds.count(_CallMetrics) == 1
     assert kinds.index(Given) < kinds.index(Added)
+    # The read observer sees the plain URI, under the pin.
+    assert kinds[kinds.index(_TakeThePrefix) + 1] is _ReadObserver
 
 
 def test_otel_off_adds_no_call_metrics() -> None:
@@ -1724,22 +1940,22 @@ def test_otel_off_adds_no_call_metrics() -> None:
     mcp = QuickMCP("plain", config={"telemetry": TelemetrySettings()})
     kinds = _middleware(mcp)
     assert UsageMiddleware not in kinds
+    assert "_ReadObserver" not in [kind.__name__ for kind in kinds]
     assert kinds[0] is _CallScope
 
 
 async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serves(
     traced, monkeypatch, caplog
 ) -> None:
-    import fastmcp.server.middleware.usage as usage
-
+    import kubed.mcp._metrics as metrics
     from kubed.mcp.app import _CallScope
 
-    real = usage.UsageMiddleware
+    real = metrics._CallMetrics
 
     def broken(**kwargs):
         raise RuntimeError("https://user:s3cret@otlp.example.com")
 
-    monkeypatch.setattr(usage, "UsageMiddleware", broken)
+    monkeypatch.setattr(metrics, "_CallMetrics", broken)
     mcp = served("unbuilt", TelemetrySettings(otel=True))
     kinds = _middleware(mcp)
     assert real not in kinds
@@ -1754,6 +1970,321 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
         )
     ]
     assert_safe(caplog.records, "s3cret")
+
+
+# -- resource reads (TEL-21) --------------------------------------------------
+
+
+def reads(points: list) -> list[tuple[str | None, int]]:
+    """Each ``resources/read`` point's template label, with its count."""
+    return [
+        (p.attributes.get("mcp.resource.template"), p.count)
+        for p in points
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+
+
+def resourced(name: str) -> QuickMCP:
+    mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)})
+
+    @mcp.resource("data://items/{id}")
+    def item(id: str) -> str:
+        return id
+
+    @mcp.resource("data://about")
+    def about() -> str:
+        return "about"
+
+    return mcp
+
+
+async def test_reads_of_one_template_are_one_series(metered) -> None:
+    async with Client(resourced("templated").server) as client:
+        await client.read_resource("data://items/1")
+        await client.read_resource("data://items/2")
+    assert reads(duration_points(metered, "templated")) == [("data://items/{id}", 2)]
+
+
+async def test_a_static_read_is_labelled_by_its_uri(metered) -> None:
+    async with Client(resourced("static").server) as client:
+        await client.read_resource("data://about")
+    assert reads(duration_points(metered, "static")) == [("data://about", 1)]
+
+
+async def test_a_read_that_matches_nothing_has_only_the_error_label(metered) -> None:
+    from fastmcp.exceptions import MCPError
+
+    async with Client(resourced("missing").server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://nope")
+    (point,) = [
+        p
+        for p in duration_points(metered, "missing")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert "mcp.resource.template" not in point.attributes
+    # Resource not found is invalid params, which the conventions don't count as an error.
+    assert point.attributes["rpc.status_code"] == "-32602"
+    assert "error.type" not in point.attributes
+
+
+async def test_a_failed_template_read_is_labelled_by_its_template(metered) -> None:
+    from fastmcp.exceptions import MCPError, ResourceError
+
+    mcp = resourced("failed-read")
+
+    @mcp.resource("data://broken/{id}")
+    def broken(id: str) -> str:
+        raise ResourceError("no")
+
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://broken/1")
+    (point,) = [
+        p
+        for p in duration_points(metered, "failed-read")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert point.attributes["mcp.resource.template"] == "data://broken/{id}"
+    assert (point.attributes["rpc.status_code"], point.attributes["error.type"]) == (
+        "-32603",
+        "-32603",
+    )
+
+
+async def test_a_failed_static_read_has_no_template_label(metered) -> None:
+    from fastmcp.exceptions import MCPError, ResourceError
+
+    mcp = resourced("failed-static")
+
+    @mcp.resource("data://bad")
+    def bad() -> str:
+        raise ResourceError("no")
+
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("data://bad")
+    (point,) = [
+        p
+        for p in duration_points(metered, "failed-static")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert "mcp.resource.template" not in point.attributes
+    assert (point.attributes["rpc.status_code"], point.attributes["error.type"]) == (
+        "-32603",
+        "-32603",
+    )
+
+
+async def test_a_static_read_a_template_also_matches_is_labelled_by_it(
+    metered,
+) -> None:
+    mcp = resourced("shadowed")
+
+    @mcp.resource("data://items/fixed")
+    def fixed() -> str:
+        return "fixed"
+
+    async with Client(mcp.server) as client:
+        (content,) = await client.read_resource("data://items/fixed")
+    # The static resource answered, and the template labels it.
+    assert content.text == "fixed"
+    assert reads(duration_points(metered, "shadowed")) == [("data://items/{id}", 1)]
+
+
+async def test_a_plugin_skill_read_under_a_prefix_is_labelled_without_it(
+    metered, tmp_path
+) -> None:
+    mcp = QuickMCP(
+        "kit-reads",
+        header_prefix="Kb",
+        config={"telemetry": TelemetrySettings(otel=True)},
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
+        await client.read_resource("kb+skill://lib/guide/references/a.md")
+        await client.read_resource("kb+skill://lib/guide/references/a.md")
+    assert reads(duration_points(metered, "kit-reads")) == [
+        ("skill://lib/guide/references/a.md", 2)
+    ]
+
+
+@pytest.mark.parametrize("uri", ["prompts://lib/ask.md", "agents://lib/scout.md"])
+async def test_a_plugin_file_read_under_a_prefix_is_labelled_without_it(
+    metered, tmp_path, uri
+) -> None:
+    name = f"kit-files-{uri.partition(':')[0]}"
+    mcp = QuickMCP(
+        name, header_prefix="Kb", config={"telemetry": TelemetrySettings(otel=True)}
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
+        await client.read_resource(f"kb+{uri}")
+    assert reads(duration_points(metered, name)) == [(uri, 1)]
+
+
+async def test_a_read_through_the_tool_is_a_call_and_a_read(metered, tmp_path) -> None:
+    from kubed.mcp import DeliverySettings
+
+    mcp = QuickMCP(
+        "tool-reads",
+        config={
+            "telemetry": TelemetrySettings(otel=True),
+            "delivery": DeliverySettings(resources="off"),
+        },
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+
+    @mcp.resource("data://items/{id}")
+    def item(id: str) -> str:
+        return id
+
+    async with Client(mcp.server) as client:
+        assert "read_resource" in {tool.name for tool in await client.list_tools()}
+        await client.call_tool("read_resource", {"uri": "data://items/1"})
+    points = duration_points(metered, "tool-reads")
+    assert sorted(
+        (p.attributes["mcp.method.name"], p.attributes.get("gen_ai.tool.name"))
+        for p in points
+    ) == [("resources/read", None), ("tools/call", "read_resource")]
+    assert reads(points) == [("data://items/{id}", 1)]
+
+
+async def test_overlapping_reads_keep_their_own_templates(metered) -> None:
+    mcp = resourced("overlap")
+
+    @mcp.resource("data://slow/{id}")
+    async def slow(id: str) -> str:
+        await asyncio.sleep(0.05)
+        return id
+
+    async with Client(mcp.server) as client:
+        await asyncio.gather(
+            client.read_resource("data://slow/1"),
+            client.read_resource("data://items/1"),
+        )
+    assert sorted(reads(duration_points(metered, "overlap"))) == [
+        ("data://items/{id}", 1),
+        ("data://slow/{id}", 1),
+    ]
+
+
+async def test_tools_and_prompts_are_recorded_as_before(metered) -> None:
+    mcp = resourced("mixed")
+    mcp.tool(lambda: "pong", name="ping")
+    mcp.prompt(lambda: "hello", name="greet")
+    async with Client(mcp.server) as client:
+        await client.call_tool("ping", {})
+        await client.get_prompt("greet")
+        await client.read_resource("data://about")
+    points = duration_points(metered, "mixed")
+    kinds = sorted(p.attributes["mcp.method.name"] for p in points)
+    assert kinds == ["prompts/get", "resources/read", "tools/call"]
+    tool = next(p for p in points if p.attributes["mcp.method.name"] == "tools/call")
+    assert "mcp.resource.template" not in tool.attributes
+
+
+def test_usage_middleware_still_has_what_the_reads_use() -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    from kubed.mcp._metrics import _CallMetrics, _Labelled
+
+    assert callable(getattr(UsageMiddleware, "_record", None))
+    # The reads call it by these keywords: a rename or a positional one would raise.
+    inspect.signature(UsageMiddleware._record).bind(
+        None, None, None, method="", name_attribute="", name=""
+    )
+    assert isinstance(_CallMetrics(user_id="omit")._duration, _Labelled)
+
+
+class Recorded:
+    """A histogram that keeps the attributes of each point."""
+
+    def __init__(self) -> None:
+        self.points: list[object] = []
+
+    def record(self, amount: float, attributes: object = None) -> None:
+        self.points.append(attributes)
+
+
+def test_the_call_metrics_copy_and_still_label() -> None:
+    import copy
+
+    from opentelemetry.metrics import NoOpMeterProvider
+
+    from kubed.mcp._metrics import (
+        _MATCHED,
+        _TEMPLATE,
+        _CallMetrics,
+        _Labelled,
+        _Matched,
+    )
+
+    # An SDK histogram holds a lock, so a plain UsageMiddleware can't be deep-copied
+    # under one either: a no-op provider keeps this about the wrapper alone.
+    metrics = _CallMetrics(user_id="omit", meter_provider=NoOpMeterProvider())
+    assert isinstance(copy.copy(metrics._duration), _Labelled)
+    assert isinstance(copy.deepcopy(metrics)._duration, _Labelled)
+    labelled = _Labelled(Recorded())
+    for twin in (copy.copy(labelled), copy.deepcopy(labelled)):
+        token = _MATCHED.set(_Matched("data://items/{id}"))
+        try:
+            twin.record(1.0, {_TEMPLATE: ""})
+        finally:
+            _MATCHED.reset(token)
+        assert twin._histogram.points[-1] == {_TEMPLATE: "data://items/{id}"}
+
+
+def _without_record(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    monkeypatch.delattr(UsageMiddleware, "_record")
+
+
+def _without_duration(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    real = UsageMiddleware.__init__
+
+    def init(self, **options) -> None:
+        real(self, **options)
+        del self._duration
+
+    monkeypatch.setattr(UsageMiddleware, "__init__", init)
+
+
+def _with_another_record(monkeypatch) -> None:
+    from fastmcp.server.middleware.usage import UsageMiddleware
+
+    async def record(self, context, call_next, *, method, attribute, label):
+        return await call_next(context)
+
+    monkeypatch.setattr(UsageMiddleware, "_record", record)
+
+
+@pytest.mark.parametrize(
+    "change", [_without_record, _without_duration, _with_another_record]
+)
+async def test_a_changed_usage_middleware_is_one_warning_and_reads_pass_through(
+    change, monkeypatch, caplog
+) -> None:
+    from kubed.mcp._metrics import _CallMetrics, _Labelled
+
+    change(monkeypatch)
+    metrics = _CallMetrics(user_id="omit")
+    assert not isinstance(getattr(metrics, "_duration", None), _Labelled)
+
+    async def call_next(context: object) -> str:
+        return "read"
+
+    assert await metrics.on_read_resource(object(), call_next) == "read"
+    records = [r for r in caplog.records if r.name == "kubed.mcp._metrics"]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (
+            logging.WARNING,
+            "Resource reads are not in the call metrics: FastMCP's UsageMiddleware has changed",
+        )
+    ]
 
 
 # -- the start line -----------------------------------------------------------
@@ -1835,3 +2366,366 @@ async def test_profiles_that_fail_to_start_are_not_named(monkeypatch, caplog) ->
         ):
             pass
     assert start_lines(caplog) == ["telemetry: off"]
+
+
+# -- the probe (TEL-19) -------------------------------------------------------
+
+
+class _Stub(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    status = 200
+    delay = 0.0
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str | None]] = []
+        super().__init__(("127.0.0.1", 0), _StubHandler)
+
+    @property
+    def port(self) -> int:
+        return self.server_address[1]
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.server.seen.append((self.path, self.headers.get("Authorization")))
+        time.sleep(self.server.delay)
+        self.send_response(self.server.status)
+        if 300 <= self.server.status < 400:
+            self.send_header("Location", "/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args) -> None:
+        pass
+
+
+@pytest.fixture
+def stub() -> Iterator[_Stub]:
+    server = _Stub()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+@pytest.fixture
+def refused() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def no_proxies(monkeypatch, caplog) -> None:
+    """No proxy variable, so a probe of localhost goes direct; the probe's lines are kept."""
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+
+
+def probe_lines(caplog) -> list[tuple[int, str]]:
+    return [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.name == "kubed.mcp.telemetry" and "pyroscope at" in r.getMessage()
+    ]
+
+
+def probe_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "pyroscope-probe"]
+
+
+def test_a_pyroscope_down_at_boot_is_one_warning_in_the_first_interval(
+    refused, no_proxies, caplog
+) -> None:
+    probe = _Probe(f"http://127.0.0.1:{refused}", interval=0.05, timeout=1)
+    probe.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not probe_lines(caplog) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)  # several more intervals
+    finally:
+        probe.stop()
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at 127.0.0.1:{refused} unreachable: connection refused",
+        )
+    ]
+    assert probe_threads() == []
+
+
+def test_down_then_up_is_one_warning_then_one_info(stub, no_proxies, caplog) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", timeout=1)
+    stub.status = 503
+    probe.check()
+    probe.check()
+    stub.status = 200
+    probe.check()
+    probe.check()
+    host = f"127.0.0.1:{stub.port}"
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at {host} unreachable: server error (HTTP 503)",
+        ),
+        (logging.INFO, f"profiles: pyroscope at {host} reachable again"),
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refused_login_is_an_auth_warning(stub, no_proxies, caplog, status) -> None:
+    stub.status = status
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith(f"unreachable: auth (HTTP {status})")
+
+
+def test_a_404_is_reachable(stub, no_proxies, caplog) -> None:
+    stub.status = 404
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog) == []
+
+
+def test_a_redirect_is_reachable_and_not_followed(stub, no_proxies, caplog) -> None:
+    stub.status = 302
+    _Probe(f"http://u:s3cret@127.0.0.1:{stub.port}", timeout=1).check()
+    assert probe_lines(caplog) == []
+    assert [path for path, _ in stub.seen] == ["/ready"]
+
+
+def test_a_timeout_is_its_own_kind(stub, no_proxies, caplog) -> None:
+    stub.delay = 1
+    _Probe(f"http://127.0.0.1:{stub.port}", timeout=0.2).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: timeout")
+
+
+def test_the_probe_sends_basic_auth_and_shows_none_of_it(
+    stub, no_proxies, caplog
+) -> None:
+    stub.status = 401
+    address = f"http://us%40er:s3cret@127.0.0.1:{stub.port}/base/?token=t0ken"
+    _Probe(address, timeout=1).check()
+    sent = "Basic " + base64.b64encode(b"us@er:s3cret").decode()
+    assert stub.seen == [("/base/ready", sent)]
+    for secret in ("s3cret", "us@er", "us%40er", "t0ken", "base"):
+        assert_safe(caplog.records, secret)
+    assert probe_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"profiles: pyroscope at 127.0.0.1:{stub.port} unreachable: auth (HTTP 401)",
+        )
+    ]
+
+
+def test_a_probe_that_fails_oddly_never_raises(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("https://u:s3cret@x")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", boom)
+    _Probe("http://127.0.0.1:1", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: RuntimeError")
+    assert_safe(caplog.records, "s3cret")
+
+
+def test_stop_ends_the_thread_within_the_timeout(stub, no_proxies) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", interval=60, timeout=1)
+    probe.start()
+    started = time.monotonic()
+    probe.stop()
+    assert time.monotonic() - started < 1.5
+    assert probe_threads() == []
+
+
+@pytest.mark.probe
+def test_profiles_start_the_probe_on_the_push_interval_and_stop_ends_it(
+    pyroscope, stub, no_proxies
+) -> None:
+    signals = _start_signals(
+        "t", TelemetrySettings(profiles=f"http://127.0.0.1:{stub.port}")
+    )
+    try:
+        (thread,) = probe_threads()
+        assert thread.daemon
+        assert pyroscope[0]["upload_interval"] == 10
+    finally:
+        signals.stop()
+    assert not thread.is_alive()
+
+
+@pytest.mark.probe
+def test_profiles_off_start_no_probe(monkeypatch, refused) -> None:
+    assert _start_signals("t", TelemetrySettings()) is None
+    assert probe_threads() == []
+    monkeypatch.setitem(sys.modules, "pyroscope", None)  # not installed
+    assert (
+        _start_signals("t", TelemetrySettings(profiles=f"http://127.0.0.1:{refused}"))
+        is None
+    )
+    assert probe_threads() == []
+
+
+@pytest.mark.parametrize(
+    "address", ["http://tok?en@host:4040", "http://u:p@host/?e=a@b"]
+)
+def test_an_ambiguous_userinfo_is_never_probed(monkeypatch, caplog, address) -> None:
+    caplog.set_level(logging.INFO, logger="kubed.mcp.telemetry")
+    opened: list[object] = []
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **kw: opened.append(a)
+    )
+    _Probe(address, timeout=1).check()
+    assert opened == []
+    assert [m for _, m in probe_lines(caplog)] == [
+        "profiles: pyroscope at an address with no host unreachable: invalid address"
+    ]
+    for secret in ("tok", "en", "u:p", "a@b", "e=a"):
+        assert_safe(caplog.records, secret)
+
+
+class Body(io.BytesIO):
+    """An error's response body that can fail to close."""
+
+    fail = False
+
+    def close(self) -> None:
+        super().close()
+        if self.fail:
+            raise OSError("s3cret")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_an_http_error_s_response_is_closed(
+    monkeypatch, no_proxies, caplog, fail
+) -> None:
+    body = Body()
+    body.fail = fail
+    # Held here, so the error's own finaliser can't be what closes it.
+    raised: list[urllib.error.HTTPError] = []
+
+    def answer(*args, **kwargs):
+        raised.append(urllib.error.HTTPError("http://h/ready", 503, "no", {}, body))
+        raise raised[-1]
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", answer)
+    _Probe("http://127.0.0.1:1", timeout=1).check()
+    assert body.closed
+    assert probe_lines(caplog)[0][1].endswith("unreachable: server error (HTTP 503)")
+    assert_safe(caplog.records, "s3cret")
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["http://u:p@host:4040/t@evil.example", "http://u:p@host:4040\\t@evil.example"],
+)
+def test_a_userinfo_with_a_slash_is_never_probed(
+    monkeypatch, no_proxies, caplog, address
+) -> None:
+    # The agent ends an http host at the first / or \, so the credentials would go
+    # elsewhere.
+    opened: list[object] = []
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda *a, **kw: opened.append(a)
+    )
+    _Probe(address, timeout=1).check()
+    assert opened == []
+    ((_, line),) = probe_lines(caplog)
+    assert line.endswith("unreachable: invalid address")
+    assert_safe(caplog.records, "u:p")
+
+
+def test_an_empty_userinfo_sends_no_authorization(stub, no_proxies, caplog) -> None:
+    _Probe(f"http://@127.0.0.1:{stub.port}", timeout=1).check()
+    assert stub.seen == [("/ready", None)]
+    assert probe_lines(caplog) == []
+
+
+def test_an_unknown_scheme_is_an_invalid_address(no_proxies, caplog) -> None:
+    _Probe("htp://127.0.0.1:1", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: invalid address")
+
+
+def test_a_port_that_is_not_a_number_is_an_invalid_address(no_proxies, caplog) -> None:
+    _Probe("http://127.0.0.1:abc", timeout=1).check()
+    assert probe_lines(caplog)[0][1].endswith("unreachable: invalid address")
+
+
+def test_a_started_probe_is_stopped_when_the_start_then_fails(
+    monkeypatch, pyroscope
+) -> None:
+    stopped: list[str] = []
+
+    class Fake:
+        def stop(self) -> None:
+            stopped.append("probe")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("s3cret")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_probe", lambda address: Fake())
+    monkeypatch.setattr(kubed.mcp.telemetry, "_Signals", fail)
+    assert _start_signals("t", TelemetrySettings(profiles=ADDRESS)) is None
+    assert stopped == ["probe"]
+
+
+def test_the_probe_starts_after_otel(monkeypatch, pyroscope) -> None:
+    # So an OTLP log handler is attached before the probe's first warning.
+    started: list[str] = []
+
+    def otel(*args, **kwargs):
+        started.append("otel")
+
+    def probe(address):
+        started.append("probe")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_otel", otel)
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_probe", probe)
+    signals = _start_signals("t", TelemetrySettings(profiles=ADDRESS))
+    try:
+        assert started == ["otel", "probe"]
+    finally:
+        signals.stop()
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (ConnectionRefusedError(), "connection refused"),
+        (socket.gaierror(), "DNS"),
+        (ssl.SSLCertVerificationError(), "TLS"),
+        (TimeoutError(), "timeout"),
+        (OSError(), "connection error"),
+        (ValueError(), "invalid address"),
+        (http.client.InvalidURL(), "invalid address"),
+        (http.client.BadStatusLine(""), "connection error"),
+        (urllib.error.URLError(socket.gaierror()), "DNS"),
+        (urllib.error.URLError("unknown url type: htp"), "invalid address"),
+        (KeyError(), "KeyError"),
+    ],
+)
+def test_the_kind_of_a_failure(error, kind) -> None:
+    assert _kind(error) == kind
+
+
+def test_an_address_without_a_scheme_is_probed_over_http(
+    stub, no_proxies, caplog
+) -> None:
+    _Probe(f"127.0.0.1:{stub.port}", timeout=1).check()
+    assert [p for p, _ in stub.seen] == ["/ready"]
+    assert probe_lines(caplog) == []
+
+
+def test_fail_recover_fail_warns_twice(stub, no_proxies, caplog) -> None:
+    probe = _Probe(f"http://127.0.0.1:{stub.port}", timeout=1)
+    for status in (503, 200, 503):
+        stub.status = status
+        probe.check()
+    assert [level for level, _ in probe_lines(caplog)] == [
+        logging.WARNING,
+        logging.INFO,
+        logging.WARNING,
+    ]

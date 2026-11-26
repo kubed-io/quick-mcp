@@ -31,6 +31,18 @@ def no_config_from_the_runner(monkeypatch):
             monkeypatch.delenv(item.env, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_probe(request, monkeypatch):
+    """No Pyroscope probe, unless the test is marked ``probe``.
+
+    Autouse because the fake pyroscope's addresses are real hostnames, which a started
+    probe would look up and connect to.
+    """
+    if request.node.get_closest_marker("probe"):
+        return
+    monkeypatch.setattr("kubed.mcp.telemetry._start_probe", lambda address: None)
+
+
 @pytest.fixture
 def no_builtins(monkeypatch):
     """No built-in sections, for tests of composition that name their own ``PORT`` or

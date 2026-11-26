@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QuickMCP(hooks={"serving": fn})` builds a built-in's section from the server's own config, in place of its env vars, flags and file keys, and `config_schema(hooked=["serving"])` writes that server's schema.
 - Set `mcp.auth` after construction, until the server starts serving.
 - At start, telemetry logs one line naming the signals that started and where they go, or `telemetry: off`.
+- With `otel` on, a log line written inside a span ends with `trace_id=… span_id=…`, so Loki can link it to its trace.
+- An unreachable Pyroscope is logged once, and so is its recovery: the server checks it on the push interval.
+- Call metrics include `resources/read`, labelled by `mcp.resource.template`.
 
 ### Changed
 
