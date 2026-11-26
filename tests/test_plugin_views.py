@@ -17,6 +17,7 @@ from plugin_server import (
     ENTRY,
     agent_md,
     command_md,
+    listed,
     listed_by,
     served,
     skill,
@@ -316,22 +317,51 @@ async def test_a_new_view_is_not_served_an_old_build():  # Review Focus 2
         assert await client.list_prompts() == []
 
 
-async def test_a_swap_during_a_request_does_not_mix_sets():
+async def test_a_set_the_view_serves_is_what_its_request_reads(tmp_path):
     mcp = served((DEMO, None))
-    swapped = []
+    calls = []
 
-    def swap() -> View:
-        if not swapped:
-            swapped.append(1)
-            mcp.serve(mcp.plugin_set())  # mid-request
+    def revalidate() -> View:
+        calls.append(1)
+        if len(calls) == 1:  # the first request finds its plugin moved
+            staging = mcp.plugin_set()
+            staging.add(plugin(tmp_path, "two"), namespace="two")
+            mcp.serve(staging)
         return View(None, lambda plugin: True)
 
-    mcp.plugin_view(swap)
+    mcp.plugin_view(revalidate)
+
+    @mcp.tool
+    async def read_now(ctx: Context) -> str:
+        await ctx.read_resource("skill://two/two-guide/SKILL.md")  # the new set
+        pin = await mcp._plugins.pinned()
+        names = " ".join(p.namespace for p in pin.build.admitted)
+        return f"{pin.state.generation} {names}"
+
     async with Client(mcp.server) as client:
-        index = await client.read_resource("skill://t/demo-guide/_index.md")
-        assert "skill://t/demo-guide/SKILL.md" in index[0].text
-        with pytest.raises(MCPError):
-            await request(client, "resources/read", uri=ENTRY)
+        result = await client.call_tool("read_now", {})
+        assert result.data == f"{mcp.generation} two"  # one set, and the served one
+        with pytest.raises(MCPError):  # the old set is gone for good
+            await request(client, "resources/read", uri="skill://t/demo-guide/_index.md")
+    assert len(calls) == 2  # once per request, nested reads included
+
+
+async def test_a_serve_during_a_build_is_never_stored(monkeypatch):
+    mcp = served((DEMO, None))
+    plain, changed = type(mcp._plugins)._make, []
+
+    async def changing(self, state, view, key):
+        build = await plain(self, state, view, key)
+        if not changed:  # a new set is served after the build, before it is stored
+            changed.append(1)
+            mcp.serve(mcp.plugin_set())
+        return build
+
+    monkeypatch.setattr(type(mcp._plugins), "_make", changing)
+    begun = mcp._plugins._memo  # the memo the first build begins against
+    assert (await listed(mcp))[0] == ["greet"]  # its own request gets it
+    assert not begun.builds  # not stored, not even in the memo it began against
+    assert (await listed(mcp))[0] == []  # the next request reads the new set
 
 
 async def broken_make(self, state, view, key):

@@ -470,7 +470,8 @@ class QuickMCP:
         (``request_values()``). Its ``View`` says which plugins the request is served:
         one it does not admit is absent for that request. ``admits`` runs only when a
         build is made, once per generation and view key, so the key must decide what
-        it admits. A ``fn()`` that raises fails the request with its error.
+        it admits. A set ``fn()`` serves with ``serve()`` is the one that request
+        reads. A ``fn()`` that raises fails the request with its error.
         """
         self._plugins.set_view(fn)
         return fn
