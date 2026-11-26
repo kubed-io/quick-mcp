@@ -52,6 +52,8 @@ async def navigate(url: str, grid: Inject[Grid]) -> dict: ...
 mcp.run()  # TRANSPORT, HOST, PORT and LOG_LEVEL, or --transport, --host, --port and --log-level
 ```
 
+Profiles cost CPU: the [Telemetry Guide](https://github.com/kubed-io/quick-mcp/wiki/Telemetry-Guide) says how much, and how to lower it.
+
 ---
 
 ## 🤝 Contributing
