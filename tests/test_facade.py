@@ -92,15 +92,16 @@ SOURCES = {
 # Names this package defines rather than re-exports.
 OWN = {
     "kubed.mcp": {
+        "Component",
         "Config",
         "Delivery",
+        "DeliverySettings",
         "Field",
         "Inject",
         "NoDecode",
         "QuickMCP",
-        "Serving",
+        "ServingSettings",
         "Source",
-        "Telemetry",
         "TelemetrySettings",
         "config",
         "config_schema",
@@ -190,6 +191,7 @@ def _fresh(code: str) -> dict:
         "from kubed.mcp import telemetry",
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
         "from kubed.mcp import Config, Field, NoDecode, Source, config, config_schema",
+        "from kubed.mcp import Component, DeliverySettings, ServingSettings",
         "from kubed.mcp import Config, Field, config, config_schema\n"
         "@config('recording')\n"
         "class Recording(Config):\n"
@@ -199,7 +201,12 @@ def _fresh(code: str) -> dict:
 )
 def test_importing_kubed_mcp_imports_no_fastmcp(code: str) -> None:
     assert _fresh(code) == {
-        "loaded": ["kubed.mcp._config", "kubed.mcp.telemetry"],
+        "loaded": [
+            "kubed.mcp._builtins",
+            "kubed.mcp._config",
+            "kubed.mcp.components",
+            "kubed.mcp.telemetry",
+        ],
         "missing_from_dir": [],
     }
 
@@ -241,11 +248,16 @@ def test_a_submodule_still_imports_from_the_package() -> None:
 
 
 @pytest.mark.parametrize(
-    "module, extra",
-    [("kubed.mcp.telemetry", set()), ("kubed.mcp._config", {"yaml"})],
+    "module, extra, allowed",
+    [
+        ("kubed.mcp.telemetry", set(), {"_config"}),
+        ("kubed.mcp._config", {"yaml"}, set()),
+        ("kubed.mcp._builtins", set(), {"_config", "telemetry", "components"}),
+        ("kubed.mcp.components", set(), set()),
+    ],
 )
 def test_the_config_modules_import_only_pydantic_and_the_standard_library(
-    module: str, extra: set[str]
+    module: str, extra: set[str], allowed: set[str]
 ) -> None:
     spec = importlib.util.find_spec(module)
     assert spec is not None and spec.origin is not None
@@ -276,4 +288,4 @@ def test_the_config_modules_import_only_pydantic_and_the_standard_library(
 
     walk(tree.body)
     assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"} | extra
-    assert relative == []
+    assert set(relative) <= allowed

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Annotated, Any, Optional
 
+import pydantic.dataclasses
 import pytest
 from pydantic import (
     AliasChoices,
@@ -17,7 +19,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Json,
+    RootModel,
     Secret,
+    SecretBytes,
     SecretStr,
     create_model,
     field_serializer,
@@ -25,7 +29,6 @@ from pydantic import (
     model_validator,
 )
 
-from kubed.mcp import QuickMCP
 from kubed.mcp._config import (
     Config,
     Field,
@@ -37,7 +40,8 @@ from kubed.mcp._config import (
     config_schema,
 )
 
-pytestmark = pytest.mark.unit
+# Serve (PORT, --port) and Tel (the key telemetry) would clash with the built-ins.
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_builtins")]
 
 
 # -- items
@@ -882,31 +886,19 @@ def test_a_source_prints_as_it_appears_in_an_error() -> None:
 
 def test_the_boot_line_lists_only_what_is_not_default(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        load(
-            environ={"PORT": "9000", "RECORDING_TOKEN": "s3cret"},
-            argv=["--recording-inbox", "/in"],
-        )
-        load()
-    lines = [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"]
+        lines = [
+            load(
+                environ={"PORT": "9000", "RECORDING_TOKEN": "s3cret"},
+                argv=["--recording-inbox", "/in"],
+            ).boot_line,
+            load().boot_line,
+        ]
     assert lines == [
         'config: port=9000 (env PORT), recording.inbox="/in" (arg --recording-inbox), '
         "recording.token=*** (env RECORDING_TOKEN)",
         "config: all defaults",
     ]
-
-
-def test_the_boot_line_is_not_built_when_info_is_off(caplog, monkeypatch) -> None:
-    def refuse(*args: object) -> str:
-        raise AssertionError("the boot line was built")
-
-    monkeypatch.setattr("kubed.mcp._config._boot_line", refuse)
-    with caplog.at_level(logging.WARNING, logger="kubed.mcp.config"):
-        assert load(environ={"PORT": "9000"}).config.port == 9000
-
-
-def test_a_load_that_fails_logs_no_boot_line(caplog) -> None:
-    with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
-        load(environ={"PORT": "x"})
+    # The lifespan logs it, at each start: a load logs nothing.
     assert not [r for r in caplog.records if r.name == "kubed.mcp.config"]
 
 
@@ -916,13 +908,11 @@ class Loose(Config):
     blob: bytes = b""
 
 
-def test_a_value_json_cannot_write_is_named_by_its_type(caplog) -> None:
+def test_a_value_json_cannot_write_is_named_by_its_type() -> None:
     values = {"loose": {"thing": SimpleNamespace(t="s3cret"), "blob": b"\xffs3cret"}}
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        _load([[Loose]], values)
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    assert _load([[Loose]], values).boot_line == (
         'config: loose.thing="<SimpleNamespace>" (code), loose.blob="<bytes>" (code)'
-    ]
+    )
 
 
 class Login(BaseModel):
@@ -949,18 +939,16 @@ class Logins(Config):
     one: Login | None = Field(None)
 
 
-def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth(caplog) -> None:
+def test_the_boot_line_masks_a_leaf_that_holds_a_secret_at_any_depth() -> None:
     environ = {
         "LOGINS_CREDS": '[{"name": "a", "token": "S3CRET-LIST"}]',
         "LOGINS_DEEP": '{"x": {"creds": [{"name": "b", "token": "S3CRET-DEEP"}]}}',
     }
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        loaded = load(Logins, environ=environ).config
-    assert loaded.logins.creds[0].token.get_secret_value() == "S3CRET-LIST"
-    assert "S3CRET" not in caplog.text
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    loaded = load(Logins, environ=environ)
+    assert loaded.config.logins.creds[0].token.get_secret_value() == "S3CRET-LIST"
+    assert loaded.boot_line == (
         "config: logins.creds=*** (env LOGINS_CREDS), logins.deep=*** (env LOGINS_DEEP)"
-    ]
+    )
 
 
 needs_type_params = pytest.mark.skipif(
@@ -979,7 +967,7 @@ def _generic_aliases() -> tuple[Any, Any]:
 
 
 @needs_type_params
-def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret(caplog) -> None:
+def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret() -> None:
     many, pair = _generic_aliases()
 
     @config("aliased")
@@ -991,14 +979,12 @@ def test_the_boot_line_masks_a_generic_alias_that_holds_a_secret(caplog) -> None
         "ALIASED_CREDS": '[{"name": "a", "token": "S3CRET-MANY"}]',
         "ALIASED_NAMED": '{"x": {"name": "b", "token": "S3CRET-PAIR"}}',
     }
-    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
-        loaded = load(Aliased, environ=environ).config
-    assert loaded.aliased.named["x"].token.get_secret_value() == "S3CRET-PAIR"
-    assert "S3CRET" not in caplog.text
-    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+    loaded = load(Aliased, environ=environ)
+    assert loaded.config.aliased.named["x"].token.get_secret_value() == "S3CRET-PAIR"
+    assert loaded.boot_line == (
         "config: aliased.creds=*** (env ALIASED_CREDS), "
         "aliased.named=*** (env ALIASED_NAMED)"
-    ]
+    )
 
 
 @needs_type_params
@@ -1185,42 +1171,151 @@ def test_a_section_error_with_several_names_below_it_names_the_kind_only() -> No
         load(Pair, environ={"PAIR_A": "1", "PAIR_B": "2"})
 
 
-# -- a server's sources
-
-
-def test_a_server_reads_only_the_flags_and_env_it_is_given(monkeypatch) -> None:
-    monkeypatch.setenv("PORT", "1")
-    mcp = QuickMCP("t", sections=[Serve], argv=["--port", "2"], environ={})
-    assert mcp.config.port == 2
-    assert mcp.config_sources["port"] == Source("arg", "--port")
-    assert QuickMCP("t", sections=[Serve], environ={"PORT": "3"}).config.port == 3
-
-
-def test_a_server_built_without_environ_reads_the_process_env(monkeypatch) -> None:
-    monkeypatch.setenv("PORT", "4")
-    mcp = QuickMCP("t", sections=[Serve])
-    assert mcp.config_sources["port"] == Source("env", "PORT")
-
-
-def test_config_with_argv_or_environ_is_a_type_error_through_the_server() -> None:
-    with pytest.raises(TypeError, match="config= reads no flags or env vars"):
-        QuickMCP("t", sections=[Serve], config={"port": 1}, argv=["--port", "2"])
-
-
-def test_a_bad_flag_stops_construction_without_exiting() -> None:
-    with pytest.raises(ValueError, match=r"the arguments \(arg --nope\)"):
-        QuickMCP("t", sections=[Serve], argv=["--nope"], environ={})
-
-
-def test_config_sources_is_read_only() -> None:
-    mcp = QuickMCP("t", sections=[Serve], environ={})
-    with pytest.raises(AttributeError):
-        mcp.config_sources = {}
-    with pytest.raises(TypeError):
-        mcp.config_sources["port"] = Source("code")
+# -- the public names
 
 
 def test_the_public_names_are_the_modules_own() -> None:
     import kubed.mcp
 
     assert kubed.mcp.Source is Source and kubed.mcp.NoDecode is NoDecode
+
+
+# -- shapes
+
+
+@config("redis")
+class Redis(Config):
+    host: str = Field("", env="REDIS_HOST")
+
+
+class Deeper(Config):
+    x: int = 0
+
+
+class Inner(Config):
+    deep: Deeper = Deeper()
+
+
+@config("outer")
+class Outer(Config):
+    inner: Inner = Field(Inner(), env="OUTER")
+
+
+def test_a_scalar_where_a_section_belongs_is_its_layers_error(tmp_path) -> None:
+    f = tmp_path / "c.yaml"
+    f.write_text("redis: broken\n")
+    with pytest.raises(ValueError) as caught:
+        load(Redis, environ={"CONFIG_FILE": str(f), "REDIS_HOST": "x"})
+    message = str(caught.value)
+    assert f"  redis (file {f}): must be a mapping, not a str" in message
+    assert message.count("  redis") == 1
+
+
+def test_a_scalar_section_alone_is_reported_once() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Redis]], {"redis": 5})
+    assert (
+        str(caught.value)
+        == "the config did not load:\n  redis (code): must be a mapping, not a int"
+    )
+
+
+def test_a_scalar_for_a_model_inside_json_names_the_env_var() -> None:
+    with pytest.raises(ValueError) as caught:
+        load(Outer, environ={"OUTER": '{"deep": 5}'})
+    assert "  outer.inner.deep (env OUTER): must be a mapping, not a int" in str(
+        caught.value
+    )
+    assert str(caught.value).count("outer.inner.deep") == 1
+
+
+# -- boot line
+
+
+def test_the_boot_line_masks_a_revealing_serializer_held_by_any() -> None:
+    loaded = _load([[Loose]], {"loose": {"thing": Login(name="a", token="S3CRET")}})
+    assert loaded.boot_line == (
+        'config: loose.thing={"name":"a","token":"**********"} (code)'
+    )
+
+
+class Badge(BaseModel):
+    """A hashable model whose JSON shows its secret, as ``Login``'s does."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    token: SecretStr
+
+    @field_serializer("token", when_used="json")
+    def _reveal(self, token: SecretStr) -> str:
+        return token.get_secret_value()
+
+
+BADGE = Badge(token=SecretStr("s3cret"))
+
+
+@dataclasses.dataclass
+class PlainHeld:
+    badge: Badge
+
+
+@pydantic.dataclasses.dataclass
+class PydanticHeld:
+    token: SecretStr
+
+    @field_serializer("token", when_used="json")
+    def _reveal(self, token: SecretStr) -> str:
+        return token.get_secret_value()
+
+
+class Open(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ShownInt(Secret[int]):
+    """A ``Secret[int]`` that displays its value: pydantic writes it as shown."""
+
+    def _display(self) -> str:
+        return str(self.get_secret_value())
+
+
+def _cyclic() -> list[object]:
+    loop: list[object] = [BADGE]
+    loop.append(loop)
+    return loop
+
+
+MASKED = '{"token":"**********"}'
+
+
+@pytest.mark.parametrize(
+    "thing, shown",
+    [
+        (PlainHeld(BADGE), f'{{"badge":{MASKED}}}'),
+        (PydanticHeld(SecretStr("s3cret")), MASKED),
+        (Open(token=SecretStr("s3cret")), MASKED),
+        (RootModel[list[SecretStr]]([SecretStr("s3cret")]), '["**********"]'),
+        ((BADGE,), f"[{MASKED}]"),
+        ({BADGE}, f"[{MASKED}]"),
+        ({"k": BADGE}, f'{{"k":{MASKED}}}'),
+        (SecretBytes(b"s3cret"), '"**********"'),
+        (ShownInt(4321), '"**********"'),
+        (_cyclic(), '"<list>"'),
+    ],
+    ids=[
+        "dataclass",
+        "pydantic dataclass",
+        "extra allow",
+        "root model",
+        "tuple",
+        "set",
+        "dict",
+        "secret bytes",
+        "secret int",
+        "cyclic list",
+    ],
+)
+def test_the_boot_line_masks_every_secret_any_holds(thing, shown) -> None:
+    line = _load([[Loose]], {"loose": {"thing": thing}}).boot_line
+    assert line == f"config: loose.thing={shown} (code)"
+    assert "s3cret" not in line and "4321" not in line

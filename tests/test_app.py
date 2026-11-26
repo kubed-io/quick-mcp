@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import argparse
 import itertools
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
 import pytest
-from config_server import Duck
 from fastmcp import Client
 from fastmcp.server.transforms import Namespace
 from fastmcp.utilities.tests import asgi_server
@@ -19,7 +16,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocket
 
 import kubed.mcp.container
-from kubed.mcp import Context, Inject, QuickMCP, lookup
+from kubed.mcp import Context, Inject, QuickMCP, ServingSettings, lookup
 
 BUILT: dict[str, int] = {}
 EVENTS: list[str] = []
@@ -71,13 +68,6 @@ class Origins:
         self.id = _count("Origins")
         self.name = name
         self.grid = grid
-
-
-@dataclass
-class Settings:
-    transport: str = "http"
-    host: str = "0.0.0.0"
-    port: int = 8000
 
 
 def server(**options) -> QuickMCP:
@@ -491,11 +481,11 @@ async def test_override_replaces_what_a_key_resolves_to() -> None:
     assert "Grid" not in BUILT
 
 
-async def test_the_root_section_is_injectable() -> None:
-    mcp = QuickMCP("configured", sections=[Duck], config={"port": 9000})
+async def test_a_section_is_injectable_by_class() -> None:
+    mcp = QuickMCP("configured", config={"serving": {"port": 9000}})
 
     @mcp.tool
-    def port(settings: Inject[Duck]) -> int:
+    def port(settings: Inject[ServingSettings]) -> int:
         return settings.port
 
     async with Client(mcp.server) as client:
@@ -576,56 +566,17 @@ async def test_get_tool_is_the_tool_as_registered() -> None:
 # -- run() ---------------------------------------------------------------------
 
 
-@pytest.fixture
-def ran(monkeypatch) -> list[dict]:
-    calls: list[dict] = []
-    monkeypatch.setattr(
-        "fastmcp.FastMCP.run", lambda self, **kwargs: calls.append(kwargs)
-    )
-    return calls
-
-
-def test_run_reads_serving(ran) -> None:
-    QuickMCP("http").run(Settings(host="127.0.0.1", port=9001))
-    assert ran == [
-        {
-            "transport": "http",
-            "host": "127.0.0.1",
-            "port": 9001,
-            "show_banner": False,
-        }
-    ]
-
-
-def test_run_reads_an_argparse_namespace(ran) -> None:
-    args = argparse.Namespace(transport="stdio", host="0.0.0.0", port=8000, extra=1)
-    QuickMCP("stdio").run(args, path="/mcp")
-    assert ran == [{"transport": "stdio", "show_banner": False}]
-
-
-def test_run_falls_back_to_the_config_and_passes_http_options(ran) -> None:
-    QuickMCP("configured", sections=[Duck], environ={}).run(path="/mcp")
-    assert ran[0]["port"] == 8000
-    assert ran[0]["path"] == "/mcp"
-
-
-def test_run_needs_a_serving(ran) -> None:
-    with pytest.raises(TypeError, match="run\\(\\) needs a Serving"):
-        QuickMCP("bare").run()
-    assert ran == []
-
-
 def test_run_hands_fastmcps_logging_to_the_server(ran) -> None:
     fastmcp_logger = logging.getLogger("fastmcp")
     fastmcp_logger.addHandler(logging.NullHandler())
     fastmcp_logger.propagate = False
-    QuickMCP("logged").run(Settings())
+    QuickMCP("logged", config={"serving": {"transport": "http"}}).run()
     assert fastmcp_logger.handlers == []
     assert fastmcp_logger.propagate is True
 
 
 def test_serving_over_http_leaves_fastmcps_logging_with_the_server(
-    monkeypatch,
+    monkeypatch, root_logging
 ) -> None:
     """FastMCP's own run, not a stand-in: given a log level it would put its handlers
     back on its logger for the rest of the process. The config has one; run() never
@@ -638,12 +589,17 @@ def test_serving_over_http_leaves_fastmcps_logging_with_the_server(
 
     monkeypatch.setattr("uvicorn.Server.serve", serve)
     fastmcp_logger = logging.getLogger("fastmcp")
-    QuickMCP("served").run(
-        argparse.Namespace(
-            transport="http", host="127.0.0.1", port=0, log_level="DEBUG"
-        ),
-        uvicorn_config={"log_config": None},
-    )
+    QuickMCP(
+        "served",
+        config={
+            "serving": {
+                "transport": "http",
+                "host": "127.0.0.1",
+                "port": 0,
+                "log_level": "DEBUG",
+            }
+        },
+    ).run(uvicorn_config={"log_config": None})
     assert seen == [([], True)]
     assert fastmcp_logger.handlers == []
     assert fastmcp_logger.propagate is True

@@ -20,7 +20,7 @@ import sys
 
 from fastmcp import Client
 
-from kubed.mcp import Config, QuickMCP, TelemetrySettings, config
+from kubed.mcp import QuickMCP, TelemetrySettings
 
 # What telemetry off must never load.
 HEAVY = (
@@ -30,14 +30,6 @@ HEAVY = (
     "kubed.mcp._otel",
     "fastmcp.server.middleware.usage",
 )
-
-
-@config()
-class Child(Config):
-    transport: str = "http"
-    host: str = "0.0.0.0"
-    port: int = 8000
-    telemetry: TelemetrySettings | None = None
 
 
 def configure_logging() -> None:
@@ -65,7 +57,7 @@ def root_seen() -> None:
 
 def server(name: str, telemetry: object, *, bare: bool = False) -> QuickMCP:
     values = {} if telemetry is None else {"telemetry": telemetry}
-    mcp = QuickMCP(name, sections=[Child], config=values)
+    mcp = QuickMCP(name, config=values)
 
     @mcp.tool
     def ping() -> str:
@@ -134,9 +126,7 @@ async def prometheus() -> None:
 
     from opentelemetry import metrics
 
-    mcp = QuickMCP(
-        "prom", sections=[Child], config={"telemetry": TelemetrySettings(otel=True)}
-    )
+    mcp = QuickMCP("prom", config={"telemetry": TelemetrySettings(otel=True)})
 
     @mcp.tool
     def ping() -> str:

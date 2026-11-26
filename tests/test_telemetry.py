@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
+import asyncio
 import importlib
 import inspect
 import json
@@ -19,13 +19,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from config_server import Duck
 from fastmcp import Client, FastMCP
 from pydantic import BaseModel, ValidationError
 
 import kubed.mcp
 import kubed.mcp.telemetry
-from kubed.mcp import Inject, QuickMCP, TelemetrySettings
+from kubed.mcp import Component, Inject, QuickMCP, TelemetrySettings, config
+from kubed.mcp._builtins import _TelemetryComponent
 from kubed.mcp.app import _with_teardown
 from kubed.mcp.container import Container
 
@@ -112,7 +112,7 @@ async def make_monitor():
 
 
 def served(name: str, telemetry: object, **options) -> QuickMCP:
-    mcp = QuickMCP(name, sections=[Duck], config={"telemetry": telemetry}, **options)
+    mcp = QuickMCP(name, config={"telemetry": telemetry}, **options)
     mcp.singleton(Monitor, make_monitor)
 
     @mcp.tool
@@ -186,7 +186,10 @@ def test_settings_embed_as_a_configs_telemetry_section() -> None:
             }
         }
     )
-    assert config.telemetry.profiles == "http://pyroscope.example.com:4040"
+    assert (
+        config.telemetry.profiles.get_secret_value()
+        == "http://pyroscope.example.com:4040"
+    )
     assert config.telemetry.tags == {"team": "a"}
     assert Section().telemetry.tags is not Section().telemetry.tags
 
@@ -246,7 +249,11 @@ async def test_profiles_stop_when_the_lifespan_fails(pyroscope) -> None:
         yield
 
     run = _with_teardown(
-        Container(), lifespan, name="t", telemetry=TelemetrySettings(profiles=ADDRESS)
+        Container(),
+        lifespan,
+        parts=[(_TelemetryComponent("t"), TelemetrySettings(profiles=ADDRESS))],
+        boot_line="config: all defaults",
+        on_enter=lambda: None,
     )
     with pytest.raises(RuntimeError, match="boom"):
         async with run(FastMCP("t")):
@@ -254,10 +261,31 @@ async def test_profiles_stop_when_the_lifespan_fails(pyroscope) -> None:
     assert EVENTS == ["profiles started", "lifespan up", "profiles stopped"]
 
 
+class Slow(Component):
+    """Starts slowly, so a second lifespan entry arrives while the first starts."""
+
+    async def start(self, section) -> None:
+        await asyncio.sleep(0.05)
+
+
+async def test_two_entries_at_once_start_and_stop_the_profiles_once(pyroscope) -> None:
+    mcp = served("twice", TelemetrySettings(profiles=ADDRESS), components=[Slow()])
+
+    async def enter() -> None:
+        async with Client(mcp.server) as client:
+            await client.call_tool("ping", {})
+
+    await asyncio.gather(enter(), enter())
+    assert [e for e in EVENTS if e.startswith("profiles")] == [
+        "profiles started",
+        "profiles stopped",
+    ]
+    assert kubed.mcp.telemetry._running is None
+
+
 @pytest.mark.parametrize(
     "telemetry",
     [
-        None,
         TelemetrySettings(),
         TelemetrySettings(profiles=""),
         TelemetrySettings(profiles=ADDRESS, profile_cpu=False, profile_memory=False),
@@ -271,7 +299,7 @@ async def test_profiles_off_import_nothing(monkeypatch, telemetry) -> None:
 
 
 async def test_a_config_without_telemetry_imports_nothing(monkeypatch) -> None:
-    # A server with no telemetry section.
+    # A server given no telemetry values: the built-in section's defaults.
     monkeypatch.delitem(sys.modules, "pyroscope", raising=False)
     mcp = QuickMCP("plain")
     async with Client(mcp.server):
@@ -412,11 +440,14 @@ async def test_profiles_start_again_once_the_owner_has_stopped(pyroscope) -> Non
     ]
 
 
+@config("telemetry")
+class OwnTelemetry(TelemetrySettings):
+    sampler: str = "always"
+
+
 async def test_a_servers_own_section_satisfies_telemetry(pyroscope) -> None:
-    section = argparse.Namespace(
-        profiles=ADDRESS, profile_cpu=True, profile_memory=False, otel=False, tags={}
-    )
-    async with Client(served("own", section).server):
+    section = OwnTelemetry(profiles=ADDRESS, profile_memory=False)
+    async with Client(served("own", section, sections=[OwnTelemetry]).server):
         pass
     assert pyroscope[0]["mem_enabled"] is False
 
@@ -442,11 +473,16 @@ async def test_a_module_missing_inside_configure_is_a_failed_start_not_a_missing
     assert_safe(caplog.records, "s3cret")
 
 
-async def test_a_section_missing_an_attribute_is_a_logged_error_and_the_server_serves(
-    pyroscope, caplog
+async def test_a_start_that_raises_is_a_logged_error_and_the_server_serves(
+    pyroscope, monkeypatch, caplog
 ) -> None:
     secret = "https://user:s3cret@pyroscope.example.com"
-    mcp = served("partial", argparse.Namespace(profiles=secret))
+
+    def refuse(name, settings):
+        raise AttributeError(f"no profiles at {secret}")
+
+    monkeypatch.setattr(kubed.mcp.telemetry, "_start_profiles", refuse)
+    mcp = served("partial", TelemetrySettings(profiles=secret))
     async with Client(mcp.server) as client:
         assert (await client.call_tool("ping", {})).data == "pong"
     records = [r for r in caplog.records if r.name == "kubed.mcp.telemetry"]
@@ -1667,7 +1703,6 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
 
     mcp = QuickMCP(
         "ordered",
-        sections=[Duck],
         config={"telemetry": TelemetrySettings(otel=True)},
         middleware=[Given()],
     )
@@ -1681,15 +1716,12 @@ def test_call_metrics_are_outermost_with_otel_on() -> None:
     assert kinds.index(Given) < kinds.index(Added)
 
 
-@pytest.mark.parametrize(
-    "telemetry", [None, TelemetrySettings(), argparse.Namespace(profiles=None)]
-)
-def test_otel_off_adds_no_call_metrics(telemetry) -> None:
+def test_otel_off_adds_no_call_metrics() -> None:
     from fastmcp.server.middleware.usage import UsageMiddleware
 
     from kubed.mcp.app import _CallScope
 
-    mcp = QuickMCP("plain", sections=[Duck], config={"telemetry": telemetry})
+    mcp = QuickMCP("plain", config={"telemetry": TelemetrySettings()})
     kinds = _middleware(mcp)
     assert UsageMiddleware not in kinds
     assert kinds[0] is _CallScope
@@ -1722,3 +1754,84 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
         )
     ]
     assert_safe(caplog.records, "s3cret")
+
+
+# -- the start line -----------------------------------------------------------
+
+
+def start_lines(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "kubed.mcp.telemetry" and r.getMessage().startswith("telemetry: ")
+    ]
+
+
+async def test_the_start_line_says_off_with_nothing_on(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("off", TelemetrySettings()).server):
+            pass
+    assert start_lines(caplog) == ["telemetry: off"]
+
+
+async def test_the_start_line_names_profiles_and_the_host(pyroscope, caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("p", TelemetrySettings(profiles=ADDRESS)).server):
+            pass
+    assert start_lines(caplog) == ["telemetry: profiles → pyroscope.example.com:4040"]
+
+
+async def test_the_start_line_names_otels_exporters(
+    traced, pyroscope, monkeypatch, caplog
+) -> None:
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", " console ")
+    settings = TelemetrySettings(profiles=ADDRESS, otel=True)
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(served("o", settings).server):
+            pass
+    assert start_lines(caplog) == [
+        "telemetry: profiles → pyroscope.example.com:4040; "
+        "otel → traces console, metrics otlp, logs none"
+    ]
+
+
+@pytest.mark.parametrize(
+    "address, shown",
+    [
+        (
+            "https://user:s3cret@pyroscope.example:4040/push?token=s3cret",
+            "pyroscope.example:4040",
+        ),
+        ("user:s3cret@pyroscope:4040", "pyroscope:4040"),
+        ("http://[::1]:4040", "[::1]:4040"),
+        ("http://host:notaport", "host"),
+        ("http://", "an address with no host"),
+        ("s3cret", "an address with no host"),
+        ("user:s3cret", "an address with no host"),
+        ("a b c:1", "an address with no host"),
+        # A password with an unencoded "/": the host is what follows the last "@".
+        ("http://admin:4321/x@host:4040", "host:4040"),
+        ("admin:4321/x@pyroscope.example", "pyroscope.example"),
+        ("http://u:a@b@host:4040/push", "host:4040"),
+        # An "@" in the query: the text before it may be a password holding an
+        # unencoded "?", and the text after it is the query's.
+        ("http://host:4040/x?u=a@b", "an address with no host"),
+        ("http://u:s3cret?x@host:4040", "an address with no host"),
+        ("http://host:4040/x#u=s3cret@b", "an address with no host"),
+        # A Docker Compose service name.
+        ("pyro_scope:4040", "pyro_scope:4040"),
+        ("http://user:s3cret@pyro_scope:4040", "pyro_scope:4040"),
+    ],
+)
+def test_the_start_line_never_shows_a_credential(address, shown) -> None:
+    assert kubed.mcp.telemetry._where(address) == shown and "s3cret" not in shown
+
+
+async def test_profiles_that_fail_to_start_are_not_named(monkeypatch, caplog) -> None:
+    monkeypatch.setitem(sys.modules, "pyroscope", None)  # not installed
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.telemetry"):
+        async with Client(
+            served("missing", TelemetrySettings(profiles=ADDRESS)).server
+        ):
+            pass
+    assert start_lines(caplog) == ["telemetry: off"]

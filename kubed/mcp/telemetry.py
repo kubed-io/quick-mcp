@@ -6,71 +6,72 @@ imported until then. The ``telemetry`` extra installs what the signals use.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 from collections.abc import Mapping
 from types import ModuleType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import SecretStr
+
+from ._config import Config, Field, config
 
 if TYPE_CHECKING:
     from fastmcp.server.middleware import Middleware
 
 log = logging.getLogger(__name__)
 
-
-class Telemetry(Protocol):
-    """What a config's ``telemetry`` section provides.
-
-    ``TelemetrySettings`` satisfies it, and so does a server's own section.
-    """
-
-    @property
-    def profiles(self) -> str | None: ...
-    @property
-    def profile_cpu(self) -> bool: ...
-    @property
-    def profile_memory(self) -> bool: ...
-    @property
-    def otel(self) -> bool: ...
-    @property
-    def tags(self) -> dict[str, str]: ...
+_HOSTNAME = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?")
 
 
-class TelemetrySettings(BaseModel):
-    """A ``telemetry`` section a server's config can embed.
+@config("telemetry")
+class TelemetrySettings(Config):
+    """The ``telemetry`` section, registered in every server.
 
     ``profiles`` is the address of the Pyroscope server. Setting it turns profiles
     on; there is no separate enabled flag. ``profile_cpu`` and ``profile_memory``
     choose which profiles are sent. ``otel`` turns OpenTelemetry on, configured by
     the standard ``OTEL_*`` variables. ``tags`` are labels added to every profile
     and resource attributes on every trace and metric. An unknown key is an error,
-    so a typo stops the boot; a server's own section may subclass it to add keys.
+    so a typo stops the boot. A server's own subclass, marked ``@config("telemetry")``,
+    replaces it to add keys.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    profiles: str | None = Field(
-        default=None,
-        description="Pyroscope server address; setting it turns profiles on.",
+    profiles: SecretStr | None = Field(
+        None,
+        doc="Pyroscope server address; setting it turns profiles on.",
+        env="TELEMETRY_PROFILES",
+        arg="--telemetry-profiles",
     )
     profile_cpu: bool = Field(
-        default=True, description="Sample CPU while profiles are on."
+        True,
+        doc="Sample CPU while profiles are on.",
+        env="TELEMETRY_PROFILE_CPU",
+        arg="--telemetry-profile-cpu",
     )
     profile_memory: bool = Field(
-        default=True, description="Sample allocations while profiles are on."
+        True,
+        doc="Sample allocations while profiles are on.",
+        env="TELEMETRY_PROFILE_MEMORY",
+        arg="--telemetry-profile-memory",
     )
     otel: bool = Field(
-        default=False,
-        description="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+        False,
+        doc="Run OpenTelemetry, configured by the standard OTEL_* variables.",
+        env="TELEMETRY_OTEL",
+        arg="--telemetry-otel",
     )
     tags: dict[str, str] = Field(
         default_factory=dict,
-        description=(
+        doc=(
             "Labels on every profile, and resource attributes on every trace "
             "and metric."
         ),
+        env="TELEMETRY_TAGS",
+        arg="--telemetry-tags",
     )
 
 
@@ -105,7 +106,7 @@ class _Signals:
 _running: _Signals | None = None
 
 
-def _start_signals(name: str, settings: Telemetry | None) -> _Signals | None:
+def _start_signals(name: str, settings: TelemetrySettings | None) -> _Signals | None:
     """Start what ``settings`` turns on, unless a start already owns the process.
 
     Returns a handle only to the call that started something. Never raises.
@@ -142,7 +143,7 @@ def _profile_tags(tags: Mapping[str, str]) -> dict[str, str]:
     return labels
 
 
-def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
+def _start_profiles(name: str, settings: TelemetrySettings) -> ModuleType | None:
     """Configure pyroscope, imported only here so an install without it still works."""
     if not settings.profiles or not (settings.profile_cpu or settings.profile_memory):
         return None
@@ -151,7 +152,7 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
 
         started = pyroscope.configure(
             application_name=_service_name(name),
-            server_address=settings.profiles,
+            server_address=settings.profiles.get_secret_value(),
             cpu_enabled=settings.profile_cpu,
             mem_enabled=settings.profile_memory,
             tags=_profile_tags(settings.tags),
@@ -182,7 +183,7 @@ def _start_profiles(name: str, settings: Telemetry) -> ModuleType | None:
 
 
 def _start_otel(
-    name: str, settings: Telemetry, profiles: ModuleType | None
+    name: str, settings: TelemetrySettings, profiles: ModuleType | None
 ) -> object | None:
     """Start OpenTelemetry when ``settings.otel``, imported only then. Never raises."""
     try:
@@ -210,13 +211,13 @@ def _start_otel(
     return _otel.start(name, settings, profiles)
 
 
-def _call_metrics(settings: Telemetry | None) -> Middleware | None:
-    """FastMCP's call metrics when ``settings.otel``, imported only then. Never raises.
+def _call_metrics(settings: TelemetrySettings | None) -> Middleware | None:
+    """FastMCP's call metrics when ``settings.otel``, imported only then.
 
-    A section with no ``otel`` is off here: the lifespan logs that section's error.
+    Never raises.
     """
     try:
-        if settings is None or not getattr(settings, "otel", False):
+        if settings is None or not settings.otel:
             return None
         from fastmcp.server.middleware.usage import UsageMiddleware
 
@@ -227,3 +228,77 @@ def _call_metrics(settings: Telemetry | None) -> Middleware | None:
             type(error).__name__,
         )
         return None
+
+
+def _where(address: str) -> str:
+    """The host a Pyroscope address names, with its port: never userinfo, path or query.
+
+    An address without ``://`` is read as ``//<address>``. Userinfo ends at the last
+    ``@``, so a password with an unencoded ``/`` is never shown. An ``@`` after a ``?``
+    or ``#`` shows nothing: the text before it may be a password holding an unencoded
+    ``?``, and the text after it is the query's. A host is shown only when it is an IP
+    address or looks like a hostname (letters, digits, dots, hyphens and underscores,
+    starting and ending with a letter, digit or underscore) and the address gave a
+    scheme, a valid port, or a host with a dot. Otherwise a bare token, or ``user:pw``
+    with no ``@``, could print a credential, so it shows ``an address with no host``.
+    Never raises.
+    """
+    nothing = "an address with no host"
+    schemed = "://" in address
+    scheme, _, rest = address.partition("://") if schemed else ("", "", address)
+    if "@" in rest:
+        query = min((i for i in (rest.find("?"), rest.find("#")) if i >= 0), default=-1)
+        if query >= 0 and "@" in rest[query:]:
+            return nothing
+        rest = rest.rpartition("@")[2]
+    address = f"{scheme}://{rest}" if schemed else rest
+    try:
+        parts = urlsplit(address if schemed else f"//{address}")
+        host = parts.hostname
+    except ValueError:
+        return nothing
+    if not host:
+        return nothing
+    try:
+        port: int | None = parts.port
+        port_ok = True
+    except ValueError:
+        port, port_ok = None, False
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if not is_ip and not _HOSTNAME.fullmatch(host):
+        return nothing
+    if not (schemed or (port_ok and port is not None) or "." in host):
+        return nothing
+    shown = f"[{host}]" if ":" in host else host
+    return f"{shown}:{port}" if port is not None else shown
+
+
+def _start_line(signals: _Signals | None, settings: TelemetrySettings | None) -> str:
+    """The one line a start logs: which signals started and where they go.
+
+    Reads only the handle, the settings and ``os.environ``. Never shows a credential:
+    profiles are named by host and port alone.
+    """
+    parts: list[str] = []
+    if (
+        signals is not None
+        and signals._profiles is not None
+        and settings
+        and settings.profiles
+    ):
+        parts.append(f"profiles \u2192 {_where(settings.profiles.get_secret_value())}")
+    if signals is not None and signals._otel is not None:
+        exporters = ", ".join(
+            f"{kind} {(os.environ.get(variable) or '').strip() or default}"
+            for kind, variable, default in (
+                ("traces", "OTEL_TRACES_EXPORTER", "otlp"),
+                ("metrics", "OTEL_METRICS_EXPORTER", "otlp"),
+                ("logs", "OTEL_LOGS_EXPORTER", "none"),
+            )
+        )
+        parts.append(f"otel \u2192 {exporters}")
+    return "telemetry: " + ("; ".join(parts) if parts else "off")
