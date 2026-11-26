@@ -171,6 +171,31 @@ def _what(value: object) -> str:
     return f"an instance of {type(value).__qualname__}"
 
 
+def _refuse_serving_options(
+    serving: ServingSettings, http_options: Mapping[str, Any]
+) -> None:
+    """Refuse a serving setting passed to ``run()``: it is the config's to set.
+
+    Given one, FastMCP would serve stdio with it unread, or take it twice. The error
+    names the first such key and where it is set: the field's own env var and flag,
+    read from the loaded class, so a subclass's names are the ones shown.
+    """
+    for key in http_options:
+        if key == "show_banner":
+            raise TypeError("run() takes no 'show_banner': no banner is ever printed")
+        if key not in ("transport", "host", "port", "log_level"):
+            continue
+        extra = type(serving).model_fields[key].json_schema_extra
+        names = [
+            extra[k] for k in ("env", "arg") if isinstance(extra, dict) and k in extra
+        ]
+        raise TypeError(
+            f"run() takes no {key!r}: set serving.{key} in the config "
+            f"({', '.join([*names, 'a serving: file key'])}) or through "
+            "hooks={'serving': ...}"
+        )
+
+
 class QuickMCP:
     """A FastMCP server and a container, built by a factory and run by ``run()``.
 
@@ -611,9 +636,15 @@ class QuickMCP:
         and stops it propagating, for the life of the process.
 
         Serving starts here, so ``mcp.auth`` is fixed from this call on.
+
+        Raises:
+            TypeError: ``http_options`` holds a serving setting, ``transport``,
+                ``host``, ``port``, ``log_level`` or ``show_banner``: those are the
+                config's, and nothing runs.
         """
-        self._serving_starts()
         serving = cast(ServingSettings, self._provided[ServingSettings])
+        _refuse_serving_options(serving, http_options)
+        self._serving_starts()
         root = logging.getLogger()
         if not root.handlers:
             logging.basicConfig()

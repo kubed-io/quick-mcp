@@ -40,22 +40,16 @@ Import it as `kubed.mcp`:
 ```python
 import sys
 
-from kubed.mcp import Config, Inject, QuickMCP, config
+from kubed.mcp import Inject, QuickMCP
 
-@config()
-class Settings(Config):
-    transport: str = "http"
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-mcp = QuickMCP("grid", sections=[Settings], argv=sys.argv[1:])
+mcp = QuickMCP("grid", argv=sys.argv[1:])
 mcp.singleton(Grid)
 mcp.add_plugin("plugin/")  # its skills, commands and agents
 
 @mcp.tool
 async def navigate(url: str, grid: Inject[Grid]) -> dict: ...
 
-mcp.run()
+mcp.run()  # TRANSPORT, HOST, PORT and LOG_LEVEL, or --transport, --host, --port and --log-level
 ```
 
 ---

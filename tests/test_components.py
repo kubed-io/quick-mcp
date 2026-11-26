@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import logging
 import sys
 import types
@@ -34,6 +35,7 @@ from kubed.mcp import (
 )
 from kubed.mcp._config import _compose, _load
 from kubed.mcp.auth import TokenVerifier
+from kubed.mcp.components import _start_all, _stop_all
 from kubed.mcp.container import Container
 
 pytestmark = pytest.mark.unit
@@ -45,30 +47,6 @@ class Pod(ServingSettings):
         "http", env="TRANSPORT", arg="--transport"
     )
     host: str = Field("0.0.0.0", env="HOST", arg="--host")
-
-
-@pytest.fixture
-def ran(monkeypatch, root_logging) -> list[dict]:
-    """FastMCP's run, recorded. ``run()`` sets the root level, which is put back."""
-    calls: list[dict] = []
-    monkeypatch.setattr(
-        "fastmcp.FastMCP.run", lambda self, **kwargs: calls.append(kwargs)
-    )
-    return calls
-
-
-@pytest.fixture
-def root_logging(monkeypatch):
-    """The root logger's level and handlers, put back after the test.
-
-    The level goes back through ``setLevel``, which clears every logger's cache of what
-    it is enabled for.
-    """
-    root = logging.getLogger()
-    monkeypatch.setattr(root, "handlers", list(root.handlers))
-    level = root.level
-    yield root
-    root.setLevel(level)
 
 
 # -- built-ins
@@ -328,6 +306,55 @@ def test_run_takes_no_serving(ran) -> None:
     assert "Serving" not in kubed.mcp.__all__
 
 
+@pytest.mark.parametrize(
+    "key, hint",
+    [
+        ("transport", "set serving.transport in the config (TRANSPORT, --transport"),
+        ("host", "set serving.host in the config (HOST, --host"),
+        ("port", "set serving.port in the config (PORT, --port"),
+        ("log_level", "set serving.log_level in the config (LOG_LEVEL, --log-level"),
+        ("show_banner", "no banner is ever printed"),
+    ],
+)
+@pytest.mark.parametrize("environ", [{}, {"TRANSPORT": "http"}], ids=["stdio", "http"])
+def test_run_refuses_a_serving_setting_before_it_does_anything(
+    ran, root_logging, key, hint, environ
+) -> None:
+    mcp = QuickMCP("t", environ={**environ, "LOG_LEVEL": "DEBUG"})
+    level = root_logging.level
+    with pytest.raises(TypeError) as caught:
+        mcp.run(path="/mcp", **{key: "x"})
+    assert str(caught.value).startswith(f"run() takes no {key!r}: {hint}")
+    assert ran == [] and root_logging.level == level
+    mcp.auth = Refuse()  # serving has not started
+
+
+def test_the_hint_for_a_serving_setting_names_the_config_and_the_hook(ran) -> None:
+    with pytest.raises(TypeError) as caught:
+        QuickMCP("t", environ={}).run(port=8080)
+    assert str(caught.value) == (
+        "run() takes no 'port': set serving.port in the config (PORT, --port, a "
+        "serving: file key) or through hooks={'serving': ...}"
+    )
+
+
+@pytest.mark.parametrize("given", ["info", "Debug", "WARNING"])
+def test_the_log_level_is_read_case_insensitively(given) -> None:
+    @config("serving")
+    class Loud(ServingSettings):
+        log_level: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = Field(
+            "DEBUG", env="LOG_LEVEL", arg="--log-level"
+        )
+
+    for sections in ((), (Loud,)):
+        mcp = QuickMCP("t", sections=sections, environ={"LOG_LEVEL": given})
+        assert mcp.config.serving.log_level == given.upper()
+    with pytest.raises(ValueError, match=r"serving\.log_level"):
+        QuickMCP("t", environ={"LOG_LEVEL": "loud"})
+    schema = config_schema()["$defs"]["ServingSettings"]["properties"]["log_level"]
+    assert schema["enum"] == ["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
+
+
 def test_run_sets_the_root_level_and_adds_a_handler_only_when_there_is_none(
     ran, root_logging, monkeypatch
 ) -> None:
@@ -489,6 +516,55 @@ async def test_a_raising_start_stops_those_started_and_fails_the_boot(
     ]
     assert closed == [True]
     assert "s3cret" not in caplog.text
+
+
+class Cancels(Component):
+    """A component whose start or stop is cancelled, recording what ran."""
+
+    def __init__(
+        self, tag: str, events: list[str], *, on_start=False, on_stop=False
+    ) -> None:
+        self.tag, self.events = tag, events
+        self.on_start, self.on_stop = on_start, on_stop
+        self.cancelled = asyncio.CancelledError(tag)
+
+    async def start(self, section) -> None:
+        self.events.append(f"start {self.tag}")
+        if self.on_start:
+            raise self.cancelled
+
+    async def stop(self) -> None:
+        self.events.append(f"stop {self.tag}")
+        if self.on_stop:
+            raise self.cancelled
+
+
+async def test_a_cancelled_stop_is_raised_once_every_stop_has_run(caplog) -> None:
+    events: list[str] = []
+    a, b, c = (
+        Cancels("a", events, on_stop=True),
+        Recorder("b", fail_stop=True),
+        Cancels("c", events, on_stop=True),
+    )
+    EVENTS.clear()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _stop_all([a, b, c])
+    assert caught.value is c.cancelled  # the first raised, and only it
+    assert events == ["stop c", "stop a"] and EVENTS == ["stop b"]
+    assert "s3cret" not in caplog.text
+
+
+async def test_a_cancelled_start_stops_those_started_and_is_raised() -> None:
+    events: list[str] = []
+    a, b, c = (
+        Cancels("a", events),
+        Cancels("b", events, on_start=True),
+        Cancels("c", events),
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _start_all([(a, None), (b, None), (c, None)])
+    assert caught.value is b.cancelled
+    assert events == ["start a", "start b", "stop a"]
 
 
 def test_components_takes_component_instances() -> None:
@@ -659,6 +735,45 @@ def test_a_servers_port_and_a_hooked_serving_do_not_clash() -> None:
     )
     with pytest.raises(ValueError, match=r"PORT"):
         config_schema(Kb)
+
+
+def test_a_clash_with_a_built_in_says_to_hook_it() -> None:
+    hint = "; to keep your own, hook the built-in: hooks={'serving': ...}"
+    with pytest.raises(ValueError) as caught:
+        QuickMCP("kb", sections=[Kb], environ={})
+    assert str(caught.value) == (
+        f"The env var 'PORT' is declared by both port and serving.port{hint}"
+    )
+
+    @config("own")
+    class Own(Config):
+        port: int = Field(0, env="KB_PORT")
+
+    @config()
+    class Root(Config):
+        port: int = Field(0, env="KB_PORT")
+
+    with pytest.raises(ValueError) as caught:
+        QuickMCP("kb", sections=[Root, Own], environ={})
+    assert str(caught.value) == (
+        "The env var 'KB_PORT' is declared by both port and own.port"
+    )
+
+
+def test_a_hooked_sections_class_is_still_checked_for_dropped_names() -> None:
+    @config("serving")
+    class Bare(ServingSettings):
+        port: int = 9000
+
+    with pytest.raises(TypeError, match=r"serving\.port: redefines ServingSettings"):
+        QuickMCP(
+            "t",
+            sections=[Bare],
+            hooks={"serving": lambda c: Bare()},
+            environ={},
+        )
+    with pytest.raises(TypeError, match=r"serving\.port: redefines ServingSettings"):
+        config_schema(Bare, hooked=["serving"])
 
 
 def test_a_hook_returning_the_wrong_type_is_a_type_error() -> None:

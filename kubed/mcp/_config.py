@@ -655,9 +655,12 @@ def _check_names(
 ) -> None:
     """Refuse a malformed name, one of quick-mcp's own, or one declared twice.
 
-    The items under a hooked key are skipped: their names are never read.
+    The items under a hooked key are skipped: their names are never read. A name
+    declared twice where one side is under a built-in's key says to hook that
+    built-in, which takes its names out of the check.
     """
-    declared: dict[tuple[str, str], str] = {}
+    builtins = _builtin_keys()
+    declared: dict[tuple[str, str], _Item] = {}
     for item in items:
         if _is_hooked(item, hooked):
             continue
@@ -681,11 +684,20 @@ def _check_names(
                     f"{item.path}: the {_NAME_KIND[kind]} {name} is quick-mcp's own: "
                     "it reads it for the config file"
                 )
-            first = declared.setdefault((kind, name), item.path)
-            if first != item.path:
+            first = declared.setdefault((kind, name), item)
+            if first.path != item.path:
+                built_in = next(
+                    (i.loc[0] for i in (first, item) if i.loc[0] in builtins), None
+                )
+                hint = (
+                    ""
+                    if built_in is None
+                    else "; to keep your own, hook the built-in: "
+                    f"hooks={{{built_in!r}: ...}}"
+                )
                 raise ValueError(
-                    f"The {_NAME_KIND[kind]} {name!r} is declared by both {first} "
-                    f"and {item.path}"
+                    f"The {_NAME_KIND[kind]} {name!r} is declared by both {first.path} "
+                    f"and {item.path}{hint}"
                 )
 
 

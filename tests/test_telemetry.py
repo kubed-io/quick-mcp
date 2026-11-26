@@ -1809,6 +1809,18 @@ async def test_the_start_line_names_otels_exporters(
         ("s3cret", "an address with no host"),
         ("user:s3cret", "an address with no host"),
         ("a b c:1", "an address with no host"),
+        # A password with an unencoded "/": the host is what follows the last "@".
+        ("http://admin:4321/x@host:4040", "host:4040"),
+        ("admin:4321/x@pyroscope.example", "pyroscope.example"),
+        ("http://u:a@b@host:4040/push", "host:4040"),
+        # An "@" in the query: the text before it may be a password holding an
+        # unencoded "?", and the text after it is the query's.
+        ("http://host:4040/x?u=a@b", "an address with no host"),
+        ("http://u:s3cret?x@host:4040", "an address with no host"),
+        ("http://host:4040/x#u=s3cret@b", "an address with no host"),
+        # A Docker Compose service name.
+        ("pyro_scope:4040", "pyro_scope:4040"),
+        ("http://user:s3cret@pyro_scope:4040", "pyro_scope:4040"),
     ],
 )
 def test_the_start_line_never_shows_a_credential(address, shown) -> None:

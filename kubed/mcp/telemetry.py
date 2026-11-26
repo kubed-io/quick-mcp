@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
+_HOSTNAME = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?")
 
 
 @config("telemetry")
@@ -233,14 +233,25 @@ def _call_metrics(settings: TelemetrySettings | None) -> Middleware | None:
 def _where(address: str) -> str:
     """The host a Pyroscope address names, with its port: never userinfo, path or query.
 
-    An address without ``://`` is read as ``//<address>``. A host is shown only when
-    it is an IP address or looks like a hostname (letters, digits, dots and hyphens,
-    starting and ending with a letter or digit) and the address gave a scheme, a valid
-    port, or a host with a dot. Otherwise a bare token, or ``user:pw`` with no ``@``,
-    could print a credential, so it shows ``an address with no host``. Never raises.
+    An address without ``://`` is read as ``//<address>``. Userinfo ends at the last
+    ``@``, so a password with an unencoded ``/`` is never shown. An ``@`` after a ``?``
+    or ``#`` shows nothing: the text before it may be a password holding an unencoded
+    ``?``, and the text after it is the query's. A host is shown only when it is an IP
+    address or looks like a hostname (letters, digits, dots, hyphens and underscores,
+    starting and ending with a letter, digit or underscore) and the address gave a
+    scheme, a valid port, or a host with a dot. Otherwise a bare token, or ``user:pw``
+    with no ``@``, could print a credential, so it shows ``an address with no host``.
+    Never raises.
     """
     nothing = "an address with no host"
     schemed = "://" in address
+    scheme, _, rest = address.partition("://") if schemed else ("", "", address)
+    if "@" in rest:
+        query = min((i for i in (rest.find("?"), rest.find("#")) if i >= 0), default=-1)
+        if query >= 0 and "@" in rest[query:]:
+            return nothing
+        rest = rest.rpartition("@")[2]
+    address = f"{scheme}://{rest}" if schemed else rest
     try:
         parts = urlsplit(address if schemed else f"//{address}")
         host = parts.hostname

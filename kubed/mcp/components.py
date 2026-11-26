@@ -42,6 +42,11 @@ class Component:
       Every stop runs: one that raises an ``Exception`` is logged at error by its
       type, never raised. Anything else, a cancellation, is raised once every stop
       has run.
+
+    Entries may overlap: FastMCP marks its lifespan entered only once the server's has
+    been, so two entries racing at start-up each run every ``start`` before either
+    runs a ``stop``. A start may run again before the earlier entry's stop, so a
+    component keeps no single-slot state it can't share.
     """
 
     section: ClassVar[type[BaseModel] | None] = None

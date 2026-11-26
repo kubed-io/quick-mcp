@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from ._config import Config, Field, config
 from .components import Component
@@ -35,7 +35,8 @@ class ServingSettings(Config):
 
     A server changes a default by subclassing it, marked ``@config("serving")``, and
     restates ``Field(default, env=..., arg=...)`` on each field it changes: a field
-    redefined without its names is refused.
+    redefined without its names is refused. The log level is read case-insensitively,
+    in a subclass too.
     """
 
     transport: Literal["stdio", "http", "sse", "streamable-http"] = Field(
@@ -62,6 +63,12 @@ class ServingSettings(Config):
         env="LOG_LEVEL",
         arg="--log-level",
     )
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper(cls, value: object) -> object:
+        """``info`` reads as ``INFO``, as FastMCP's own settings read it."""
+        return value.upper() if isinstance(value, str) else value
 
 
 @config("delivery")

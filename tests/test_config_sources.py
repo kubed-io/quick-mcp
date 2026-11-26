@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Annotated, Any, Optional
 
+import pydantic.dataclasses
 import pytest
 from pydantic import (
     AliasChoices,
@@ -17,7 +19,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Json,
+    RootModel,
     Secret,
+    SecretBytes,
     SecretStr,
     create_model,
     field_serializer,
@@ -1233,3 +1237,85 @@ def test_the_boot_line_masks_a_revealing_serializer_held_by_any() -> None:
     assert loaded.boot_line == (
         'config: loose.thing={"name":"a","token":"**********"} (code)'
     )
+
+
+class Badge(BaseModel):
+    """A hashable model whose JSON shows its secret, as ``Login``'s does."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    token: SecretStr
+
+    @field_serializer("token", when_used="json")
+    def _reveal(self, token: SecretStr) -> str:
+        return token.get_secret_value()
+
+
+BADGE = Badge(token=SecretStr("s3cret"))
+
+
+@dataclasses.dataclass
+class PlainHeld:
+    badge: Badge
+
+
+@pydantic.dataclasses.dataclass
+class PydanticHeld:
+    token: SecretStr
+
+    @field_serializer("token", when_used="json")
+    def _reveal(self, token: SecretStr) -> str:
+        return token.get_secret_value()
+
+
+class Open(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ShownInt(Secret[int]):
+    """A ``Secret[int]`` that displays its value: pydantic writes it as shown."""
+
+    def _display(self) -> str:
+        return str(self.get_secret_value())
+
+
+def _cyclic() -> list[object]:
+    loop: list[object] = [BADGE]
+    loop.append(loop)
+    return loop
+
+
+MASKED = '{"token":"**********"}'
+
+
+@pytest.mark.parametrize(
+    "thing, shown",
+    [
+        (PlainHeld(BADGE), f'{{"badge":{MASKED}}}'),
+        (PydanticHeld(SecretStr("s3cret")), MASKED),
+        (Open(token=SecretStr("s3cret")), MASKED),
+        (RootModel[list[SecretStr]]([SecretStr("s3cret")]), '["**********"]'),
+        ((BADGE,), f"[{MASKED}]"),
+        ({BADGE}, f"[{MASKED}]"),
+        ({"k": BADGE}, f'{{"k":{MASKED}}}'),
+        (SecretBytes(b"s3cret"), '"**********"'),
+        (ShownInt(4321), '"**********"'),
+        (_cyclic(), '"<list>"'),
+    ],
+    ids=[
+        "dataclass",
+        "pydantic dataclass",
+        "extra allow",
+        "root model",
+        "tuple",
+        "set",
+        "dict",
+        "secret bytes",
+        "secret int",
+        "cyclic list",
+    ],
+)
+def test_the_boot_line_masks_every_secret_any_holds(thing, shown) -> None:
+    line = _load([[Loose]], {"loose": {"thing": thing}}).boot_line
+    assert line == f"config: loose.thing={shown} (code)"
+    assert "s3cret" not in line and "4321" not in line

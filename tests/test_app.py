@@ -566,30 +566,6 @@ async def test_get_tool_is_the_tool_as_registered() -> None:
 # -- run() ---------------------------------------------------------------------
 
 
-@pytest.fixture
-def ran(monkeypatch, root_logging) -> list[dict]:
-    """FastMCP's run, recorded. ``run()`` sets the root level, which is put back."""
-    calls: list[dict] = []
-    monkeypatch.setattr(
-        "fastmcp.FastMCP.run", lambda self, **kwargs: calls.append(kwargs)
-    )
-    return calls
-
-
-@pytest.fixture
-def root_logging(monkeypatch):
-    """The root logger's level and handlers, put back after the test.
-
-    The level goes back through ``setLevel``, which clears every logger's cache of what
-    it is enabled for.
-    """
-    root = logging.getLogger()
-    monkeypatch.setattr(root, "handlers", list(root.handlers))
-    level = root.level
-    yield root
-    root.setLevel(level)
-
-
 def test_run_hands_fastmcps_logging_to_the_server(ran) -> None:
     fastmcp_logger = logging.getLogger("fastmcp")
     fastmcp_logger.addHandler(logging.NullHandler())
