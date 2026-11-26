@@ -632,7 +632,9 @@ class _Skills(skills.EntryOnlySkillProvider):
         # Listed only as the request lists skills (DLV-8, SKL-8); reads are not.
         if "skills" not in _resolved().listed:
             return []
-        return await super()._list_resources()
+        # The rows are the build's, made once with it (PLUG-55); the gate above stays
+        # per request.
+        return list((await self._plugins.pinned()).build.entries)
 
     async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
         # skills/list asks this, and skills/get its own _get_skill_entry, so under
@@ -1000,7 +1002,9 @@ class _Build:
     """What one build key is served: the admitted plugins and what they serve.
 
     ``files`` is each prompt and agent file served, by its address, and ``folders``
-    each of their folders' children (PLUG-66, PLUG-68), rewritten or not.
+    each of their folders' children (PLUG-66, PLUG-68), rewritten or not. ``entries`` is
+    each skill's ``SKILL.md`` row, as ``resources/list`` shows it (SKL-8), made with the
+    build.
     """
 
     admitted: tuple[Plugin, ...]
@@ -1014,6 +1018,7 @@ class _Build:
     folders: Mapping[str, tuple[dict, ...]] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    entries: tuple[skills.SkillFileResource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1896,17 +1901,19 @@ class Plugins:
                 for s in admitted
                 for f in (*s.prompts, *s.agents)
             ]
+            plain = MappingProxyType(
+                {k: skill for s in admitted for k, skill in s.catalogue.items()}
+            )
             return _Build(
                 admitted=plugins,
-                catalogue=MappingProxyType(
-                    {k: skill for s in admitted for k, skill in s.catalogue.items()}
-                ),
+                catalogue=plain,
                 prompts=tuple(f.item for s in admitted for f in s.prompts),
                 agents=tuple(f.item for s in admitted for f in s.agents),
                 rewritten=False,
                 indexes=MappingProxyType({}),
                 files=MappingProxyType({m.file.uri: m for m in read}),
                 folders=MappingProxyType(_folder_rows(read)),
+                entries=self._rows(plain),
             )
         rewrite = _Rewrite(chain, view.key, plugins)
         catalogue: dict[str, skills.Skill] = {}
@@ -1963,7 +1970,18 @@ class Plugins:
             _renderers=tuple(renderers),
             files=MappingProxyType(files),
             folders=MappingProxyType(folders),
+            entries=self._rows(catalogue),
         )
+
+    def _rows(
+        self, catalogue: Mapping[str, skills.Skill]
+    ) -> tuple[skills.SkillFileResource, ...]:
+        """Each skill's ``SKILL.md`` row, made from the build's own catalogue, rewritten
+        or not, with the server's one skills provider. Without one there is no skill to
+        list."""
+        if self._skills is None:
+            return ()
+        return skills._entries(self._skills, skills._manifests(catalogue))
 
     def add(
         self,
