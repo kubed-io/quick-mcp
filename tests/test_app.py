@@ -604,7 +604,7 @@ def test_run_reads_an_argparse_namespace(ran) -> None:
 
 
 def test_run_falls_back_to_the_config_and_passes_http_options(ran) -> None:
-    QuickMCP("configured", sections=[Duck]).run(path="/mcp")
+    QuickMCP("configured", sections=[Duck], environ={}).run(path="/mcp")
     assert ran[0]["port"] == 8000
     assert ran[0]["path"] == "/mcp"
 

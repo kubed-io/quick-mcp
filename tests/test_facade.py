@@ -96,8 +96,10 @@ OWN = {
         "Delivery",
         "Field",
         "Inject",
+        "NoDecode",
         "QuickMCP",
         "Serving",
+        "Source",
         "Telemetry",
         "TelemetrySettings",
         "config",
@@ -187,7 +189,7 @@ def _fresh(code: str) -> dict:
         "import kubed.mcp.telemetry",
         "from kubed.mcp import telemetry",
         "from kubed.mcp import TelemetrySettings\nTelemetrySettings(otel=True, tags={'team': 'a'})",
-        "from kubed.mcp import Config, Field, config, config_schema",
+        "from kubed.mcp import Config, Field, NoDecode, Source, config, config_schema",
         "from kubed.mcp import Config, Field, config, config_schema\n"
         "@config('recording')\n"
         "class Recording(Config):\n"
@@ -238,9 +240,12 @@ def test_a_submodule_still_imports_from_the_package() -> None:
     assert protocol is importlib.import_module("kubed.mcp.protocol")
 
 
-@pytest.mark.parametrize("module", ["kubed.mcp.telemetry", "kubed.mcp._config"])
+@pytest.mark.parametrize(
+    "module, extra",
+    [("kubed.mcp.telemetry", set()), ("kubed.mcp._config", {"yaml"})],
+)
 def test_the_config_modules_import_only_pydantic_and_the_standard_library(
-    module: str,
+    module: str, extra: set[str]
 ) -> None:
     spec = importlib.util.find_spec(module)
     assert spec is not None and spec.origin is not None
@@ -270,5 +275,5 @@ def test_the_config_modules_import_only_pydantic_and_the_standard_library(
                 walk(node.orelse)
 
     walk(tree.body)
-    assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"}
+    assert tops <= set(sys.stdlib_module_names) | {"__future__", "pydantic"} | extra
     assert relative == []
