@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-26
+
 ### Fixed
 
 - A plugin set a view serves is what that same request reads, not the next one.
