@@ -134,6 +134,7 @@ def test_a_profile_config_without_an_address_is_refused() -> None:
         "app_name=x",
         "basic_auth_password=x",
         "http_headers={}",
+        "auth_token=x",
     ],
 )
 def test_an_option_configure_does_not_take_or_quickmcp_owns_is_refused(option) -> None:
@@ -148,6 +149,24 @@ def test_an_option_configure_does_not_take_or_quickmcp_owns_is_refused(option) -
     )
     assert out.returncode == 2 and option.split("=")[0] in out.stderr
     # The refusal names the key, never its value.
+    assert option not in out.stderr
+
+
+@pytest.mark.parametrize(
+    "option", ["basic_auth_password=x", "http_headers={}", "auth_token=x", "x_token=x"]
+)
+def test_an_option_named_like_a_credential_is_refused_as_one(option) -> None:
+    # Refused by part of its name, so a credential keyword pyroscope-io adds later is too.
+    out = run(
+        "measure",
+        "--configs",
+        "cpu",
+        "--option",
+        option,
+        *FAST,
+        env={"TELEMETRY_PROFILES": "http://127.0.0.1:1"},
+    )
+    assert out.returncode == 2 and "credential" in out.stderr
     assert option not in out.stderr
 
 

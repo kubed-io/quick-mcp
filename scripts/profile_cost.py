@@ -80,9 +80,10 @@ OWNED = frozenset(
     }
 )
 
-# The pyroscope.configure keywords that carry a credential: an option's value prints in
-# its row's name, and a credential belongs in the TELEMETRY_PROFILES address instead.
-SECRET = frozenset({"basic_auth_username", "basic_auth_password", "http_headers"})
+# The parts of a pyroscope.configure keyword that mark a credential: an option's value
+# prints in its row's name, and a credential belongs in the TELEMETRY_PROFILES address.
+# Matched by part, so basic_auth_*, http_headers, and any credential added later.
+SECRET = ("auth", "token", "password", "header")
 
 # What QuickMCP logs when profiles are on but did not start; it serves on without them.
 _NOT_PROFILED = (
@@ -338,7 +339,7 @@ def _refused(options: Mapping[str, object]) -> str | None:
     for key in options:
         if key in OWNED:
             return f"--option {key}: QuickMCP sets it"
-        if key in SECRET:
+        if any(part in key for part in SECRET):
             return (
                 f"--option {key}: it carries a credential, which belongs in the "
                 "TELEMETRY_PROFILES address and is never printed"
