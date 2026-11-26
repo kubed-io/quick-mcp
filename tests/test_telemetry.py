@@ -1972,6 +1972,111 @@ async def test_call_metrics_that_fail_to_build_are_one_error_and_the_server_serv
     assert_safe(caplog.records, "s3cret")
 
 
+# -- subscriptions/listen (TEL-22) --------------------------------------------
+
+
+def server_span_names(spans) -> list[str]:
+    from opentelemetry.trace import SpanKind
+
+    return [s.name for s in spans.get_finished_spans() if s.kind is SpanKind.SERVER]
+
+
+async def listened_and_called(mcp: QuickMCP) -> None:
+    async with Client(mcp.server) as client, client.listen(tools_list_changed=True):
+        await client.call_tool("ping", {})
+
+
+async def test_a_listen_stream_has_no_server_span_or_duration_point(
+    metered, spans
+) -> None:
+    await listened_and_called(served("listened", TelemetrySettings(otel=True)))
+    names = server_span_names(spans)
+    assert "subscriptions/listen" not in names
+    assert "tools/call ping" in names
+    methods = [
+        p.attributes.get("mcp.method.name")
+        for p in duration_points(metered, "listened")
+    ]
+    # The call metrics never time listen today; this pins it against one that would.
+    assert "subscriptions/listen" not in methods
+    assert "tools/call" in methods
+
+
+async def test_a_listen_stream_is_left_out_under_someone_elses_provider(
+    traced, spans
+) -> None:
+    await listened_and_called(served("listened-off", TelemetrySettings()))
+    names = server_span_names(spans)
+    assert "subscriptions/listen" not in names
+    assert "tools/call ping" in names
+
+
+async def test_the_listen_middleware_stands_ahead_of_fastmcps_seam() -> None:
+    from fastmcp.server.low_level import FastMCPServerMiddleware
+
+    from kubed.mcp._listen import _ListenUntraced
+
+    mcp = served("ordered", TelemetrySettings())
+    kinds = [type(m) for m in mcp.server._mcp_server.middleware]
+    assert kinds[:2] == [_ListenUntraced, FastMCPServerMiddleware]
+
+
+@pytest.mark.parametrize(
+    ("method", "request_id", "mode"),
+    [
+        ("subscriptions/listen", 1, "propagation_only"),
+        ("tools/call", 2, "native"),
+        ("subscriptions/listen", None, "native"),
+    ],
+)
+async def test_only_a_listen_request_is_traced_by_propagation_alone(
+    method, request_id, mode
+) -> None:
+    from fastmcp.telemetry import telemetry_mode
+
+    from kubed.mcp._listen import _ListenUntraced
+
+    seen = []
+
+    async def call_next(ctx):
+        seen.append(telemetry_mode())
+        return "result"
+
+    ctx = types.SimpleNamespace(method=method, request_id=request_id)
+    assert await _ListenUntraced()(ctx, call_next) == "result"
+    assert seen == [mode]
+
+
+async def test_a_changed_fastmcp_server_warns_once_and_still_serves(caplog) -> None:
+    from fastmcp.server.low_level import FastMCPServerMiddleware
+
+    from kubed.mcp._listen import _leave_listen_untraced
+
+    mcp = served("changed", TelemetrySettings())
+    middleware = mcp.server._mcp_server.middleware
+    middleware[:] = [
+        m for m in middleware if not isinstance(m, FastMCPServerMiddleware)
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp._listen"):
+        _leave_listen_untraced(mcp.server)
+    warnings = [r for r in caplog.records if r.name == "kubed.mcp._listen"]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert "no FastMCPServerMiddleware" in warnings[0].getMessage()
+    async with Client(mcp.server) as client:
+        assert (await client.call_tool("ping", {})).data == "pong"
+
+
+def test_a_server_without_a_low_level_server_warns_once(caplog) -> None:
+    from kubed.mcp._listen import _leave_listen_untraced
+
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp._listen"):
+        _leave_listen_untraced(types.SimpleNamespace())
+    warnings = [r for r in caplog.records if r.name == "kubed.mcp._listen"]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert "AttributeError" in warnings[0].getMessage()
+
+
 # -- resource reads (TEL-21) --------------------------------------------------
 
 
@@ -2322,8 +2427,71 @@ async def test_the_start_line_names_otels_exporters(
             pass
     assert start_lines(caplog) == [
         "telemetry: profiles → pyroscope.example.com:4040; "
-        "otel → traces console, metrics otlp, logs none"
+        "otel → traces console, metrics otlp (default), logs none"
     ]
+
+
+def otel_line() -> str:
+    signals = kubed.mcp.telemetry._Signals(None, otel=object())
+    return kubed.mcp.telemetry._start_line(signals, None)
+
+
+def test_the_start_line_shows_default_with_no_endpoint() -> None:
+    assert otel_line() == "telemetry: otel → traces otlp (default), metrics otlp (default), logs none"
+
+
+def test_the_start_line_names_the_shared_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.example:4318")
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (collector.example:4318), "
+        "metrics otlp (collector.example:4318), logs none"
+    )
+
+
+def test_a_per_signal_endpoint_beats_the_shared_one(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://shared.example:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://traces.example:443/v1/traces")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "")  # empty counts as unset
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (traces.example:443), "
+        "metrics otlp (shared.example:4318), logs none"
+    )
+
+
+def test_an_endpoint_never_shows_its_credentials(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "https://user:s3cret@collector.example:4318/v1/traces?x=s3cret",
+    )
+    line = otel_line()
+    assert line.startswith("telemetry: otel → traces otlp (collector.example:4318), metrics otlp (default)")
+    assert "s3cret" not in line and "user" not in line and "/v1" not in line
+
+
+def test_logs_over_otlp_show_their_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://logs.example:4318")
+    assert otel_line().endswith(", logs none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "otlp")
+    assert otel_line().endswith(", logs otlp (logs.example:4318)")
+
+
+def test_only_the_otlp_entries_of_a_list_show_an_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", " otlp_proto_grpc , console ")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "prometheus")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
+    assert otel_line() == (
+        "telemetry: otel → traces otlp_proto_grpc (collector:4317),console, "
+        "metrics prometheus, logs none"
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["s3cret", "   ", "http://"])
+def test_an_endpoint_with_no_host_says_so(monkeypatch, endpoint) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+    assert otel_line() == (
+        "telemetry: otel → traces otlp (an address with no host), "
+        "metrics otlp (an address with no host), logs none"
+    )
 
 
 @pytest.mark.parametrize(

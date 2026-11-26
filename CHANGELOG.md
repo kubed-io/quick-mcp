@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-26
+
+### Added
+
+- Load a server's config before building it with `load_config()`, and build the server from that load with `QuickMCP(loaded=...)`.
+
+## [0.4.4] - 2026-11-26
+
+### Changed
+
+- The telemetry start line shows where each OTLP exporter sends, as host and port.
+
+## [0.4.3] - 2026-11-26
+
+### Fixed
+
+- A `subscriptions/listen` stream no longer shows as a server span lasting as long as the stream.
+
 ## [0.4.2] - 2026-11-26
 
 ### Fixed

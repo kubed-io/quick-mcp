@@ -2,8 +2,9 @@
 
 A component names the config section it takes, registers with the server at the end of
 construction, starts when serving starts and stops when it ends. A server passes its
-components to ``QuickMCP(components=...)``. Serving, telemetry and delivery are
-components too, built into every server and started before the server's own.
+components to ``QuickMCP(components=...)`` or ``load_config(components=...)``.
+Serving, telemetry and delivery are components too, built into every server and
+started before the server's own.
 
 This module imports no FastMCP, so a component can be declared, and its section's
 schema written, without loading it.
@@ -12,7 +13,7 @@ schema written, without loading it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel
@@ -59,6 +60,28 @@ class Component:
 
     async def stop(self) -> None:
         """Stops what ``start`` began."""
+
+
+def _components(components: Iterable[Component]) -> tuple[Component, ...]:
+    """``components=`` as a tuple, each one checked to be a ``Component`` instance."""
+    if isinstance(components, (Component, type)) or not isinstance(
+        components, Iterable
+    ):
+        raise TypeError(
+            "components= takes Component instances in a sequence, got "
+            + _what(components)
+        )
+    checked = tuple(components)
+    for each in checked:
+        if not isinstance(each, Component):
+            raise TypeError(f"components= takes Component instances, got {_what(each)}")
+    return checked
+
+
+def _what(value: object) -> str:
+    if isinstance(value, type):
+        return f"the class {value.__qualname__}"
+    return f"an instance of {type(value).__qualname__}"
 
 
 async def _start_all(
