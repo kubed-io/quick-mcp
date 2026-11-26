@@ -11,6 +11,7 @@ import argparse
 import dataclasses
 import json
 import keyword
+import logging
 import os
 import re
 import types
@@ -31,6 +32,7 @@ from pydantic import (
     Secret,
     SecretBytes,
     SecretStr,
+    TypeAdapter,
     ValidationError,
     create_model,
 )
@@ -741,18 +743,47 @@ def _spread(
     return data
 
 
-def _path(loc: tuple[int | str, ...]) -> str:
-    """Join a pydantic ``loc``: names with ``.``, indexes as ``[i]``."""
+def _path(loc: tuple[int | str, ...], model: type[BaseModel]) -> str:
+    """Join a pydantic ``loc``: names with ``.``, indexes as ``[i]``, up to a secret.
+
+    The walk keeps a set of model classes that only grows, starting with ``model``. A
+    ``str`` part that is the key of a field of any class in the set is written. If that
+    field is sensitive the path ends after it, so no dict key or index below a secret
+    prints, at any depth. Otherwise the model classes the field's annotation reaches,
+    through ``Optional``, ``Annotated``, unions, lists, tuples, sets and dict values,
+    join the set. Any other part, an index, a dict key or a union tag, is written and
+    leaves the set as it is. A dict key that is also a field's name is taken for the
+    field, and the set never shrinks, so a path may stop early but never late.
+    """
     if not loc:
         return "the root section"
     path = ""
+    at: tuple[type[BaseModel], ...] = (model,)
     for part in loc:
         if isinstance(part, int):
             path += f"[{part}]"
-        elif part.startswith("["):  # pydantic's "[key]", for a bad dict key
+            continue
+        if part.startswith("["):  # pydantic's "[key]", for a bad dict key
             path += part
         else:
             path += f".{part}" if path else part
+        fields = [
+            (cls, name)
+            for cls in at
+            for name, info in cls.model_fields.items()
+            if _key(name, info) == part
+        ]
+        if not fields:
+            continue
+        if any(name in _sensitive_fields(cls) for cls, name in fields):
+            break
+        reached = (
+            inner
+            for cls, name in fields
+            for inner in _models_in(cls.model_fields[name].annotation)
+            if issubclass(inner, BaseModel)
+        )
+        at = tuple(dict.fromkeys((*at, *reached)))
     return path
 
 
@@ -1108,6 +1139,51 @@ def _given(
     raise _bad_values(f"an instance of {type(values).__qualname__}")
 
 
+_LOG = logging.getLogger("kubed.mcp.config")
+_ANY = TypeAdapter(Any)
+
+
+def _type_name(value: object) -> str:
+    return f"<{type(value).__qualname__}>"
+
+
+def _json(value: object) -> str:
+    """A loaded value as JSON for the boot line, or its type's name where it has none.
+
+    A field typed ``Any`` may hold an object pydantic can't write, and a load that
+    validated must not fail on its log line, so such a value is named by its type and
+    never shown.
+    """
+    try:
+        return _ANY.dump_json(value, fallback=_type_name).decode()
+    except ValueError:  # pydantic's serialization error, such as bytes not UTF-8
+        return json.dumps(_type_name(value))
+
+
+def _boot_line(
+    leaves: Iterable[_Item], loaded: Config, sources: Mapping[str, Source]
+) -> str:
+    """The one line a load logs: each leaf not at its default, its value and source.
+
+    A sensitive item's value is ``***``. Every other value is the loaded one, as JSON,
+    which pydantic's secret types mask wherever they sit inside it.
+    """
+    shown: list[str] = []
+    for item in leaves:
+        source = sources[item.path]
+        if source.kind == "default":
+            continue
+        if item.sensitive:
+            value = "***"
+        else:
+            node: Any = loaded
+            for attr in item.attrs:
+                node = getattr(node, attr, None)
+            value = _json(node)
+        shown.append(f"{item.path}={value} ({source})")
+    return "config: " + (", ".join(shown) if shown else "all defaults")
+
+
 def _load(
     sources: Iterable[Iterable[type[BaseModel]]],
     values: Mapping[str, Any] | BaseModel | Iterable[BaseModel] | None,
@@ -1127,11 +1203,16 @@ def _load(
     code: it goes over the defaults, and no file, env var or flag is read. Instances
     given are kept as given.
 
-    A load error names each path and its source. Pydantic's own texts never carry the
-    input, but a server's own validator text is kept as written, so a validator should
-    not put the value in it. The argv errors, the decode errors and every validation
-    error are reported together. A named file that can't be used stops the load at
-    once, alone.
+    Each leaf item's path maps, in item order and read-only, to the source its value
+    came from. A load that validates logs one ``INFO`` line on ``kubed.mcp.config``
+    naming each item not at its default, its value and its source, with a sensitive
+    item's value as ``***``.
+
+    A load error names each path and its source, and a path stops at a sensitive
+    field. Pydantic's own texts never carry the input, but a server's own validator
+    text is kept as written, so a validator should not put the value in it. The argv
+    errors, the decode errors and every validation error are reported together. A
+    named file that can't be used stops the load at once, alone.
 
     A root instance's fields are spread into the mapping and validated again with the
     rest, as are the values of a default model instance a source merges over, so a
@@ -1194,7 +1275,8 @@ def _load(
         loaded = composition.model.model_validate(data)
     except ValidationError as exc:
         lines += [
-            f"  {_path(error['loc'])} ({_source(error['loc'], layers)}): "
+            f"  {_path(error['loc'], composition.model)} "
+            f"({_source(error['loc'], layers)}): "
             f"{_message(error)}"
             for error in exc.errors(include_input=False, include_url=False)
         ]
@@ -1207,7 +1289,12 @@ def _load(
         value = loaded if key is None else getattr(loaded, key)
         for each in (cls, *composition.replaced.get(key, ())):
             provided[each] = value
-    return _Loaded(loaded, provided, types.MappingProxyType({}))
+    leaves = [item for item in items if item.leaf]
+    record = types.MappingProxyType(
+        {item.path: _source(item.loc, layers) for item in leaves}
+    )
+    _LOG.info("%s", _boot_line(leaves, loaded, record))
+    return _Loaded(loaded, provided, record)
 
 
 # Schema keywords whose value maps a name to a schema, so a name there is data.

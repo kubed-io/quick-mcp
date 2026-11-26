@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
-from typing import Annotated, Optional
+from types import SimpleNamespace
+from typing import Annotated, Any, Optional
 
 import pytest
-from pydantic import Json, Secret, SecretStr, create_model, field_validator
+from pydantic import (
+    Json,
+    Secret,
+    SecretStr,
+    create_model,
+    field_validator,
+    model_validator,
+)
 
 from kubed.mcp._config import (
     Config,
     Field,
     NoDecode,
+    Source,
     _compose,
     _load,
     config,
@@ -705,3 +715,205 @@ def test_a_mismatch_is_the_highest_layer_holding_it(tmp_path) -> None:
     f.write_text("port: 1\n")
     with pytest.raises(ValueError, match=r"  port \(env PORT\): "):
         load(environ={"CONFIG_FILE": str(f), "PORT": "x"})
+
+
+# -- provenance
+
+
+def test_every_source_is_recorded(tmp_path) -> None:
+    f = tmp_path / "c.yaml"
+    f.write_text("name: kb\ntelemetry:\n  limits:\n    burst: 7\n")
+    loaded = load(
+        environ={"CONFIG_FILE": str(f), "TELEMETRY_RATE": "9"}, argv=["--port", "1"]
+    )
+    assert loaded.sources["port"] == Source("arg", "--port")
+    assert loaded.sources["name"] == Source("file", str(f))
+    assert loaded.sources["telemetry.limits.burst"] == Source("file", str(f))
+    assert loaded.sources["telemetry.limits.rate"] == Source("env", "TELEMETRY_RATE")
+    assert loaded.sources["recording.inbox"] == Source("default")
+
+
+def test_a_blank_leaves_the_lower_source(tmp_path) -> None:
+    f = tmp_path / "c.yaml"
+    f.write_text("port: 8001\n")
+    loaded = load(environ={"CONFIG_FILE": str(f), "PORT": ""}, argv=["--port", " "])
+    assert loaded.sources["port"] == Source("file", str(f))
+
+
+def test_the_record_covers_every_leaf_and_is_read_only() -> None:
+    sources = load().sources
+    assert list(sources) == [
+        i.path for i in _compose([[Serve, Rec, Tel]]).items if i.leaf
+    ]
+    assert set(sources.values()) == {Source("default")}
+    with pytest.raises(TypeError):
+        sources["port"] = Source("code")
+
+
+def test_values_in_code_are_code() -> None:
+    sources = _load([[Serve, Rec]], {"port": 2, "recording": Rec(inbox="/in")}).sources
+    assert sources["port"] == Source("code")
+    assert sources["recording.hosts"] == Source("code")
+    assert sources["name"] == Source("default")
+
+
+def test_a_model_field_set_from_json_names_its_env_var() -> None:
+    sources = load(environ={"TELEMETRY_LIMITS": '{"burst": 3}'}).sources
+    assert sources["telemetry.limits.burst"] == Source("env", "TELEMETRY_LIMITS")
+    assert sources["telemetry.limits.rate"] == Source("default")
+
+
+def test_a_source_prints_as_it_appears_in_an_error() -> None:
+    sources = (
+        Source("default"),
+        Source("code"),
+        Source("env", "PORT"),
+        Source("arg", "--port"),
+        Source("file", "/etc/c.yaml"),
+        Source("hook"),
+    )
+    assert [str(s) for s in sources] == [
+        "default",
+        "code",
+        "env PORT",
+        "arg --port",
+        "file /etc/c.yaml",
+        "hook",
+    ]
+
+
+def test_the_boot_line_lists_only_what_is_not_default(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
+        load(
+            environ={"PORT": "9000", "RECORDING_TOKEN": "s3cret"},
+            argv=["--recording-inbox", "/in"],
+        )
+        load()
+    lines = [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"]
+    assert lines == [
+        'config: port=9000 (env PORT), recording.inbox="/in" (arg --recording-inbox), '
+        "recording.token=*** (env RECORDING_TOKEN)",
+        "config: all defaults",
+    ]
+
+
+def test_a_load_that_fails_logs_no_boot_line(caplog) -> None:
+    with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
+        load(environ={"PORT": "x"})
+    assert not [r for r in caplog.records if r.name == "kubed.mcp.config"]
+
+
+@config("loose")
+class Loose(Config):
+    thing: Any = None
+    blob: bytes = b""
+
+
+def test_a_value_json_cannot_write_is_named_by_its_type(caplog) -> None:
+    values = {"loose": {"thing": SimpleNamespace(t="s3cret"), "blob": b"\xffs3cret"}}
+    with caplog.at_level(logging.INFO, logger="kubed.mcp.config"):
+        _load([[Loose]], values)
+    assert [r.getMessage() for r in caplog.records if r.name == "kubed.mcp.config"] == [
+        'config: loose.thing="<SimpleNamespace>" (code), loose.blob="<bytes>" (code)'
+    ]
+
+
+# -- secrets
+
+
+@config("pair")
+class Pair(Config):
+    a: int = Field(0, env="PAIR_A")
+    b: int = Field(0, env="PAIR_B")
+
+    @model_validator(mode="after")
+    def _same(self) -> Pair:
+        if self.a != self.b:
+            raise ValueError("a and b differ")
+        return self
+
+
+class Cred(Config):
+    keys: Secret[dict[str, int]]
+
+
+@config("vault")
+class Vault(Config):
+    creds: list[Cred] = Field(default_factory=list)
+
+
+class Plain(Config):
+    note: str = ""
+
+
+class Locked(Config):
+    keys: Secret[dict[str, int]] | None = None
+
+
+@config("either")
+class Either(Config):
+    one: Plain | Locked = Plain()
+
+
+class Entry(Config):
+    a: int = 0
+    s: Secret[dict[str, int]] | None = None
+
+
+@config("d")
+class Entries(Config):
+    d: dict[str, Entry] = Field(default_factory=dict)
+
+
+def test_a_secret_from_env_never_shows(caplog) -> None:
+    environ = {"RECORDING_TOKEN": "s3cret"}
+    with caplog.at_level(logging.DEBUG):
+        loaded = load(environ=environ)
+    for text in (
+        caplog.text,
+        repr(loaded.sources),
+        repr(loaded.config),
+        repr(loaded.config.recording),
+        loaded.config.model_dump_json(),
+        loaded.config.recording.model_dump_json(),
+    ):
+        assert "s3cret" not in text
+    with pytest.raises(ValueError) as caught:
+        load(environ={**environ, "PORT": "x"})
+    assert "s3cret" not in str(caught.value)
+
+
+def test_a_bad_key_of_a_secret_dict_never_prints() -> None:
+    with pytest.raises(ValueError) as caught:
+        load(environ={"RECORDING_KEYS": '{"s3cretkey": "x"}'})
+    message = str(caught.value)
+    assert "  recording.keys (env RECORDING_KEYS): " in message
+    assert "s3cretkey" not in message
+
+
+def test_the_path_stops_at_a_secret_in_a_list_of_models() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Vault]], {"vault": {"creds": [{"keys": {"s3cretkey": "x"}}]}})
+    message = str(caught.value)
+    assert "  vault.creds[0].keys (code): " in message
+    assert "s3cretkey" not in message
+
+
+def test_the_path_stops_at_a_secret_in_a_union_of_models() -> None:
+    with pytest.raises(ValueError) as caught:
+        _load([[Either]], {"either": {"one": {"keys": {"s3cretkey": "x"}}}})
+    message = str(caught.value)
+    assert "either.one.Locked.keys (" in message and "s3cretkey" not in message
+
+
+def test_a_dict_key_named_like_a_field_still_stops_at_a_secret() -> None:
+    # The dict key "a" is also Entry's field a, which must not hide Entry's secret s.
+    with pytest.raises(ValueError) as caught:
+        _load([[Entries]], {"d": {"d": {"a": {"s": {"s3cretkey": "x"}}}}})
+    message = str(caught.value)
+    assert "  d.d.a.s (code): " in message and "s3cretkey" not in message
+
+
+def test_a_section_error_with_several_names_below_it_names_the_kind_only() -> None:
+    with pytest.raises(ValueError, match=r"  pair \(env\): .*a and b differ"):
+        load(Pair, environ={"PAIR_A": "1", "PAIR_B": "2"})
