@@ -681,11 +681,9 @@ async def test_the_probe_plugin_is_named_as_claude_code_names_it(tmp_path, caplo
     plugin = mcp.plugins[0]
     # Path order: a/b/deep.md before db/migrate.md before flat.md.
     assert plugin.prompts == ("a_b_deep", "db_migrate", "flat")
-    assert plugin.components.notes == (
-        "skills/group/nested/SKILL.md is not served: a skill is one folder below "
-        "its skills folder",
-    )
+    assert plugin.components.notes == ()
     warned = caplog.text
+    assert "skills/group/nested" not in warned
     assert "agent name 'x@y_r' is not a usable name" in warned
     assert "prompt name 'a:b_c' is not a usable name" in warned
     assert "not a valid Agent Skill" in warned  # skills/wrong names itself "other"

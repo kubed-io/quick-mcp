@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A plugin no longer logs a warning for each `SKILL.md` that isn't one of its skills, such as a sibling plugin's in a shared `skills/` folder.
+
 ## [0.5.2] - 2026-11-27
 
 ### Changed
