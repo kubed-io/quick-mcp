@@ -68,7 +68,8 @@ class ServingSettings(Config):
         ge=0,
         doc=(
             "Seconds in-flight HTTP requests get to finish when the server stops; "
-            "stdio doesn't read it."
+            "a stop by signal ends listen streams at once, a programmatic stop waits "
+            "up to graceful_timeout for them. stdio doesn't read it."
         ),
         env="GRACEFUL_TIMEOUT",
         arg="--graceful-timeout",
