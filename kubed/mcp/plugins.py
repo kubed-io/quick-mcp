@@ -19,8 +19,8 @@ and reused.
 A build runs the server's rewriters (``mcp.add_rewriter``) over the text it serves, from
 what was read and never from the disk.
 The layout and names are Claude Code's: a skill is one folder below ``skills/`` or a
-declared skills folder, or a declared skill folder itself, while commands and agents
-are files at any depth, each folder adding a name segment, Claude
+declared skills folder, or a skills folder that itself holds a ``SKILL.md``, while
+commands and agents are files at any depth, each folder adding a name segment, Claude
 Code's ``:`` written ``_`` (``commands/db/migrate.md`` is ``db_migrate``). A plugin
 added with no namespace is the server's own, its skills under ``skill://<server
 name>/``; there is no root, and an empty namespace is refused. Plugins added under one
@@ -421,7 +421,7 @@ def _skill_folders(base: Path, folder: str, notes: list[str]) -> list[tuple[str,
     """Each skill in ``folder``, as its name and its folder, as Claude Code finds them
     (PLUG-19).
 
-    A declared folder that holds a ``SKILL.md`` is that skill, under its own name.
+    A skills folder that itself holds a ``SKILL.md`` is that skill, under its own name.
     Otherwise a skill is a folder directly in ``folder`` that holds one, in name
     order: one level only. A dot folder is not searched, a symlinked folder is not
     entered, and nothing below the first level is opened, so a folder that is no skill
@@ -2119,8 +2119,8 @@ class Plugins:
                     skip(location, skill)
                     continue
                 catalogue[key] = skill
-                folder = location.relative_to(base).as_posix()
-                skill_dirs[key] = "" if folder == "." else folder
+                where = location.relative_to(base).as_posix()
+                skill_dirs[key] = "" if where == "." else where
                 by_name.setdefault(skill.name, uri)
         # The server is already a scope for prompts and agents: only an explicit
         # namespace other than its own is a prefix, and only its first segment
