@@ -18,7 +18,8 @@ view has run, of those its view admits (``mcp.plugin_view``), built once per bui
 and reused.
 A build runs the server's rewriters (``mcp.add_rewriter``) over the text it serves, from
 what was read and never from the disk.
-The layout and names are Claude Code's: a skill is one folder below ``skills/``, while
+The layout and names are Claude Code's: a skill is one folder below ``skills/`` or a
+declared skills folder, or a skills folder that itself holds a ``SKILL.md``, while
 commands and agents are files at any depth, each folder adding a name segment, Claude
 Code's ``:`` written ``_`` (``commands/db/migrate.md`` is ``db_migrate``). A plugin
 added with no namespace is the server's own, its skills under ``skill://<server
@@ -416,35 +417,32 @@ def read_plugin(
 # ---- reading each kind -------------------------------------------------------------
 
 
-def _skill_folders(
-    base: Path, folder: str, notes: list[str]
-) -> tuple[list[tuple[str, Path]], list[Path]]:
-    """Each skill in ``folder``, as its name and its folder, and the nested ones.
+def _skill_folders(base: Path, folder: str, notes: list[str]) -> list[tuple[str, Path]]:
+    """Each skill in ``folder``, as its name and its folder, as Claude Code finds them
+    (PLUG-19).
 
-    A skill is a folder directly in ``folder`` holding a ``SKILL.md``: one level only,
-    as Claude Code reads it. A declared folder that is a skill itself is its own name.
-    Every ``SKILL.md`` deeper, in a folder that is no skill, is returned as nested,
-    not served. A dot folder is never searched, and nothing below a skill is.
+    A skills folder that itself holds a ``SKILL.md`` is that skill, under its own name.
+    Otherwise a skill is a folder directly in ``folder`` that holds one, in name
+    order: one level only. A dot folder is not searched, a symlinked folder is not
+    entered, and nothing below the first level is opened, so a folder that is no skill
+    is silently not one.
     """
     start = base / folder
     if _inside(start, base) is None or not start.is_dir():
         notes.append(f"skills entry '{folder}' is not a folder in the plugin")
-        return [], []
+        return []
     if (start / skills.ENTRY).is_file():
-        return [(start.name, start)], []
+        return [(start.name, start)]
     found: list[tuple[str, Path]] = []
-    nested: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(start):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         here = Path(dirpath)
-        if here == start or skills.ENTRY not in filenames:
+        if here == start:
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
             continue
-        if here.parent == start:
+        if skills.ENTRY in filenames:
             found.append((here.name, here))
-        else:
-            nested.append(here / skills.ENTRY)
         dirnames[:] = []
-    return sorted(found), nested
+    return sorted(found)
 
 
 def _md_files(
@@ -2108,13 +2106,8 @@ class Plugins:
         catalogue: dict[str, skills.Skill] = {}
         skill_dirs: dict[str, str] = {}
         by_name: dict[str, str] = {}
-        folders: set[Path] = set()
-        nested: list[Path] = []
         for folder in parts.skills:
-            found, deeper = _skill_folders(base, folder, notes)
-            nested += deeper
-            for path, location in found:
-                folders.add(location)
+            for path, location in _skill_folders(base, folder, notes):
                 key = f"{prefix}/{path}"
                 uri = f"skill://{quote(key, safe='/')}/{skills.ENTRY}"
                 if not self._claim(
@@ -2126,17 +2119,9 @@ class Plugins:
                     skip(location, skill)
                     continue
                 catalogue[key] = skill
-                folder = location.relative_to(base).as_posix()
-                skill_dirs[key] = "" if folder == "." else folder
+                where = location.relative_to(base).as_posix()
+                skill_dirs[key] = "" if where == "." else where
                 by_name.setdefault(skill.name, uri)
-        # A skills folder read as well, the root say, may hold one found as nested.
-        for entry in nested:
-            if entry.parent not in folders:
-                notes.append(
-                    f"{entry.relative_to(base).as_posix()} is not served: a skill is "
-                    "one folder below its skills folder"
-                )
-
         # The server is already a scope for prompts and agents: only an explicit
         # namespace other than its own is a prefix, and only its first segment
         # (PLUG-63).
