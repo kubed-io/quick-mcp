@@ -4,21 +4,24 @@ host acting on a skill checks, it checks here."""
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import fastmcp.skills.skill as fastmcp_skill
 import pytest
 from fastmcp import Client
 from gateway_server import kit, over_http
 from mcp_types import INVALID_PARAMS
-from plugin_server import copy
+from plugin_server import DEMO, copy
 from plugin_server import served as plugin_served
 from skill_server import (
     DIRECTORY,
     ENTRY_URI,
+    GOOD,
     demo,
     read_bytes,
     read_directory,
@@ -287,3 +290,50 @@ async def test_an_unlisted_skill_is_still_got(tmp_path):
         }
     assert not [u for u in unlisted if u in PLUGIN_SKILLS]
     assert got == {u: listed[u] for u in PLUGIN_SKILLS}
+
+
+def over_the_limits(monkeypatch, over: str) -> tuple[dict[str, str], str]:
+    """A skill's files over one limit, and FastMCP's reason."""
+    if over == "files":
+        return (
+            {
+                "SKILL.md": f"---\n{GOOD}\n---\n",
+                **{f"r/{i}.txt": "x" for i in range(512)},
+            },
+            "A skill may contain at most 512 files",
+        )
+    monkeypatch.setattr(fastmcp_skill, "MAX_SKILL_BYTES", 1000)
+    return (
+        {"SKILL.md": f"---\n{GOOD}\n---\n", "big.txt": "x" * 2000},
+        "A skill may contain at most 1000 bytes",
+    )
+
+
+@pytest.mark.parametrize("over", ["files", "bytes"])
+def test_a_skill_over_the_limits_is_never_served(monkeypatch, over):
+    """FastMCP's Skill.from_files refuses a skill over a limit, so there is no Skill for any
+    path to serve: not a catalogue, a load_skills() override or a rewrite's rebuild (SKL-29)."""
+    files, reason = over_the_limits(monkeypatch, over)
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        Skill.from_files(files)
+
+
+async def test_a_rewrite_past_the_limits_fails_the_skill(tmp_path, monkeypatch, caplog):
+    folder = DEMO / "skills" / "demo-guide"
+    size = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+    monkeypatch.setattr(fastmcp_skill, "MAX_SKILL_BYTES", size + 100)
+    mcp = plugin_served((copy(tmp_path), None))
+    mcp.add_rewriter(
+        lambda site, text: text + "x" * 200 if site.path.endswith("/SKILL.md") else text
+    )
+    with caplog.at_level(logging.ERROR):
+        async with Client(mcp.server) as client:
+            entries = [
+                e["uri"] for e in (await request(client, "skills/list"))["skills"]
+            ]
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert "skill://t/demo-guide/SKILL.md" not in entries
+    assert len(errors) == 1
+    assert "failed on skills/demo-guide/SKILL.md" in errors[0]
+    assert "so skill://t/demo-guide/SKILL.md is not served" in errors[0]
+    assert f"A skill may contain at most {size + 100} bytes" in errors[0]
