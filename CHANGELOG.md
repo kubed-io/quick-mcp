@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-27
+
 ### Added
 
 - Cap listed skills with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
