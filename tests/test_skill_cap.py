@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -11,7 +12,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.skills.provider import SkillManifestProvider
 from gateway_server import over_http
-from plugin_server import skill, write
+from plugin_server import agent_md, command_md, skill, write
 from skill_server import read_directory, request
 from test_delivery_inputs import warnings
 
@@ -99,6 +100,22 @@ async def page_sizes(client, method: str, key: str) -> list[int]:
         cursor = page.get("nextCursor")
         if not cursor:
             return sizes
+
+
+async def rows(client) -> list[str]:
+    """Every ``resources/list`` row URI holding ``skill://``, in the order sent,
+    following ``nextCursor``."""
+    found, cursor = [], None
+    while True:
+        page = await request(
+            client, "resources/list", **({"cursor": cursor} if cursor else {})
+        )
+        found += [
+            str(r["uri"]) for r in page["resources"] if "skill://" in str(r["uri"])
+        ]
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return found
 
 
 async def listing(client) -> list[str]:
@@ -328,3 +345,80 @@ async def test_a_cut_skill_is_still_served(tmp_path):  # DLV-10
         for tail in ("SKILL.md", "_manifest", "_index.md", "_index.json"):
             assert await client.read_resource(f"{root}/{tail}")
         assert (await read_directory(client, uri=root))["resources"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_resources_list_cuts_at_the_same_places(tmp_path, mode):  # Review Focus 1
+    mcp = capped(tmp_path, ("a", 60), ("b", 60), own=3, list_page_size=7)
+    async with Client(mcp.server, mode=mode) as client:
+        listed = await listing(client)
+        shown = await rows(client)
+        pages = await page_sizes(client, "resources/list", "resources")
+    assert listed == uris("a", range(60)) + uris("b", range(37)) + own(range(3))
+    assert sorted(shown) == sorted(listed)
+    assert pages == [7] * 14 + [2]
+
+
+async def test_a_prefixed_listing_is_cut_alike(tmp_path):  # Review Focus 2
+    async with over_http(capped(tmp_path, ("a", 101)), header="kb+") as client:
+        listed = await listing(client)
+        shown = await rows(client)
+    assert listed == uris("a", range(100))
+    assert sorted(u.removeprefix("kb+") for u in shown) == listed
+
+
+async def test_prompt_and_agent_rows_are_never_cut(tmp_path):
+    root = plugin(tmp_path, "a", 101)
+    write(root, {f"commands/c{i}.md": command_md() for i in range(3)})
+    write(root, {f"agents/g{i}.md": agent_md(f"g{i}") for i in range(3)})
+    mcp = QuickMCP("t")
+    mcp.add_plugin(root, namespace="a")
+    headers = {"X-MCP-Max": "5", "X-MCP-Listed": "skills,prompts,agents"}
+    async with over_http(mcp, headers=headers) as client:
+        everything = [str(r.uri) for r in await client.list_resources()]
+        prompts = await client.list_prompts()
+        agents = (await request(client, "agents/list"))["agents"]
+    assert len([u for u in everything if u.startswith("skill://")]) == 5
+    assert len([u for u in everything if u.startswith("prompts://")]) == 3
+    assert len([u for u in everything if u.startswith("agents://")]) == 3
+    assert (len(prompts), len(agents)) == (3, 3)
+
+
+async def test_list_resources_is_cut(tmp_path):  # DLV-6
+    async with over_http(
+        capped(tmp_path, ("a", 101)), headers={"X-MCP-Resources": "off"}
+    ) as client:
+        found = json.loads(
+            (await client.call_tool("list_resources", {})).content[0].text
+        )
+    assert (
+        len([r for r in found["resources"] if r["uri"].startswith("skill://")]) == 100
+    )
+
+
+async def test_local_listing_skills_keeps_the_same_room(tmp_path):  # Dr K, call 3
+    headers = {"X-MCP-Via": "local", "X-MCP-Listed": "skills"}
+    async with over_http(
+        capped(tmp_path, ("a", 101), own=3), headers=headers
+    ) as client:
+        assert await listing(client) == own(range(3))
+        assert sorted(await rows(client)) == sorted(
+            uris("a", range(97)) + own(range(3))
+        )
+
+
+async def test_no_cap_lists_every_row(tmp_path):
+    async with over_http(
+        capped(tmp_path, ("a", 101)), headers={"X-MCP-Max": "all"}
+    ) as client:
+        assert sorted(await rows(client)) == uris("a", range(101))
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_resources_list_runs_no_listing_pass(
+    tmp_path, monkeypatch, mode
+):  # Review Focus 5
+    checked = visibility_checks(monkeypatch)
+    async with Client(capped(tmp_path, ("a", 101), own=3).server, mode=mode) as client:
+        assert len(await rows(client)) == 100
+    assert checked == []

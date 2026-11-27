@@ -637,8 +637,11 @@ class _Skills(skills.EntryOnlySkillProvider):
         if "skills" not in _resolved().listed:
             return []
         # The rows are the build's, made once with it (PLUG-55); the gate above stays
-        # per request.
-        return list((await self._plugins.pinned()).build.entries)
+        # per request. The cap keeps the first ``room`` of them, in the build's order
+        # (DLV-17). Counting the room reads the request manifests, never a listing
+        # (#86).
+        entries = (await self._plugins.pinned()).build.entries
+        return list(entries[: await self._room_left()])
 
     async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
         # skills/list asks this, and skills/get its own _get_skill_entry, so under
