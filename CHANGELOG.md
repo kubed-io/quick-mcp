@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Garbage-collection counts and pause times, per generation, are in the metrics.
+
+### Fixed
+
+- A session's first request no longer stalls ~2 s while FastMCP's state store loads.
+
 ## [0.6.0] - 2026-11-27
 
 ### Added
