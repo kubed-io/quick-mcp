@@ -195,8 +195,13 @@ def _is_index(path: str) -> bool:
 
 
 def _unserved(files: Iterable[str]) -> set[str]:
-    """The files whose URI the server answers otherwise: an index, the root manifest."""
-    return {path for path in files if _is_index(path) or path == MANIFEST}
+    """The files never served: a hidden path (SKL-24), and a file whose URI the server
+    answers otherwise: an index, the root manifest."""
+    return {
+        path
+        for path in files
+        if _is_hidden(path) or _is_index(path) or path == MANIFEST
+    }
 
 
 def _all_folders(paths: Iterable[str]) -> set[str]:
@@ -226,6 +231,8 @@ def _folders_of(paths: Iterable[str]) -> set[str]:
 def without_reserved(skill: Skill) -> Skill:
     """The skill minus any file whose URI the server answers otherwise, each named.
 
+    A hidden path is dropped too, without a warning: one debug line names the files.
+
     That is a file with an index's name, which reads as its folder's index, and a
     ``_manifest`` at the root, which reads as the manifest. FastMCP would find such a
     file unreadable as listed and drop the whole skill from ``skills/list``. A
@@ -234,6 +241,8 @@ def without_reserved(skill: Skill) -> Skill:
     reserved.
     """
     for rel in sorted(_all_folders(skill.files)):
+        if _is_hidden(rel):
+            continue
         if _is_index(rel):
             log.warning(
                 "skill %s: folder %s is not served, "
@@ -249,7 +258,14 @@ def without_reserved(skill: Skill) -> Skill:
                 rel,
             )
     unserved = sorted(_unserved(skill.files))
+    hidden = [name for name in unserved if _is_hidden(name)]
+    if hidden:
+        log.debug(
+            "skill %s: hidden paths not served: %s", skill.name, ", ".join(hidden)
+        )
     for name in unserved:
+        if _is_hidden(name):
+            continue
         answers = "the skill's manifest" if name == MANIFEST else "its folder's index"
         log.warning(
             "skill %s: %s is not served, %s answers that URI", skill.name, name, answers
@@ -561,8 +577,9 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
 
     ``_get_resource`` still answers every file, the manifest and each folder's two index
     files by exact URI. A folder is every one a skill's files sit in. A file whose URI
-    the server answers otherwise is never served: a catalogue given here is trimmed with
-    ``without_reserved``, and one ``load_skills()`` returns is trimmed silently.
+    the server answers otherwise, or a hidden path, is never served: a catalogue given
+    here is trimmed with ``without_reserved``, and one ``load_skills()`` returns is
+    trimmed silently.
 
     The provider brings ``SkillsExtension``, which FastMCP registers once however many
     providers bring it.
