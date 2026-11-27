@@ -386,6 +386,9 @@ class _DirectoryRead:
     The cursor is the decimal offset of the next child. Any offset inside the folder,
     from 1 to one less than the number of children, is accepted; anything else is
     ``-32602``.
+
+    Its result is the SEP's: ``resultType`` ``complete``, a page of ``resources``, and
+    ``nextCursor`` while more remain.
     """
 
     page_size = 100
@@ -402,7 +405,7 @@ class _DirectoryRead:
             raise MCPError(code=INVALID_PARAMS, message="Directory not found")
         start = _offset(params.cursor, len(children))
         end = start + self.page_size
-        result: dict = {"resources": children[start:end]}
+        result: dict = {"resultType": "complete", "resources": children[start:end]}
         if end < len(children):
             result["nextCursor"] = str(end)
         return result
