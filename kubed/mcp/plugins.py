@@ -625,12 +625,18 @@ def _room(own: int, cap: int | None) -> int | None:
     return None if cap is None else max(0, cap - own)
 
 
-def _count(own: int, plugin: int, cap: int | None, via: str) -> SkillCount:
-    """How many skills ``skills/list`` holds, and how many the cap cuts, for a server
-    with ``own`` skills of its own and ``plugin`` from its plugins (DLV-17). Under
-    ``local`` the plugins' skills are unlisted, and none is cut."""
+def _count(
+    own: int, plugin: int, cap: int | None, via: str, listed: frozenset[str]
+) -> SkillCount:
+    """How many skills the listing the mode lists skills in holds, and how many the
+    cap cuts, for a server with ``own`` skills of its own and ``plugin`` from its
+    plugins (DLV-11, DLV-17): ``resources/list`` under ``mcp``, ``skills/list``
+    otherwise. Under ``local`` the plugins' skills are unlisted, and under ``mcp``
+    without ``skills`` in ``listed`` no skill is: either way none is cut."""
     if via == "local":
         return SkillCount(own, 0)
+    if via == "mcp" and "skills" not in listed:
+        return SkillCount(0, 0)
     room = _room(own, cap)
     kept = plugin if room is None else min(room, plugin)
     return SkillCount(own + kept, plugin - kept)
@@ -647,9 +653,15 @@ class _Skills(skills.EntryOnlySkillProvider):
     async def load_skills(self) -> dict[str, skills.Skill]:
         return dict((await self._plugins.pinned()).build.catalogue)
 
+    def _lists_rows(self) -> bool:
+        return "skills" in _resolved().listed
+
+    def _lists_entries(self) -> bool:
+        return _resolved().via == "extension"
+
     async def _list_resources(self) -> list[Resource]:
         # Listed only as the request lists skills (DLV-8, SKL-8); reads are not.
-        if "skills" not in _resolved().listed:
+        if not self._lists_rows():
             return []
         # The rows are the build's, made once with it (PLUG-55); the gate above stays
         # per request. The cap keeps the first ``room`` of them, in the build's order
@@ -660,8 +672,9 @@ class _Skills(skills.EntryOnlySkillProvider):
 
     async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
         # skills/list asks this, and skills/get its own _get_skill_entry, so under
-        # local the plugins' skills are unlisted and still answer (DLV-9, DLV-10).
-        if _resolved().via == "local":
+        # mcp and local the plugins' skills are unlisted and still answer: it lists
+        # none and builds none (DLV-9, DLV-10).
+        if not self._lists_entries():
             return []
         # FastMCP gives the entries in the catalogue's order, which is the order rule
         # (DLV-17), and merges, sorts and pages after this: the cut is across the
@@ -699,8 +712,8 @@ class _Prompts(Provider):
         self._plugins = plugins
 
     async def _list_prompts(self) -> list[Prompt]:
-        # Listed under mcp alone; prompts/get finds every one (DLV-9, DLV-10).
-        if _resolved().via != "mcp":
+        # Unlisted under local alone, and prompts/get finds every one (DLV-9, DLV-10).
+        if _resolved().via == "local":
             return []
         return list((await self._plugins.pinned()).build.prompts)
 
@@ -2027,20 +2040,22 @@ class Plugins:
             return None
 
     async def skill_count(self) -> SkillCount | None:
-        """How many skills ``skills/list`` holds and how many the cap cuts, for the
-        request's handshake, or None when it cannot be told (DLV-17). It reads the
-        cached build and the request's manifests, and runs no listing. Under ``local``
-        it counts no plugin skill, so it pins no build."""
+        """How many skills the mode's listing holds and how many the cap cuts, for the
+        request's handshake, or None when it cannot be told (DLV-11, DLV-17). It reads
+        the cached build and the request's manifests, and runs no listing. Under
+        ``local``, and under ``mcp`` without ``skills`` in ``X-MCP-Listed``, it counts
+        no plugin skill, so it pins no build."""
         own = await skills._own_count(self._server, self._skills)
         resolved = _resolved()
+        via, listed = resolved.via, resolved.listed
         if self._skills is None:
-            return _count(own, 0, resolved.max, resolved.via) if own else None
-        if resolved.via == "local":
-            return _count(own, 0, resolved.max, resolved.via)
+            return _count(own, 0, resolved.max, via, listed) if own else None
+        if via == "local" or (via == "mcp" and "skills" not in listed):
+            return _count(own, 0, resolved.max, via, listed)
         pin = await self._quiet_pin()
         if pin is None:
             return None
-        return _count(own, len(pin.build.entries), resolved.max, resolved.via)
+        return _count(own, len(pin.build.entries), resolved.max, via, listed)
 
     async def _build_for(
         self, memo: _Memo, state: _State, view: View, key: _Key

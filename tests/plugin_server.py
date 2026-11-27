@@ -34,8 +34,10 @@ def copy(tmp_path: Path, name: str = "demo", files: dict | None = None) -> Path:
     return write(root, files or {})
 
 
-def served(*plugins: tuple[Path, str | None], name: str = "t") -> QuickMCP:
-    mcp = QuickMCP(name)
+def served(
+    *plugins: tuple[Path, str | None], name: str = "t", config: dict | None = None
+) -> QuickMCP:
+    mcp = QuickMCP(name, config=config or {})
     for root, namespace in plugins:
         mcp.add_plugin(root, namespace=namespace)
     return mcp

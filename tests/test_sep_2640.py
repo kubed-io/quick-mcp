@@ -19,6 +19,7 @@ from mcp_types import INVALID_PARAMS
 from plugin_server import DEMO, copy
 from plugin_server import served as plugin_served
 from skill_server import (
+    BOTH,
     DIRECTORY,
     ENTRY_URI,
     GOOD,
@@ -59,19 +60,19 @@ async def connect(
             yield client, "skill://tmp-skill"
     elif kind in ("plugin", "rewritten"):
         files = {f"skills/demo-guide/{p}": b for p, b in FILES.items()}
-        mcp = plugin_served((copy(tmp_path, files=files), None))
+        mcp = plugin_served((copy(tmp_path, files=files), None), config=BOTH)
         if kind == "rewritten":
             mcp.add_rewriter(lambda site, text: text + "\n<!-- r -->\n")
         async with Client(mcp.server, mode=mode) as client:
             yield client, "skill://t/demo-guide"
     else:
-        async with over_http(kit(tmp_path), header="kb+", mode=mode) as client:
+        async with over_http(kit(tmp_path, config=BOTH), header="kb+", mode=mode) as client:
             yield client, "skill://lib/guide"
 
 
 def three(**options: Any) -> QuickMCP:
     """A server named ``t`` with three catalogue skills, ``alpha``, ``beta`` and ``gamma``."""
-    mcp = QuickMCP("t", **options)
+    mcp = QuickMCP("t", **{"config": BOTH, **options})
     skills = [
         Skill.from_files(
             {
@@ -280,7 +281,7 @@ async def test_an_unlisted_skill_is_still_got(tmp_path):
     """Under X-MCP-Via local the plugin's skills are unlisted, and skills/get answers each
     with the entry the listing gives under mcp (SKL-23, DLV-9, DLV-10)."""
     mcp = make(tmp_path)
-    async with over_http(mcp) as client:
+    async with over_http(mcp, headers={"X-MCP-Via": "extension"}) as client:
         listed = {e["uri"]: e for e in (await request(client, "skills/list"))["skills"]}
     async with over_http(mcp, headers={"X-MCP-Via": "local"}) as client:
         unlisted = [e["uri"] for e in (await request(client, "skills/list"))["skills"]]
@@ -322,7 +323,7 @@ async def test_a_rewrite_past_the_limits_fails_the_skill(tmp_path, monkeypatch, 
     folder = DEMO / "skills" / "demo-guide"
     size = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
     monkeypatch.setattr(fastmcp_skill, "MAX_SKILL_BYTES", size + 100)
-    mcp = plugin_served((copy(tmp_path), None))
+    mcp = plugin_served((copy(tmp_path), None), config=BOTH)
     mcp.add_rewriter(
         lambda site, text: text + "x" * 200 if site.path.endswith("/SKILL.md") else text
     )

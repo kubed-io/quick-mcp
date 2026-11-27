@@ -63,6 +63,7 @@ from pydantic import Field, ValidationError
 from mcp.shared.exceptions import MCPError
 
 from . import _media
+from .delivery import _delivered
 from .protocol import AdvertiseLegacyExtensions
 
 __all__ = [
@@ -591,10 +592,49 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
 
     The provider brings ``SkillsExtension``, which FastMCP registers once however many
     providers bring it.
+
+    Where a ``QuickMCP`` resolves delivery, its rows follow ``X-MCP-Listed`` and its
+    ``skills/list`` entries ``X-MCP-Via`` (DLV-8, DLV-10). Anywhere else both are
+    listed.
     """
 
     def __init__(self, skills: Catalogue | None = None) -> None:
         super().__init__(_trimmed(skills))
+
+    def _lists_rows(self) -> bool:
+        """Whether ``resources/list`` lists this catalogue's ``SKILL.md`` rows."""
+        resolved = _delivered()
+        return resolved is None or "skills" in resolved.listed
+
+    def _lists_entries(self) -> bool:
+        """Whether ``skills/list`` lists this catalogue's skills."""
+        resolved = _delivered()
+        return resolved is None or resolved.via != "mcp"
+
+    async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
+        # skills/list asks this, and skills/get its own _get_skill_entry: an unlisted
+        # skill still answers (DLV-10).
+        if not self._lists_entries():
+            return []
+        return await super()._list_skill_entries(context)
+
+    async def _skill_uris(self, uri: str | None = None) -> Sequence[str]:
+        """The catalogue's URIs, or none when ``skills/list`` asks for its duplicate
+        check and lists none of them.
+
+        FastMCP's ``skills/list`` handler (``SkillsExtension._list_entries``, through
+        ``_identities()``) asks every source for ``_skill_uris(None)`` to drop the
+        URIs two sources share. For a catalogue the listing shows none of, that would
+        load it (build it, for the plugins) for nothing, so it answers none.
+        ``skills/get`` passes its URI and is unchanged.
+
+        Written against fastmcp 4.2.6; ``_skill_uris`` is a private method.
+        ``test_skills_list_reaches_the_uri_override`` fails if an upgrade renames it or
+        stops calling it.
+        """
+        if uri is None and not self._lists_entries():
+            return []
+        return await super()._skill_uris(uri)
 
     def required_extensions(self) -> Sequence[ServerExtension]:
         return (SkillsExtension(),)
@@ -645,7 +685,9 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
 
     async def _list_resources(self) -> list[Resource]:
         """Each skill's ``SKILL.md`` row alone, made from the manifests FastMCP loads
-        once per request (SKL-8, SKL-19)."""
+        once per request (SKL-8, SKL-19), when the request lists skills as rows."""
+        if not self._lists_rows():
+            return []
         return list(_entries(self, await self._request_manifests()))
 
     async def _get_resource(

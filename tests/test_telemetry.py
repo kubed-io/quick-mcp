@@ -33,7 +33,7 @@ from fastmcp import Client, FastMCP
 from gateway_server import KIT_TREE, over_http
 from plugin_server import write
 from pydantic import BaseModel, ValidationError
-from skill_server import request
+from skill_server import BOTH, request
 
 import kubed.mcp
 import kubed.mcp.telemetry
@@ -2358,9 +2358,18 @@ LISTING_KEYS = {
 }
 
 
-def listings_served(name: str, tmp_path: Path, **options) -> QuickMCP:
-    """A server with something behind each of the seven listings."""
-    mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)}, **options)
+def listings_served(
+    name: str, tmp_path: Path, delivery: dict | None = None, **options
+) -> QuickMCP:
+    """A server with something behind each of the seven listings.
+
+    ``delivery`` is merged into its config: a test that reads ``skills/list`` passes
+    the opt-in that lists skills both ways.
+    """
+    config = {"telemetry": TelemetrySettings(otel=True)}
+    if delivery is not None:
+        config["delivery"] = delivery
+    mcp = QuickMCP(name, config=config, **options)
     mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
     mcp.tool(lambda: "pong", name="ping")
 
@@ -2427,7 +2436,9 @@ async def test_a_paged_listing_is_one_series(metered, mode) -> None:
 
     name = f"paged-{mode}"
     mcp = QuickMCP(
-        name, list_page_size=1, config={"telemetry": TelemetrySettings(otel=True)}
+        name,
+        list_page_size=1,
+        config={"telemetry": TelemetrySettings(otel=True), **BOTH},
     )
     serve(
         mcp.server,
@@ -2458,7 +2469,7 @@ async def test_a_listing_behind_a_prefix_is_one_unnamed_series(
     metered, tmp_path, mode
 ) -> None:
     name = f"prefixed-listings-{mode}"
-    mcp = listings_served(name, tmp_path)
+    mcp = listings_served(name, tmp_path, delivery=BOTH["delivery"])
     async with over_http(mcp, header="kb+", mode=mode) as client:
         (entry,) = (await request(client, "skills/list"))["skills"]
         # The prefix is in force: the served text carries it.
@@ -2476,7 +2487,8 @@ async def test_a_get_and_a_directory_read_record_nothing(
     metered, tmp_path, mode
 ) -> None:
     name = f"gets-{mode}"
-    async with Client(listings_served(name, tmp_path).server, mode=mode) as client:
+    mcp = listings_served(name, tmp_path, delivery=BOTH["delivery"])
+    async with Client(mcp.server, mode=mode) as client:
         (agent,) = (await request(client, "agents/list"))["agents"]
         (entry,) = (await request(client, "skills/list"))["skills"]
         await request(client, "skills/get", uri=entry["uri"])

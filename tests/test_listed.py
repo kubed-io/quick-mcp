@@ -73,7 +73,7 @@ async def test_listed_kinds_add_one_row_per_file(tmp_path, scheme):
             assert len(kind_rows) == len(await client.list_prompts())
 
 
-async def test_an_empty_listed_shows_only_the_servers_own(tmp_path):
+async def test_an_empty_listed_shows_the_servers_own_resources_and_no_skill(tmp_path):
     mcp = make(tmp_path)
     skills.serve(mcp.server, [load_skill(make_skill(tmp_path, {}))])
     async with over_http(mcp, headers={"X-MCP-Listed": ""}) as client:
@@ -81,7 +81,7 @@ async def test_an_empty_listed_shows_only_the_servers_own(tmp_path):
     assert OWN in listed
     assert not any(u.startswith("skill://t/") for u in listed)
     assert not any(u.startswith(("prompts://", "agents://")) for u in listed)
-    assert any(u.endswith("tmp-skill/SKILL.md") for u in listed)
+    assert not any(u.endswith("tmp-skill/SKILL.md") for u in listed)
 
 
 async def test_unknown_kinds_are_dropped(tmp_path):
@@ -107,8 +107,10 @@ async def test_folders_and_indexes_are_never_listed(tmp_path):
 async def test_the_other_lists_do_not_change(tmp_path):
     mcp = make(tmp_path)
     async with (
-        over_http(mcp) as plain,
-        over_http(mcp, headers={"X-MCP-Listed": ""}) as none,
+        over_http(mcp, headers={"X-MCP-Via": "extension"}) as plain,
+        over_http(
+            mcp, headers={"X-MCP-Via": "extension", "X-MCP-Listed": ""}
+        ) as none,
     ):
         assert [p.name for p in await plain.list_prompts()] == [
             p.name for p in await none.list_prompts()

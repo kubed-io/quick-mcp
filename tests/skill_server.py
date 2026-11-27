@@ -21,6 +21,9 @@ ENTRY_URI = f"{ROOT}/SKILL.md"
 MANIFEST_URI = f"{ROOT}/_manifest"
 DIRECTORY = "inode/directory"
 GOOD = "name: tmp-skill\ndescription: A skill for tests."
+# The opt-in that lists skills both ways (DLV-8, DLV-9). Tests of skill rules read
+# under it, so they hold in every delivery mode; only tests of delivery name a mode.
+BOTH = {"delivery": {"via": "extension", "listed": "skills"}}
 
 
 class ExtensionParams(RequestParams):
@@ -50,9 +53,12 @@ async def read_json(client, uri: str):
     return json.loads(contents[0].text)
 
 
-def demo() -> QuickMCP:
-    """A server over the demo skill, loaded and added as a server would."""
-    mcp = QuickMCP("t")
+def demo(config: dict = BOTH) -> QuickMCP:
+    """A server over the demo skill, loaded and added as a server would.
+
+    It lists skills both ways, the opt-in (DLV-8, DLV-9), so it reads alike in every mode.
+    """
+    mcp = QuickMCP("t", config=config)
     serve(mcp.server, [load_skill(DEMO)])
     return mcp
 
@@ -76,8 +82,13 @@ def make_skill(
     return folder
 
 
-def served(tmp_path: Path, files: dict[str, str | bytes], **options) -> QuickMCP:
-    """A server over a throwaway skill called ``tmp-skill``."""
-    mcp = QuickMCP("t")
-    serve(mcp.server, [load_skill(make_skill(tmp_path, files, **options))])
+def served(
+    tmp_path: Path, files: dict[str, str | bytes], *, config: dict = BOTH, **skill_options
+) -> QuickMCP:
+    """A server over a throwaway skill called ``tmp-skill``.
+
+    It lists skills both ways, the opt-in (DLV-8, DLV-9), so it reads alike in every mode.
+    """
+    mcp = QuickMCP("t", config=config)
+    serve(mcp.server, [load_skill(make_skill(tmp_path, files, **skill_options))])
     return mcp

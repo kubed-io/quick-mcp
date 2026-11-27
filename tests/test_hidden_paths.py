@@ -10,7 +10,7 @@ from fastmcp import Client
 from mcp_types import INVALID_PARAMS
 from plugin_server import copy
 from plugin_server import served as plugin_served
-from skill_server import GOOD, read_directory, read_json, request, served
+from skill_server import BOTH, GOOD, read_directory, read_json, request, served
 
 from kubed.mcp import QuickMCP, skills
 from kubed.mcp.protocol import MCPError
@@ -53,11 +53,11 @@ def build(kind: str, tmp_path: Path) -> tuple[QuickMCP, str, set[str]]:
         skill = Skill.from_files(
             {"SKILL.md": f"---\n{GOOD}\n---\n\n# Tmp\n", **everything}
         )
-        mcp = QuickMCP("t")
+        mcp = QuickMCP("t", config=BOTH)
         serve(mcp.server, [skill] if kind == "catalogue" else PerRequest(skill))
         return mcp, "skill://tmp-skill", {"SKILL.md", *ORDINARY}
     files = {f"skills/demo-guide/{p}": b for p, b in everything.items()}
-    mcp = plugin_served((copy(tmp_path, files=files), None))
+    mcp = plugin_served((copy(tmp_path, files=files), None), config=BOTH)
     if kind == "rewritten":
         # Skill files only: a rewriter is run on a folder's index too, and JSON
         # with a comment after it is no JSON.

@@ -11,7 +11,7 @@ import skill_server
 from fastmcp import Client
 from gateway_server import KIT_TREE, over_http
 from plugin_server import ENTRY, copy, served, write
-from skill_server import read_bytes, read_directory, read_json, request
+from skill_server import BOTH, read_bytes, read_directory, read_json, request
 
 from kubed.mcp import QuickMCP
 from kubed.mcp._media import media_type, text_like, text_of
@@ -50,7 +50,7 @@ def with_files(tmp_path, files: dict[str, tuple[bytes, str]]) -> QuickMCP:
     root = copy(tmp_path)
     for name, (data, _) in files.items():
         (root / "skills/demo-guide" / name).write_bytes(data)
-    return served((root, None))
+    return served((root, None), config=BOTH)
 
 
 async def entry_rows(client) -> dict[str, dict]:
@@ -146,7 +146,7 @@ async def test_a_rewriter_sees_a_skills_json_and_yaml(tmp_path):  # PLUG-58
 async def test_the_prefix_reaches_a_skills_json(tmp_path):  # GW-5
     links = "skills/guide/references/links.json"
     tree = {**KIT_TREE, links: '{"see": "skill://lib/guide/SKILL.md"}'}
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     mcp.add_plugin(write(tmp_path / "kit", tree), namespace="lib")
     uri = "skill://lib/guide/references/links.json"
     async with over_http(mcp, header="kb+") as client:

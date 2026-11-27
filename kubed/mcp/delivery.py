@@ -170,12 +170,20 @@ def _take_listed(raw: str) -> frozenset[str]:
     return frozenset(named)
 
 
+_TOO_LONG = "a number of more than 10 digits"
+_BOUND = 10**10  # a whole number this large or larger is _TOO_LONG, never str()-ed
+
+
 def _take_max(raw: str) -> int | None:
-    """The cap ``raw`` gives: None for ``all``, else a whole number of 1 or more."""
+    """The cap ``raw`` gives: None for ``all``, else a whole number of 1 or more, at
+    most 10 digits. A longer one is refused before ``int()`` reads it, which Python
+    limits to 4300 digits."""
     value = raw.strip()
     if value.lower() == "all":
         return None
     if not (value.isascii() and value.isdecimal()):
+        raise ValueError(raw)
+    if len(value) > 10:
         raise ValueError(raw)
     count = int(value)
     if count < 1:
@@ -248,7 +256,8 @@ _INPUTS: Mapping[str, _Input] = MappingProxyType(
                 "max",
                 "max",
                 _take_max,
-                "it is a whole number of 1 or more, or all for no cap",
+                "it is a whole number of 1 or more, at most 10 digits, "
+                "or all for no cap",
                 100,
                 blank=False,
                 plus=False,
@@ -334,13 +343,24 @@ def _query(entry: _Input) -> Level:
     return level
 
 
+def _shown(value: object) -> str:
+    """``value`` as shown in a warning: a whole number of more than 10 digits is
+    ``_TOO_LONG``, not ``str()``-ed, which Python refuses past 4300 digits."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) >= _BOUND:
+        return _TOO_LONG
+    return str(value)[:64]
+
+
 def _raw(entry: _Input, value: object) -> str | None:
     """``value`` as a raw value of ``entry``: a string, or for ``Listed`` a collection
-    joined with ``,``, for ``Max`` a whole number. None when it is none of these."""
+    joined with ``,``, for ``Max`` a whole number. None when it is none of these.
+
+    A ``Max`` of more than 10 digits is compared as an int and never ``str()``-ed, which
+    Python refuses past 4300 digits: it is ``_TOO_LONG`` instead."""
     if isinstance(value, str):
         return value
     if entry.name == "Max" and isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
+        return _shown(value)
     if entry.name == "Listed" and isinstance(value, Collection):
         return ",".join(str(kind) for kind in value)
     return None
@@ -586,7 +606,7 @@ class _Resolver:
             value = given[attr]
             raws[attr] = raw = None if value is None else _raw(entry, value)
             if value is not None and raw is None:
-                source, shown = f"delivery_default {attr}", str(value)[:64]
+                source, shown = f"delivery_default {attr}", _shown(value)
                 if warn and _warn_once(source, shown):
                     _warning(source, shown, entry)
         return _Partial(**raws)
@@ -674,3 +694,23 @@ def _resolved() -> Resolved:
             if served is not None:
                 resolver = _RESOLVERS.get(served, _BARE)
     return resolver.resolve(request_values(), _client_info(None), _extensions(None))
+
+
+def _delivered() -> Resolved | None:
+    """The current request's resolution where a ``QuickMCP`` resolves delivery, and
+    None anywhere else.
+
+    Only ``QuickMCP`` resolves delivery: it is the open resolution, or the one
+    ``_resolved`` makes when the context's server is a ``QuickMCP``'s. A server mounted
+    on a ``QuickMCP`` is answered within the ``QuickMCP``'s request and follows its
+    resolution. A server no ``QuickMCP`` serves the request for, or no context at all,
+    gets None, and lists as FastMCP does (DLV-10).
+    """
+    current = _RESOLVED.get()
+    if current is not None:
+        return current[1]
+    try:
+        server = get_context().fastmcp
+    except RuntimeError:  # no context: no server
+        return None
+    return _resolved() if server in _RESOLVERS else None
