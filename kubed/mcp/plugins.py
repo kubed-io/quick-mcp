@@ -30,12 +30,13 @@ namespace merge, and a second thing at one address is refused.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import os
 import re
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -1768,7 +1769,7 @@ class Plugins:
         self._tools: _ResourceTools | None = None
         self._pointer: BinaryPointer | None = None
         self._state = _State(0, ())
-        self._view: Callable[[], View] | None = None
+        self._view: Callable[[], View | Awaitable[View]] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
         self._reader: CommandReader = read_command
         self._agent_meta: AgentMeta | None = None
@@ -1870,8 +1871,9 @@ class Plugins:
         (DLV-6), in place of any earlier one."""
         self._pointer = fn
 
-    def set_view(self, fn: Callable[[], View]) -> None:
-        """Makes ``fn`` the view, called once per request (PLUG-53)."""
+    def set_view(self, fn: Callable[[], View | Awaitable[View]]) -> None:
+        """Makes ``fn`` the view, called once per request and awaited when it returns
+        an awaitable (PLUG-53)."""
         self._view = fn
         self._memo = _Memo(OrderedDict(), {})  # last: no build of the old view is kept
 
@@ -1963,9 +1965,26 @@ class Plugins:
         what the request reads. The memo and the state are taken after it and before
         any await, and a build is stored only while its memo is still the server's, so
         a change made during a build is never stored where a later request finds it. A
-        view may serve; nothing else."""
-        view = self._view() if self._view else _EVERY
+        view may serve; nothing else. An async view's set is read after it returns,
+        like a sync one's."""
+        view = await self._call_view()
         return await self._pin_view(view)
+
+    async def _call_view(self) -> View:
+        """The one place a view is called. An awaitable result is awaited in the
+        caller's task, never in a thread, and a view replaced during that await is
+        called in its place."""
+        while True:
+            fn = self._view
+            if fn is None:
+                return _EVERY
+            view = fn()
+            if not inspect.isawaitable(view):
+                return view  # a sync view: today's path exactly
+            view = await view
+            if self._view is fn:
+                return view
+            # plugin_view landed while it awaited: the new view answers (new memo)
 
     async def _pin_view(self, view: View) -> _Pin:
         """The pin for ``view``: the memo and the state are taken, then the key, then
@@ -1992,7 +2011,7 @@ class Plugins:
             return None
         key = None
         try:
-            view = self._view() if self._view else _EVERY
+            view = await self._call_view()
             key = view.key
             return await self._pin_view(view)
         except Exception as exc:  # noqa: BLE001 - a count must never fail the handshake

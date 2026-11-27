@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import anyio
@@ -55,10 +56,23 @@ def plugin(tmp_path: Path, name: str) -> Path:
     )
 
 
-def scopes(tmp_path: Path) -> QuickMCP:
+def awaited(fn):
+    """``fn`` as a coroutine function that yields to the loop once, then answers."""
+
+    async def view():
+        await anyio.sleep(0)
+        return fn()
+
+    return view
+
+
+KINDS = {"sync": lambda fn: fn, "async": awaited}
+
+
+def scopes(tmp_path: Path, kind: str = "sync") -> QuickMCP:
     """Plugins ``one`` and ``two``, each under its own namespace, seen by scope."""
     mcp = served((plugin(tmp_path, "one"), "one"), (plugin(tmp_path, "two"), "two"))
-    mcp.plugin_view(scoped)
+    mcp.plugin_view(KINDS[kind](scoped))
     return mcp
 
 
@@ -75,7 +89,7 @@ async def over_http(mcp: QuickMCP, scope: str):
             yield client
 
 
-def counting(mcp: QuickMCP) -> list:
+def counting(mcp: QuickMCP, kind: str = "sync") -> list:
     """Each call of the view, admitting every plugin under one key."""
     calls: list = []
 
@@ -83,7 +97,7 @@ def counting(mcp: QuickMCP) -> list:
         calls.append(1)
         return View(None, lambda plugin: True)
 
-    mcp.plugin_view(view)
+    mcp.plugin_view(KINDS[kind](view))
     return calls
 
 
@@ -101,8 +115,9 @@ def slow_make(monkeypatch, mcp: QuickMCP) -> list:
     return made
 
 
-async def test_each_scope_is_served_its_plugins(tmp_path):
-    mcp = scopes(tmp_path)
+@pytest.mark.parametrize("kind", KINDS)
+async def test_each_scope_is_served_its_plugins(tmp_path, kind):
+    mcp = scopes(tmp_path, kind)
     async with over_http(mcp, "one") as client:
         assert await listed_by(client) == (
             ["one_wave"],
@@ -140,9 +155,10 @@ async def test_outside_the_view_fails_as_a_missing_one_does(tmp_path, method, pa
     assert failures[0] == failures[1]
 
 
-async def test_the_view_runs_once_per_request():
+@pytest.mark.parametrize("kind", KINDS)
+async def test_the_view_runs_once_per_request(kind):
     mcp = served((DEMO, None))
-    calls = counting(mcp)
+    calls = counting(mcp, kind)
 
     # Skills, an index and a prompt, in one request.
     @mcp.tool
@@ -319,7 +335,8 @@ async def test_a_new_view_is_not_served_an_old_build():  # Review Focus 2
         assert await client.list_prompts() == []
 
 
-async def test_a_set_the_view_serves_is_what_its_request_reads(tmp_path):
+@pytest.mark.parametrize("kind", KINDS)
+async def test_a_set_the_view_serves_is_what_its_request_reads(tmp_path, kind):
     mcp = served((DEMO, None))
     calls = []
 
@@ -331,7 +348,7 @@ async def test_a_set_the_view_serves_is_what_its_request_reads(tmp_path):
             mcp.serve(staging)
         return View(None, lambda plugin: True)
 
-    mcp.plugin_view(revalidate)
+    mcp.plugin_view(KINDS[kind](revalidate))
 
     @mcp.tool
     async def read_now(ctx: Context) -> str:
@@ -374,6 +391,7 @@ FAILING_VIEWS = {
     "raises": lambda: 1 / 0,
     "unhashable": lambda: View([], lambda plugin: True),
 }
+FAILING_VIEWS |= {f"{name}, async": awaited(fn) for name, fn in FAILING_VIEWS.items()}
 READS = [
     ("skills/list", {}),
     ("skills/get", {"uri": ENTRY}),
@@ -429,16 +447,17 @@ async def test_a_failure_to_pin_fails_the_request_over_http(
     assert caught.value.error.message == "Internal server error"
 
 
+@pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(("method", "params"), READS)
 async def test_a_view_that_raises_an_mcp_error_sends_it_whole(
-    method, params, mode
+    method, params, mode, kind
 ):  # PLUG-53
     def refuses() -> View:
         raise MCPError(code=-32001, message="not for you")
 
     mcp = served((DEMO, None))
-    mcp.plugin_view(refuses)
+    mcp.plugin_view(KINDS[kind](refuses))
     async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
             await request(client, method, **params)
@@ -546,3 +565,55 @@ async def test_a_pins_mcp_error_carries_nothing_of_the_requests_own_miss():  # P
         await scope.on_request(None, misses)
     assert caught.value is sent
     assert caught.value.__context__ is None
+
+
+SEEN: ContextVar[str | None] = ContextVar("SEEN", default=None)
+
+
+def marks() -> View:
+    SEEN.set("pinned")
+    return View(None, lambda plugin: True)
+
+
+async def test_a_context_variable_the_view_sets_is_kept_as_a_sync_views_is():
+    # Review Focus 5
+    seen = {}
+    for kind, wrap in KINDS.items():
+        SEEN.set(None)
+        mcp = served((DEMO, None))
+        mcp.plugin_view(wrap(marks))
+
+        @mcp.tool
+        async def read_back(ctx: Context) -> str:
+            await ctx.read_resource(ENTRY)
+            return str(SEEN.get())
+
+        async with Client(mcp.server) as client:
+            seen[kind] = (await client.call_tool("read_back", {})).data
+        await mcp._plugins.pinned()  # off a request, pinned in this very task
+        assert SEEN.get() == "pinned", kind  # awaited here: no thread, no task between
+    assert seen["async"] == seen["sync"]  # in a request, as a sync view's
+
+
+async def test_a_view_set_while_an_async_view_awaits_answers_in_its_place():
+    # Review Focus 2
+    mcp = served((DEMO, None))
+    entered, release, pins = anyio.Event(), anyio.Event(), []
+
+    async def old() -> View:
+        entered.set()
+        await release.wait()
+        return View("old", lambda plugin: True)
+
+    async def pin() -> None:
+        pins.append(await mcp._plugins.pinned())
+
+    mcp.plugin_view(old)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(pin)
+        await entered.wait()
+        mcp.plugin_view(lambda: View("new", lambda plugin: False))
+        release.set()
+    assert pins[0].view.key == "new"
+    assert pins[0].build.admitted == ()
+    assert [key[1] for key in mcp._plugins._memo.builds] == ["new"]
