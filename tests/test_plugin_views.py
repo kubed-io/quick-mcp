@@ -586,16 +586,16 @@ async def test_a_context_variable_the_view_sets_is_kept_as_a_sync_views_is():
         mcp = served((DEMO, None))
         mcp.plugin_view(wrap(marks))
 
-        @mcp.tool
-        async def read_back(ctx: Context) -> str:
-            await ctx.read_resource(ENTRY)
-            return str(SEEN.get())
+        def record(site, text, kind=kind):
+            seen[kind] = SEEN.get()  # while the read is served, after the pin
+            return text
 
+        mcp.add_rewriter(record)
         async with Client(mcp.server) as client:
-            seen[kind] = (await client.call_tool("read_back", {})).data
+            await client.read_resource(ENTRY)
         await mcp._plugins.pinned()  # off a request, pinned in this very task
         assert SEEN.get() == "pinned", kind  # awaited here: no thread, no task between
-    assert seen["async"] == seen["sync"]  # in a request, as a sync view's
+    assert seen == {"sync": "pinned", "async": "pinned"}  # in a request, as a sync view's
 
 
 async def test_a_view_set_while_an_async_view_awaits_answers_in_its_place():

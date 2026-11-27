@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Listings show at most 100 skills by default, set with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
+- A plugin view may be async, so it can wait on I/O without holding the event loop.
 - Call metrics time listings: `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`, `skills/list`, `agents/list` and `server/discover`.
 
 ### Changed
