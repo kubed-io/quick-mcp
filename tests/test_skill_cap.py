@@ -404,7 +404,7 @@ async def test_list_resources_is_cut(tmp_path):  # DLV-6
     )
 
 
-async def test_local_listing_skills_keeps_the_same_room(tmp_path):  # Dr K, call 3
+async def test_local_listing_skills_keeps_the_same_room(tmp_path):
     headers = {"X-MCP-Via": "local", "X-MCP-Listed": "skills"}
     async with over_http(
         capped(tmp_path, ("a", 101), own=3), headers=headers

@@ -27,13 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Listings show at most 100 skills by default, set with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
+- Cap listed skills with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
 - A plugin view may be async, so it can wait on I/O without holding the event loop.
 - Call metrics time listings: `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`, `skills/list`, `agents/list` and `server/discover`.
 
 ### Changed
 
 - Skill, prompt and agent file reads are charted by pattern, library and plugin, not one series per file.
+- `skills/list` and `resources/list` show at most 100 skills by default; set `delivery.max: all` to list them all.
+- `run()` refuses `uvicorn_config['timeout_graceful_shutdown']`; set `serving.graceful_timeout` (15 s by default) instead.
 
 ### Fixed
 
