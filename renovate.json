@@ -1,0 +1,10 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "description": "Hold the interpreter at 3.14: pyroscope-io (kubed-mcp[telemetry], which [test] pulls in) ships no cp315 wheel, and its sdist needs a Rust toolchain, so on 3.15 both `pip install .[test,tasks]` in test.yml and the Dependency Audit's `pip install --editable '.[telemetry]'` in lint.yml fail. Lift this rule once pyroscope-io publishes cp315 wheels, then move lint.yml, package.yml, the test.yml matrix, the pyproject classifiers and spec PKG-8 to 3.15 together.",
+      "matchDepNames": ["python"],
+      "allowedVersions": "<3.15"
+    }
+  ]
+}
