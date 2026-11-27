@@ -10,7 +10,14 @@ import functools
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
@@ -23,6 +30,7 @@ from starlette.routing import WebSocketRoute
 from ._builtins import DeliverySettings, ServingSettings, _builtin_components
 from ._config import Config, LoadedConfig, Source, load_config
 from ._handshake import _Describe
+from ._shutdown import _listen_ender, _stop_hook
 from .components import Component, _start_all, _stop_all, _what
 from .container import (
     _CALL,
@@ -59,6 +67,7 @@ from .plugins import (
 T = TypeVar("T")
 P = ParamSpec("P")
 R = TypeVar("R")
+_ViewFn = TypeVar("_ViewFn", bound=Callable[[], "View | Awaitable[View]"])
 
 # ``singleton``'s ``instance`` when none is given: ``None`` may be one.
 _UNSET: Any = object()
@@ -157,24 +166,36 @@ def _refuse_serving_options(
 ) -> None:
     """Refuse a serving setting passed to ``run()``: it is the config's to set.
 
-    Given one, FastMCP would serve stdio with it unread, or take it twice. The error
-    names the first such key and where it is set: the field's own env var and flag,
-    read from the loaded class, so a subclass's names are the ones shown.
+    Given one, FastMCP would serve stdio with it unread, or take it twice. A
+    ``uvicorn_config`` holding ``timeout_graceful_shutdown`` is refused the same way,
+    as ``serving.graceful_timeout`` sets it. The error names the first such key and
+    where it is set: the field's own env var and flag, read from the loaded class, so
+    a subclass's names are the ones shown.
     """
     for key in http_options:
         if key == "show_banner":
             raise TypeError("run() takes no 'show_banner': no banner is ever printed")
-        if key not in ("transport", "host", "port", "log_level"):
-            continue
-        extra = type(serving).model_fields[key].json_schema_extra
-        names = [
-            extra[k] for k in ("env", "arg") if isinstance(extra, dict) and k in extra
-        ]
+        if key in ("transport", "host", "port", "log_level"):
+            raise TypeError(f"run() takes no {key!r}: {_set_it(serving, key)}")
+    uvicorn_config = http_options.get("uvicorn_config")
+    if isinstance(uvicorn_config, Mapping) and (
+        "timeout_graceful_shutdown" in uvicorn_config
+    ):
         raise TypeError(
-            f"run() takes no {key!r}: set serving.{key} in the config "
-            f"({', '.join([*names, 'a serving: file key'])}) or through "
-            "hooks={'serving': ...}"
+            "run() takes no uvicorn_config['timeout_graceful_shutdown']: "
+            f"{_set_it(serving, 'graceful_timeout')}"
         )
+
+
+def _set_it(serving: ServingSettings, field: str) -> str:
+    """Where ``serving.<field>`` is set: its env var and flag, a file key, a hook."""
+    extra = type(serving).model_fields[field].json_schema_extra
+    names = [extra[k] for k in ("env", "arg") if isinstance(extra, dict) and k in extra]
+    return (
+        f"set serving.{field} in the config "
+        f"({', '.join([*names, 'a serving: file key'])}) or through "
+        "hooks={'serving': ...}"
+    )
 
 
 class QuickMCP:
@@ -329,7 +350,7 @@ class QuickMCP:
         # Inside the resolution, so the handshake echoes and is written for this
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
-        self.add_middleware(_Describe(lambda: self._instructions))
+        self.add_middleware(_Describe(lambda: self._instructions, self._plugins))
         # Claimed only once every argument has passed: from here on a component may
         # have registered, so the load stays claimed.
         loaded._claim()
@@ -477,7 +498,7 @@ class QuickMCP:
         """How many sets this server has served: 0 until a set is first served."""
         return self._plugins.generation
 
-    def plugin_view(self, fn: Callable[[], View]) -> Callable[[], View]:
+    def plugin_view(self, fn: _ViewFn) -> _ViewFn:
         """Sets the server's view, and returns ``fn``, so it works as a decorator
         (PLUG-53).
 
@@ -485,8 +506,14 @@ class QuickMCP:
         (``request_values()``). Its ``View`` says which plugins the request is served:
         one it does not admit is absent for that request. ``admits`` runs only when a
         build is made, once per generation and view key, so the key must decide what
-        it admits. A set ``fn()`` serves with ``serve()`` is the one that request
-        reads. A ``fn()`` that raises fails the request with its error.
+        it admits.
+
+        ``fn`` may be a coroutine function: its result is awaited inside the request,
+        and a set it serves with ``serve()``, after any await, is the one that request
+        reads. A synchronous ``fn`` runs on the event loop and must not block: I/O
+        goes in an async view. A ``fn()`` that raises fails the request with ``-32603``
+        "Internal server error", and one that raises an ``MCPError`` fails it with
+        that error.
         """
         self._plugins.set_view(fn)
         return fn
@@ -663,7 +690,11 @@ class QuickMCP:
         handler first only when it has none.
 
         ``http_options`` go to FastMCP's HTTP transport (``path``, ``middleware``,
-        ``uvicorn_config``) and are not used on stdio. The log level is never
+        ``uvicorn_config``) and are not used on stdio. On HTTP, ``uvicorn_config``
+        gets ``timeout_graceful_shutdown`` from ``serving.graceful_timeout``, and
+        ``middleware`` gets the listen-ender first, ahead of the caller's: when the
+        server begins to stop, open ``subscriptions/listen`` streams end cleanly
+        while other requests get the timeout to finish. The log level is never
         passed on: given one, FastMCP's run puts its own handlers back on its logger
         and stops it propagating, for the life of the process.
 
@@ -671,8 +702,9 @@ class QuickMCP:
 
         Raises:
             TypeError: ``http_options`` holds a serving setting, ``transport``,
-                ``host``, ``port``, ``log_level`` or ``show_banner``: those are the
-                config's, and nothing runs.
+                ``host``, ``port``, ``log_level`` or ``show_banner``, or a
+                ``uvicorn_config`` holding ``timeout_graceful_shutdown``: those are
+                the config's, and nothing runs.
         """
         serving = cast(ServingSettings, self._provided[ServingSettings])
         _refuse_serving_options(serving, http_options)
@@ -685,10 +717,21 @@ class QuickMCP:
         if serving.transport == "stdio":
             self.server.run(transport="stdio", show_banner=False)
             return
-        self.server.run(
-            transport=serving.transport,
-            host=serving.host,
-            port=serving.port,
-            show_banner=False,
-            **http_options,
-        )
+        with _stop_hook() as stop:
+            self.server.run(
+                transport=serving.transport,
+                host=serving.host,
+                port=serving.port,
+                show_banner=False,
+                **{
+                    **http_options,
+                    "uvicorn_config": {
+                        **(http_options.get("uvicorn_config") or {}),
+                        "timeout_graceful_shutdown": serving.graceful_timeout,
+                    },
+                    "middleware": [
+                        _listen_ender(stop),
+                        *(http_options.get("middleware") or []),
+                    ],
+                },
+            )

@@ -37,7 +37,14 @@ from kubed.mcp.request import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BinaryPointer", "Delivery", "DeliveryDefault", "Instructions", "Resolved"]
+__all__ = [
+    "BinaryPointer",
+    "Delivery",
+    "DeliveryDefault",
+    "Instructions",
+    "Resolved",
+    "SkillCount",
+]
 
 # A letter, then letters, digits, +, - or ., ending in +: 64 characters at most.
 _PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,62}\+")
@@ -89,6 +96,8 @@ class Delivery(Protocol):
     def listed(self) -> str | Collection[str] | None: ...
     @property
     def via(self) -> str | None: ...
+    @property
+    def max(self) -> int | str | None: ...
 
 
 # A server's defaults for a client, given its clientInfo or None (DLV-14).
@@ -102,6 +111,7 @@ class _Partial:
     resources: str | None = None
     listed: str | None = None
     via: str | None = None
+    max: str | None = None
 
 
 # kubed-mcp's known clients, by a prefix of clientInfo.name, the longest winning
@@ -158,6 +168,19 @@ def _take_listed(raw: str) -> frozenset[str]:
     if not named:
         raise ValueError(raw)
     return frozenset(named)
+
+
+def _take_max(raw: str) -> int | None:
+    """The cap ``raw`` gives: None for ``all``, else a whole number of 1 or more."""
+    value = raw.strip()
+    if value.lower() == "all":
+        return None
+    if not (value.isascii() and value.isdecimal()):
+        raise ValueError(raw)
+    count = int(value)
+    if count < 1:
+        raise ValueError(raw)
+    return count
 
 
 @dataclass(frozen=True)
@@ -220,6 +243,16 @@ _INPUTS: Mapping[str, _Input] = MappingProxyType(
                 blank=False,
                 plus=False,
             ),
+            _Input(
+                "Max",
+                "max",
+                "max",
+                _take_max,
+                "it is a whole number of 1 or more, or all for no cap",
+                100,
+                blank=False,
+                plus=False,
+            ),
         )
     }
 )
@@ -230,13 +263,23 @@ _ATTRS: Mapping[str, _Input] = MappingProxyType(
 
 
 @dataclass(frozen=True)
+class SkillCount:
+    """How many skills a request lists and how many its cap cuts."""
+
+    listed: int
+    cut: int
+
+
+@dataclass(frozen=True)
 class Resolved:
     """What one request resolved its inputs to (DLV-11).
 
     ``resources`` is ``"on"`` or ``"off"``, ``listed`` the kinds ``resources/list``
     shows, ``via`` ``"mcp"``, ``"extension"`` or ``"local"``, and ``prefix`` the
     gateway prefix or None. ``extensions`` is the extension ids the client declares,
-    or None when the request does not say.
+    or None when the request does not say. ``max`` is the cap on listed skills, None
+    for none (DLV-17), and ``skills`` what the handshake counted for an instructions fn
+    (DLV-11).
     """
 
     resources: Literal["on", "off"]
@@ -244,6 +287,8 @@ class Resolved:
     via: Literal["mcp", "extension", "local"]
     prefix: str | None
     extensions: frozenset[str] | None = None
+    max: int | None = 100
+    skills: SkillCount | None = None
 
 
 # A server's instructions for a request, given what it resolved, or None (DLV-11).
@@ -257,6 +302,7 @@ def _echo(r: Resolved) -> dict:
         "listed": [kind for kind in _ECHO_ORDER if kind in r.listed],
         "via": r.via,
         "prefix": r.prefix,
+        "max": "all" if r.max is None else r.max,
     }
 
 
@@ -290,9 +336,11 @@ def _query(entry: _Input) -> Level:
 
 def _raw(entry: _Input, value: object) -> str | None:
     """``value`` as a raw value of ``entry``: a string, or for ``Listed`` a collection
-    joined with ``,``. None when it is neither."""
+    joined with ``,``, for ``Max`` a whole number. None when it is none of these."""
     if isinstance(value, str):
         return value
+    if entry.name == "Max" and isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
     if entry.name == "Listed" and isinstance(value, Collection):
         return ",".join(str(kind) for kind in value)
     return None
@@ -507,6 +555,7 @@ class _Resolver:
             via=via,
             prefix=walk("Resource-Prefix"),
             extensions=extensions,
+            max=walk("Max"),
         )
 
     def _answer(self, client: Implementation | None, warn: bool) -> _Partial | None:

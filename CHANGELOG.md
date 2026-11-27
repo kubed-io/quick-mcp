@@ -25,13 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Cap listed skills with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
+- A plugin view may be async, so it can wait on I/O without holding the event loop.
+- Call metrics time listings: `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`, `skills/list`, `agents/list` and `server/discover`.
+
 ### Changed
 
 - Skill, prompt and agent file reads are charted by pattern, library and plugin, not one series per file.
+- `skills/list` and `resources/list` show at most 100 skills by default; set `delivery.max: all` to list them all.
+- `run()` refuses `uvicorn_config['timeout_graceful_shutdown']`; set `serving.graceful_timeout` (15 s by default) instead.
 
 ### Fixed
 
+- `resources/directory/read` results carry `resultType: "complete"`, as SEP-2640 has them.
 - A plugin no longer logs a warning for each `SKILL.md` that isn't one of its skills, such as a sibling plugin's in a shared `skills/` folder.
+- A server that stops with clients connected ends their listen streams cleanly and gives in-flight calls 15 s (`serving.graceful_timeout`).
+- A request whose plugin view or build fails answers `-32603` on every protocol; raise an `MCPError` to send your own.
 
 ## [0.5.2] - 2026-11-27
 

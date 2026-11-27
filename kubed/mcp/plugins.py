@@ -30,17 +30,18 @@ namespace merge, and a second thing at one address is refused.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import os
 import re
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NoReturn, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlparse
 
 import anyio
@@ -53,7 +54,9 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool
 from fastmcp.utilities.versions import VersionSpec, version_sort_key
-from mcp_types import TextContent
+from mcp_types import INTERNAL_ERROR, TextContent
+
+from mcp.shared.exceptions import MCPError
 
 from . import gateway, skills
 from ._media import text_of
@@ -77,9 +80,10 @@ from .agents import (
     served_as,
 )
 from .agents import usable_name as _usable
-from .delivery import BinaryPointer, _resolved
+from .delivery import BinaryPointer, SkillCount, _resolved
 from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
+from .request import _warn_once
 
 __all__ = [
     "AgentFile",
@@ -615,6 +619,23 @@ class _Served:
     read_agents: tuple[_File, ...]
 
 
+def _room(own: int, cap: int | None) -> int | None:
+    """What the cap leaves the plugins' skills after the server's ``own``: None for no
+    cap (DLV-17)."""
+    return None if cap is None else max(0, cap - own)
+
+
+def _count(own: int, plugin: int, cap: int | None, via: str) -> SkillCount:
+    """How many skills ``skills/list`` holds, and how many the cap cuts, for a server
+    with ``own`` skills of its own and ``plugin`` from its plugins (DLV-17). Under
+    ``local`` the plugins' skills are unlisted, and none is cut."""
+    if via == "local":
+        return SkillCount(own, 0)
+    room = _room(own, cap)
+    kept = plugin if room is None else min(room, plugin)
+    return SkillCount(own + kept, plugin - kept)
+
+
 class _Skills(skills.EntryOnlySkillProvider):
     """The server's one skills provider: the skills of the request's build, in the
     order their plugins were added."""
@@ -631,15 +652,29 @@ class _Skills(skills.EntryOnlySkillProvider):
         if "skills" not in _resolved().listed:
             return []
         # The rows are the build's, made once with it (PLUG-55); the gate above stays
-        # per request.
-        return list((await self._plugins.pinned()).build.entries)
+        # per request. The cap keeps the first ``room`` of them, in the build's order
+        # (DLV-17). Counting the room reads the request manifests, never a listing
+        # (#86).
+        entries = (await self._plugins.pinned()).build.entries
+        return list(entries[: await self._room_left()])
 
     async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
         # skills/list asks this, and skills/get its own _get_skill_entry, so under
         # local the plugins' skills are unlisted and still answer (DLV-9, DLV-10).
         if _resolved().via == "local":
             return []
-        return await super()._list_skill_entries(context)
+        # FastMCP gives the entries in the catalogue's order, which is the order rule
+        # (DLV-17), and merges, sorts and pages after this: the cut is across the
+        # whole listing.
+        entries = await super()._list_skill_entries(context)
+        return list(entries)[: await self._room_left()]
+
+    async def _room_left(self) -> int | None:
+        """How many of the plugins' skills the cap lets the listing hold, or None."""
+        cap = _resolved().max
+        if cap is None:
+            return None
+        return _room(await skills._own_count(self._plugins._server, self), cap)
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
@@ -1116,6 +1151,11 @@ class _PinScope(Middleware):
     open and shares it. FastMCP logs and swallows what a provider raises, so an error
     stored in the slot is raised again here, after the request is handled, in place of
     whatever the request made of its absence (an unknown skill, say).
+
+    It is raised as an ``MCPError``, so both protocol eras answer alike (the legacy
+    one would send code 0 and the error's text for anything else): an ``MCPError`` the
+    pin raised goes through whole, and any other failure is ``-32603`` "Internal
+    server error", the original logged once, at error, with its traceback.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -1133,13 +1173,27 @@ class _PinScope(Middleware):
         except Exception:
             if slot.error is None:
                 raise
-            raise slot.error from None
+            result = None  # the pin's failure is what the request fails with
         finally:
             if token is not None:
                 _PINS.reset(token)
         if slot.error is not None:
-            raise slot.error
+            self._fail(slot.error, token is not None)
         return result
+
+    @staticmethod
+    def _fail(error: Exception, owner: bool) -> NoReturn:
+        """Fail the request for its pin's ``error``: raised as it is if an ``MCPError``,
+        else as an internal error, the original logged here and nowhere else (the SDK
+        logs only what it is not handed an ``MCPError`` for). Only the scope that opened
+        the slot logs: one nested in it shares the slot and just raises."""
+        if isinstance(error, MCPError):
+            raise error
+        if owner:
+            log.error(
+                "plugin pin failed: %s: %s", type(error).__name__, error, exc_info=error
+            )
+        raise MCPError(code=INTERNAL_ERROR, message="Internal server error") from error
 
 
 @dataclass
@@ -1715,7 +1769,7 @@ class Plugins:
         self._tools: _ResourceTools | None = None
         self._pointer: BinaryPointer | None = None
         self._state = _State(0, ())
-        self._view: Callable[[], View] | None = None
+        self._view: Callable[[], View | Awaitable[View]] | None = None
         self._rewriters: tuple[Rewriter, ...] = ()
         self._reader: CommandReader = read_command
         self._agent_meta: AgentMeta | None = None
@@ -1817,8 +1871,9 @@ class Plugins:
         (DLV-6), in place of any earlier one."""
         self._pointer = fn
 
-    def set_view(self, fn: Callable[[], View]) -> None:
-        """Makes ``fn`` the view, called once per request (PLUG-53)."""
+    def set_view(self, fn: Callable[[], View | Awaitable[View]]) -> None:
+        """Makes ``fn`` the view, called once per request and awaited when it returns
+        an awaitable (PLUG-53)."""
         self._view = fn
         self._memo = _Memo(OrderedDict(), {})  # last: no build of the old view is kept
 
@@ -1910,13 +1965,82 @@ class Plugins:
         what the request reads. The memo and the state are taken after it and before
         any await, and a build is stored only while its memo is still the server's, so
         a change made during a build is never stored where a later request finds it. A
-        view may serve; nothing else."""
-        view = self._view() if self._view else _EVERY
+        view may serve; nothing else. An async view's set is read after it returns,
+        like a sync one's."""
+        view = await self._call_view()
+        return await self._pin_view(view)
+
+    async def _call_view(self) -> View:
+        """The one place a view is called. An awaitable result is awaited in the
+        caller's task, never in a thread, and a view replaced during that await is
+        called in its place."""
+        while True:
+            fn = self._view
+            if fn is None:
+                return _EVERY
+            view = fn()
+            if not inspect.isawaitable(view):
+                return view  # a sync view: today's path exactly
+            view = await view
+            if self._view is fn:
+                return view
+            # plugin_view landed while it awaited: the new view answers (new memo)
+
+    async def _pin_view(self, view: View) -> _Pin:
+        """The pin for ``view``: the memo and the state are taken, then the key, then
+        the build."""
         memo = self._memo
         state = self._state
         key = self._key(state, view, gateway.prefix())
         build = await self._build_for(memo, state, view, key)
         return _Pin(state, view, key, build)
+
+    async def _quiet_pin(self) -> _Pin | None:
+        """The request's pin for a reader that must not fail it, or None.
+
+        The slot's pin when it holds one, and None when it holds an error, which fails
+        the request anyway. Otherwise a pin made outside the slot, through the same
+        build cache the request's readers share, so the first reader later finds the
+        build kept; its failure is never stored there, only logged once per view and
+        error (the handshake has no session, so that is across the server).
+        """
+        slot = (_PINS.get() or {}).get(self)
+        if slot is not None and slot.pin is not None:
+            return slot.pin
+        if slot is not None and slot.error is not None:
+            return None
+        key = None
+        try:
+            view = await self._call_view()
+            key = view.key
+            return await self._pin_view(view)
+        except Exception as exc:  # noqa: BLE001 - a count must never fail the handshake
+            detail = f"{type(exc).__name__}: {exc}"
+            if _warn_once(f"skill count {key!r}", detail):
+                log.error(
+                    "skill count skipped for view %r: %s: %s; "
+                    "the instructions get no count",
+                    key,
+                    type(exc).__name__,
+                    exc,
+                )
+            return None
+
+    async def skill_count(self) -> SkillCount | None:
+        """How many skills ``skills/list`` holds and how many the cap cuts, for the
+        request's handshake, or None when it cannot be told (DLV-17). It reads the
+        cached build and the request's manifests, and runs no listing. Under ``local``
+        it counts no plugin skill, so it pins no build."""
+        own = await skills._own_count(self._server, self._skills)
+        resolved = _resolved()
+        if self._skills is None:
+            return _count(own, 0, resolved.max, resolved.via) if own else None
+        if resolved.via == "local":
+            return _count(own, 0, resolved.max, resolved.via)
+        pin = await self._quiet_pin()
+        if pin is None:
+            return None
+        return _count(own, len(pin.build.entries), resolved.max, resolved.via)
 
     async def _build_for(
         self, memo: _Memo, state: _State, view: View, key: _Key

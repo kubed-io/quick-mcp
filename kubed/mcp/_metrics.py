@@ -1,12 +1,14 @@
-"""Resource reads in the call metrics, labelled ``mcp.resource.template``: imported only
-when ``otel`` is on.
+"""Resource reads and listings in the call metrics: imported only when ``otel`` is on.
 
 FastMCP's ``UsageMiddleware`` records tool calls and prompt renders; ``_CallMetrics``
-records ``resources/read`` too. The label crosses two middlewares. The metrics are
-outermost, to record what the client received, but only a middleware inside the pin and
-the prefix sees the plain URI, under the request's pinned build. So ``_ReadObserver``
-sits there and writes the label into a holder the metrics leave in ``_MATCHED``, and the
-metrics' histogram reads it back as the read's point is recorded.
+records ``resources/read`` too, labelled ``mcp.resource.template``, and the seven
+listings, each by its method alone.
+
+A read's label crosses two middlewares. The metrics are outermost, to record what the
+client received, but only a middleware inside the pin and the prefix sees the plain URI,
+under the request's pinned build. So ``_ReadObserver`` sits there and writes the label
+into a holder the metrics leave in ``_MATCHED``, and the metrics' histogram reads it
+back as the read's point is recorded.
 
 The plugin layer is asked first, from the pinned build's maps: a file it serves is
 labelled by a bounded pattern, with the library and plugin that serve it
@@ -45,6 +47,10 @@ log = logging.getLogger(__name__)
 _TEMPLATE = "mcp.resource.template"
 _LIBRARY = "kubed.plugin.library"
 _PLUGIN = "kubed.plugin.name"
+# The listings with no typed hook: the root dispatch runs only on_message and on_request
+# for them. Every other request passes on_request through, a component one included,
+# which also runs it beside its typed hook.
+_EXTENSION_LISTINGS = frozenset({"skills/list", "agents/list"})
 
 
 @dataclass
@@ -107,12 +113,16 @@ def _takes_the_reads(record: Any) -> bool:
 
 
 class _CallMetrics(UsageMiddleware):
-    """FastMCP's call metrics, with ``resources/read`` recorded too.
+    """FastMCP's call metrics, with ``resources/read`` and the listings recorded too.
+
+    A listing (``tools/list``, ``resources/list``, ``resources/templates/list``,
+    ``prompts/list``, ``server/discover``, ``skills/list``, ``agents/list``) is one
+    point labelled by its method and nothing that names what it listed.
 
     It uses two private names of FastMCP's UsageMiddleware, ``_record`` and
     ``_duration``. Without them, or with a ``_record`` that no longer takes the keywords
-    the reads pass, it logs one warning and reads pass straight through: tools and
-    prompts are still recorded.
+    the reads pass, it logs one warning and reads and listings pass straight through:
+    tools and prompts are still recorded.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -125,24 +135,47 @@ class _CallMetrics(UsageMiddleware):
             self._duration = _Labelled(duration)
         else:
             log.warning(
-                "Resource reads are not in the call metrics: "
+                "Resource reads and listings are not in the call metrics: "
                 "FastMCP's UsageMiddleware has changed"
             )
 
-    async def on_read_resource(self, context: Any, call_next: Any) -> Any:
+    async def _unnamed(
+        self, context: Any, call_next: Any, method: str, matched: _Matched | None
+    ) -> Any:
+        """Record ``method`` with no name; only a read's ``matched`` adds a label."""
         if not self._reads:
             return await call_next(context)
-        token = _MATCHED.set(_Matched())
+        token = _MATCHED.set(matched)
         try:
             return await self._record(
-                context,
-                call_next,
-                method="resources/read",
-                name_attribute=_TEMPLATE,
-                name="",
+                context, call_next, method=method, name_attribute=_TEMPLATE, name=""
             )
         finally:
             _MATCHED.reset(token)
+
+    async def on_read_resource(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "resources/read", _Matched())
+
+    async def on_list_tools(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "tools/list", None)
+
+    async def on_list_resources(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "resources/list", None)
+
+    async def on_list_resource_templates(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "resources/templates/list", None)
+
+    async def on_list_prompts(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "prompts/list", None)
+
+    async def on_discover(self, context: Any, call_next: Any) -> Any:
+        return await self._unnamed(context, call_next, "server/discover", None)
+
+    async def on_request(self, context: Any, call_next: Any) -> Any:
+        method = getattr(context, "method", None)
+        if method not in _EXTENSION_LISTINGS:
+            return await call_next(context)
+        return await self._unnamed(context, call_next, method, None)
 
     def observe(self, server: FastMCP, plugins: Plugins) -> None:
         """Put the read observer right after the prefix, or last without one.
