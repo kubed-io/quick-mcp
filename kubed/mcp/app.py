@@ -10,7 +10,14 @@ import functools
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
@@ -60,6 +67,7 @@ from .plugins import (
 T = TypeVar("T")
 P = ParamSpec("P")
 R = TypeVar("R")
+_ViewFn = TypeVar("_ViewFn", bound=Callable[[], "View | Awaitable[View]"])
 
 # ``singleton``'s ``instance`` when none is given: ``None`` may be one.
 _UNSET: Any = object()
@@ -490,7 +498,7 @@ class QuickMCP:
         """How many sets this server has served: 0 until a set is first served."""
         return self._plugins.generation
 
-    def plugin_view(self, fn: Callable[[], View]) -> Callable[[], View]:
+    def plugin_view(self, fn: _ViewFn) -> _ViewFn:
         """Sets the server's view, and returns ``fn``, so it works as a decorator
         (PLUG-53).
 
@@ -498,8 +506,14 @@ class QuickMCP:
         (``request_values()``). Its ``View`` says which plugins the request is served:
         one it does not admit is absent for that request. ``admits`` runs only when a
         build is made, once per generation and view key, so the key must decide what
-        it admits. A set ``fn()`` serves with ``serve()`` is the one that request
-        reads. A ``fn()`` that raises fails the request with its error.
+        it admits.
+
+        ``fn`` may be a coroutine function: its result is awaited inside the request,
+        and a set it serves with ``serve()``, after any await, is the one that request
+        reads. A synchronous ``fn`` runs on the event loop and must not block: I/O
+        goes in an async view. A ``fn()`` that raises fails the request with ``-32603``
+        "Internal server error", and one that raises an ``MCPError`` fails it with
+        that error.
         """
         self._plugins.set_view(fn)
         return fn

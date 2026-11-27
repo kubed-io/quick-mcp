@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from fastmcp import Client
 from fastmcp.skills.provider import SkillManifestProvider
@@ -598,6 +599,11 @@ async def test_a_failing_count_leaves_skills_none(tmp_path, monkeypatch, caplog)
     ]
 
 
+async def _view_raises_async() -> View:
+    await anyio.sleep(0)
+    raise RuntimeError("view down")
+
+
 def _view_raises() -> View:
     raise RuntimeError("view down")
 
@@ -611,7 +617,7 @@ def _build_fails() -> View:
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
-    ("view", "key"), [(_view_raises, None), (_build_fails, "broken")]
+    ("view", "key"), [(_view_raises, None), (_view_raises_async, None), (_build_fails, "broken")]
 )
 async def test_a_failing_pin_leaves_the_count_out(
     tmp_path, caplog, mode, view, key
@@ -649,3 +655,18 @@ async def test_local_counts_without_the_view(tmp_path, caplog, mode):
             pass
     assert got[0].skills == SkillCount(2, 0)
     assert not [r for r in caplog.records if "skill count" in r.getMessage()]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_async_view_is_counted(tmp_path, mode):  # Review Focus 3
+    mcp = capped(tmp_path, ("a", 101))
+
+    async def every() -> View:
+        await anyio.sleep(0)
+        return View(None, lambda plugin: True)
+
+    mcp.plugin_view(every)
+    got = seen_by(mcp)
+    async with over_http(mcp, mode=mode):
+        pass
+    assert got[0].skills == SkillCount(100, 1)
