@@ -408,13 +408,22 @@ MODES = ["auto", "legacy"]  # the protocol eras, as tests/test_sep_2640.py
 FAILURES = [*FAILING_VIEWS, "make"]
 
 
-def failing(monkeypatch, failure) -> QuickMCP:
-    mcp = served((DEMO, None))
+def failing(monkeypatch, failure, via: str = "mcp") -> QuickMCP:
+    mcp = served((DEMO, None), config={"delivery": {"via": via}})
     if failure == "make":
         monkeypatch.setattr(type(mcp._plugins), "_make", broken_make)
     else:
         mcp.plugin_view(FAILING_VIEWS[failure])
     return mcp
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_extension_prompts_list_pins(monkeypatch, mode):  # Review Focus 4
+    mcp = failing(monkeypatch, "make", via="extension")
+    async with Client(mcp.server, mode=mode) as client:
+        with pytest.raises(MCPError) as caught:
+            await client.list_prompts()
+    assert caught.value.error.code == INTERNAL_ERROR
 
 
 @pytest.mark.parametrize("mode", MODES)

@@ -699,8 +699,8 @@ class _Prompts(Provider):
         self._plugins = plugins
 
     async def _list_prompts(self) -> list[Prompt]:
-        # Listed under mcp alone; prompts/get finds every one (DLV-9, DLV-10).
-        if _resolved().via != "mcp":
+        # Unlisted under local alone, and prompts/get finds every one (DLV-9, DLV-10).
+        if _resolved().via == "local":
             return []
         return list((await self._plugins.pinned()).build.prompts)
 

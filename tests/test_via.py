@@ -96,12 +96,12 @@ async def test_local_lists_none_of_the_plugins(tmp_path, by):
     assert got["resources"] == sorted([own, OWN_STATE])
 
 
-async def test_extension_drops_prompts_and_keeps_the_extensions(tmp_path):
+async def test_extension_lists_the_plugins_prompts(tmp_path):
     mcp = make(tmp_path)
     own = await own_skill(mcp)
     async with over_http(mcp, headers={"X-MCP-Via": "extension"}) as client:
         got = await lists(client)
-    assert got["prompts"] == [OWN_PROMPT]
+    assert got["prompts"] == sorted([*PLUGIN_PROMPTS, OWN_PROMPT])
     assert got["skills"] == sorted([*PLUGIN_SKILLS, own])
     assert got["agents"] == PLUGIN_AGENTS
     assert not any(u.startswith(PLUGIN_SCHEMES) for u in got["resources"])
@@ -186,7 +186,9 @@ async def test_an_explicit_listed_beats_the_preset(tmp_path, via):
     assert set(PLUGIN_SKILLS) <= set(got["resources"])
     assert AGENT_FILE in got["resources"]
     assert PROMPT_FILE not in got["resources"]
-    assert got["prompts"] == [OWN_PROMPT]
+    assert got["prompts"] == (
+        sorted([*PLUGIN_PROMPTS, OWN_PROMPT]) if via == "extension" else [OWN_PROMPT]
+    )
 
 
 async def test_a_client_via_beats_a_config_listed(tmp_path):
