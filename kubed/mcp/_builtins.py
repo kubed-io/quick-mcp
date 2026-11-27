@@ -63,6 +63,16 @@ class ServingSettings(Config):
         env="LOG_LEVEL",
         arg="--log-level",
     )
+    graceful_timeout: float = Field(
+        15,
+        ge=0,
+        doc=(
+            "Seconds in-flight HTTP requests get to finish when the server stops; "
+            "stdio doesn't read it."
+        ),
+        env="GRACEFUL_TIMEOUT",
+        arg="--graceful-timeout",
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod

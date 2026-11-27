@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A plugin no longer logs a warning for each `SKILL.md` that isn't one of its skills, such as a sibling plugin's in a shared `skills/` folder.
+- A server that stops with clients connected ends their listen streams cleanly and gives in-flight calls 15 s (`serving.graceful_timeout`).
 
 ## [0.5.2] - 2026-11-27
 
