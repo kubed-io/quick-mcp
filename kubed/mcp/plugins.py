@@ -615,6 +615,12 @@ class _Served:
     read_agents: tuple[_File, ...]
 
 
+def _room(own: int, cap: int | None) -> int | None:
+    """What the cap leaves the plugins' skills after the server's ``own``: None for no
+    cap (DLV-17)."""
+    return None if cap is None else max(0, cap - own)
+
+
 class _Skills(skills.EntryOnlySkillProvider):
     """The server's one skills provider: the skills of the request's build, in the
     order their plugins were added."""
@@ -639,7 +645,18 @@ class _Skills(skills.EntryOnlySkillProvider):
         # local the plugins' skills are unlisted and still answer (DLV-9, DLV-10).
         if _resolved().via == "local":
             return []
-        return await super()._list_skill_entries(context)
+        # FastMCP gives the entries in the catalogue's order, which is the order rule
+        # (DLV-17), and merges, sorts and pages after this: the cut is across the
+        # whole listing.
+        entries = await super()._list_skill_entries(context)
+        return list(entries)[: await self._room_left()]
+
+    async def _room_left(self) -> int | None:
+        """How many of the plugins' skills the cap lets the listing hold, or None."""
+        cap = _resolved().max
+        if cap is None:
+            return None
+        return _room(await skills._own_count(self._plugins._server, self), cap)
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks

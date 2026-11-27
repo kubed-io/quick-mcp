@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastmcp import Client
+from fastmcp.skills.provider import SkillManifestProvider
 from gateway_server import over_http
+from plugin_server import skill, write
+from skill_server import read_directory, request
 from test_delivery_inputs import warnings
 
 from kubed.mcp import DeliverySettings, QuickMCP
 from kubed.mcp.delivery import _Partial, _resolved
+from kubed.mcp.skills import Skill, serve
 
 pytestmark = pytest.mark.unit
 
@@ -41,6 +47,92 @@ def server(delivery=None, header_prefix=None) -> QuickMCP:
 
 async def cap(client) -> int | None:
     return (await client.call_tool("cap", {})).data["max"]
+
+
+def plugin(tmp_path: Path, name: str, count: int) -> Path:
+    """A plugin folder ``name`` holding ``count`` skills, ``<name>-000`` on."""
+    return write(
+        tmp_path / name,
+        {
+            f"skills/{name}-{i:03}/SKILL.md": skill(f"{name}-{i:03}")
+            for i in range(count)
+        },
+    )
+
+
+def capped(
+    tmp_path: Path, *plugins: tuple[str, int], own: int = 0, **options
+) -> QuickMCP:
+    """A server ``t``: ``own`` skills of its own, then each plugin under its name."""
+    mcp = QuickMCP("t", **options)
+    if own:
+        serve(
+            mcp.server,
+            [
+                Skill.from_files(
+                    {
+                        "SKILL.md": (
+                            f"---\nname: own-{i:03}\ndescription: Its own.\n---\n"
+                        )
+                    }
+                )
+                for i in range(own)
+            ],
+        )
+    for name, count in plugins:
+        mcp.add_plugin(plugin(tmp_path, name, count), namespace=name)
+    return mcp
+
+
+async def page_sizes(client, method: str, key: str) -> list[int]:
+    """The length of each page's ``key`` list, following ``nextCursor``. For
+    ``resources/list`` it counts only the rows holding ``skill://``."""
+    sizes, cursor = [], None
+    while True:
+        page = await request(client, method, **({"cursor": cursor} if cursor else {}))
+        counted = [
+            row
+            for row in page[key]
+            if method != "resources/list" or "skill://" in str(row["uri"])
+        ]
+        sizes.append(len(counted))
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return sizes
+
+
+async def listing(client) -> list[str]:
+    """Every ``skills/list`` entry URI, following ``nextCursor``."""
+    found, cursor = [], None
+    while True:
+        page = await request(
+            client, "skills/list", **({"cursor": cursor} if cursor else {})
+        )
+        found += [entry["uri"] for entry in page["skills"]]
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return found
+
+
+def uris(name: str, numbers: Iterable[int]) -> list[str]:
+    return [f"skill://{name}/{name}-{i:03}/SKILL.md" for i in numbers]
+
+
+def own(numbers: Iterable[int]) -> list[str]:
+    return [f"skill://own-{i:03}/SKILL.md" for i in numbers]
+
+
+def visibility_checks(monkeypatch) -> list[str]:
+    """Wrap FastMCP's ``_is_served``, recording each skill path it is called with."""
+    seen: list[str] = []
+    original = SkillManifestProvider._is_served
+
+    async def spy(self, path, manifest):
+        seen.append(path)
+        return await original(self, path, manifest)
+
+    monkeypatch.setattr(SkillManifestProvider, "_is_served", spy)
+    return seen
 
 
 @pytest.mark.parametrize(
@@ -156,3 +248,83 @@ async def test_a_yaml_bool_config_cap_is_ignored(tmp_path, caplog):
         assert mcp._resolver.resolve(None).max == 100
     (record,) = warnings(caplog)
     assert record.getMessage().startswith("config delivery.max 'True' is ignored")
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_the_default_lists_100_of_101(tmp_path, mode):
+    async with Client(capped(tmp_path, ("a", 101)).server, mode=mode) as client:
+        assert await listing(client) == uris("a", range(100))
+
+
+@pytest.mark.parametrize(
+    ("options", "sent", "count"),
+    [
+        ({}, {"headers": {"X-MCP-Max": "150"}}, 150),
+        ({}, {"params": {"max": "5"}}, 5),
+        ({"header_prefix": "Kb"}, {"headers": {"Kb-Max": "5"}}, 5),
+        ({"config": {"delivery": {"max": 150}}}, {}, 150),
+        ({}, {"headers": {"X-MCP-Max": "all"}}, 160),
+    ],
+)
+async def test_the_cap_is_set_per_request(tmp_path, options, sent, count):
+    async with over_http(capped(tmp_path, ("a", 160), **options), **sent) as client:
+        assert await listing(client) == uris("a", range(count))
+
+
+async def test_delivery_default_caps_the_listing(tmp_path):
+    mcp = capped(tmp_path, ("a", 160))
+    mcp.delivery_default(lambda client: _Partial(max="5"))
+    async with over_http(mcp) as client:
+        assert await listing(client) == uris("a", range(5))
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_the_order_holds_on_every_call_and_page(tmp_path, mode):  # Review Focus 1
+    mcp = capped(tmp_path, ("a", 60), ("b", 60), list_page_size=7)
+    async with Client(mcp.server, mode=mode) as client:
+        seen = [await listing(client) for _ in range(3)]
+        pages = await page_sizes(client, "skills/list", "skills")
+    assert seen == [uris("a", range(60)) + uris("b", range(40))] * 3
+    assert pages == [7] * 14 + [2]
+
+
+async def test_the_order_plugins_are_added_in_chooses_who_survives(tmp_path):
+    mcp = capped(tmp_path, ("b", 60), ("a", 60))
+    async with Client(mcp.server) as client:
+        assert await listing(client) == uris("a", range(40)) + uris("b", range(60))
+
+
+@pytest.mark.parametrize(("mine", "kept_theirs"), [(3, 97), (100, 0), (105, 0)])
+async def test_the_servers_own_skills_are_never_cut(tmp_path, mine, kept_theirs):
+    async with Client(capped(tmp_path, ("a", 101), own=mine).server) as client:
+        assert await listing(client) == uris("a", range(kept_theirs)) + own(range(mine))
+
+
+@pytest.mark.parametrize("via", ["mcp", "extension"])
+async def test_extension_mode_is_cut_alike(tmp_path, via):
+    async with over_http(
+        capped(tmp_path, ("a", 101)), headers={"X-MCP-Via": via}
+    ) as client:
+        assert await listing(client) == uris("a", range(100))
+
+
+async def test_the_cut_adds_no_visibility_check(tmp_path, monkeypatch):  # #86
+    checked = visibility_checks(monkeypatch)
+    for sent in ({"X-MCP-Max": "all"}, {}):
+        checked.clear()
+        async with over_http(
+            capped(tmp_path / str(len(sent)), ("a", 101)), headers=sent
+        ) as client:
+            await listing(client)
+        assert len(checked) == 101  # each plugin skill once, capped or not
+
+
+async def test_a_cut_skill_is_still_served(tmp_path):  # DLV-10
+    root = "skill://a/a-100"
+    async with Client(capped(tmp_path, ("a", 101)).server) as client:
+        assert f"{root}/SKILL.md" not in await listing(client)
+        got = await request(client, "skills/get", uri=f"{root}/SKILL.md")
+        assert got["skill"]["uri"] == f"{root}/SKILL.md"
+        for tail in ("SKILL.md", "_manifest", "_index.md", "_index.json"):
+            assert await client.read_resource(f"{root}/{tail}")
+        assert (await read_directory(client, uri=root))["resources"]

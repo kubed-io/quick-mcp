@@ -715,6 +715,19 @@ async def _served_children(server: FastMCP, uri: str) -> list[dict] | None:
         return await _children(server.providers, uri)
 
 
+async def _own_count(server: FastMCP, besides: object | None) -> int:
+    """How many ``SKILL.md``s the server's providers other than ``besides`` serve for
+    the request: the room's count of the server's own skills (DLV-17). It reads the
+    request's manifests FastMCP loads once, and runs no ``_is_served`` and no
+    listing."""
+    count = 0
+    for provider in server.providers:
+        if isinstance(provider, SkillManifestProvider) and provider is not besides:
+            manifests = await provider._request_manifests()
+            count += sum(ENTRY in manifest.files for manifest in manifests.values())
+    return count
+
+
 def _advertises(server: FastMCP, identifier: str) -> bool:
     """Whether ``server`` already declares ``identifier`` in a legacy ``initialize``."""
     return any(
