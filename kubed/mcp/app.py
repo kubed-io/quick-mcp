@@ -342,7 +342,7 @@ class QuickMCP:
         # Inside the resolution, so the handshake echoes and is written for this
         # request's; appended, as no other middleware needs to see it first.
         self._instructions: Instructions | None = None
-        self.add_middleware(_Describe(lambda: self._instructions))
+        self.add_middleware(_Describe(lambda: self._instructions, self._plugins))
         # Claimed only once every argument has passed: from here on a component may
         # have registered, so the load stays claimed.
         loaded._claim()

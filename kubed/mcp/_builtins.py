@@ -86,8 +86,9 @@ class ServingSettings(Config):
 class DeliverySettings(Config):
     """The config's defaults for the delivery inputs: None leaves the built-in one.
 
-    Each is a lax string, checked when the server is built: a value its input doesn't
-    take is warned once and ignored, and the next level answers.
+    Each is a lax string, and ``max`` may be a whole number too, checked when the server
+    is built: a value its input doesn't take is warned once and ignored, and the next
+    level answers.
     """
 
     resources: str | None = Field(
@@ -108,6 +109,20 @@ class DeliverySettings(Config):
         env="DELIVERY_VIA",
         arg="--delivery-via",
     )
+    max: str | int | None = Field(
+        None,
+        doc="How many skills a listing shows, a whole number or all for no cap; "
+        "it counts skills only.",
+        env="DELIVERY_MAX",
+        arg="--delivery-max",
+    )
+
+    @field_validator("max", mode="before")
+    @classmethod
+    def _not_coerced(cls, value: object) -> object:
+        """A bool or float is kept as text, which ``max`` warns and ignores: lax mode
+        would coerce it to an int it isn't (``true`` to 1)."""
+        return str(value) if isinstance(value, bool | float) else value
 
 
 BUILTINS: tuple[type[BaseModel], ...] = (

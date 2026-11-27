@@ -77,9 +77,10 @@ from .agents import (
     served_as,
 )
 from .agents import usable_name as _usable
-from .delivery import BinaryPointer, _resolved
+from .delivery import BinaryPointer, SkillCount, _resolved
 from .prompts import _survives_json, index_meta, read_command
 from .protocol import AdvertiseLegacyExtensions
+from .request import _warn_once
 
 __all__ = [
     "AgentFile",
@@ -615,6 +616,23 @@ class _Served:
     read_agents: tuple[_File, ...]
 
 
+def _room(own: int, cap: int | None) -> int | None:
+    """What the cap leaves the plugins' skills after the server's ``own``: None for no
+    cap (DLV-17)."""
+    return None if cap is None else max(0, cap - own)
+
+
+def _count(own: int, plugin: int, cap: int | None, via: str) -> SkillCount:
+    """How many skills ``skills/list`` holds, and how many the cap cuts, for a server
+    with ``own`` skills of its own and ``plugin`` from its plugins (DLV-17). Under
+    ``local`` the plugins' skills are unlisted, and none is cut."""
+    if via == "local":
+        return SkillCount(own, 0)
+    room = _room(own, cap)
+    kept = plugin if room is None else min(room, plugin)
+    return SkillCount(own + kept, plugin - kept)
+
+
 class _Skills(skills.EntryOnlySkillProvider):
     """The server's one skills provider: the skills of the request's build, in the
     order their plugins were added."""
@@ -631,15 +649,29 @@ class _Skills(skills.EntryOnlySkillProvider):
         if "skills" not in _resolved().listed:
             return []
         # The rows are the build's, made once with it (PLUG-55); the gate above stays
-        # per request.
-        return list((await self._plugins.pinned()).build.entries)
+        # per request. The cap keeps the first ``room`` of them, in the build's order
+        # (DLV-17). Counting the room reads the request manifests, never a listing
+        # (#86).
+        entries = (await self._plugins.pinned()).build.entries
+        return list(entries[: await self._room_left()])
 
     async def _list_skill_entries(self, context: Any) -> Sequence[Any]:
         # skills/list asks this, and skills/get its own _get_skill_entry, so under
         # local the plugins' skills are unlisted and still answer (DLV-9, DLV-10).
         if _resolved().via == "local":
             return []
-        return await super()._list_skill_entries(context)
+        # FastMCP gives the entries in the catalogue's order, which is the order rule
+        # (DLV-17), and merges, sorts and pages after this: the cut is across the
+        # whole listing.
+        entries = await super()._list_skill_entries(context)
+        return list(entries)[: await self._room_left()]
+
+    async def _room_left(self) -> int | None:
+        """How many of the plugins' skills the cap lets the listing hold, or None."""
+        cap = _resolved().max
+        if cap is None:
+            return None
+        return _room(await skills._own_count(self._plugins._server, self), cap)
 
     async def get_tasks(self) -> list:
         return []  # see _Prompts.get_tasks
@@ -1912,11 +1944,63 @@ class Plugins:
         a change made during a build is never stored where a later request finds it. A
         view may serve; nothing else."""
         view = self._view() if self._view else _EVERY
+        return await self._pin_view(view)
+
+    async def _pin_view(self, view: View) -> _Pin:
+        """The pin for ``view``: the memo and the state are taken, then the key, then
+        the build."""
         memo = self._memo
         state = self._state
         key = self._key(state, view, gateway.prefix())
         build = await self._build_for(memo, state, view, key)
         return _Pin(state, view, key, build)
+
+    async def _quiet_pin(self) -> _Pin | None:
+        """The request's pin for a reader that must not fail it, or None.
+
+        The slot's pin when it holds one, and None when it holds an error, which fails
+        the request anyway. Otherwise a pin made outside the slot, through the same
+        build cache the request's readers share, so the first reader later finds the
+        build kept; its failure is never stored there, only logged once per view and
+        error (the handshake has no session, so that is across the server).
+        """
+        slot = (_PINS.get() or {}).get(self)
+        if slot is not None and slot.pin is not None:
+            return slot.pin
+        if slot is not None and slot.error is not None:
+            return None
+        key = None
+        try:
+            view = self._view() if self._view else _EVERY
+            key = view.key
+            return await self._pin_view(view)
+        except Exception as exc:  # noqa: BLE001 - a count must never fail the handshake
+            detail = f"{type(exc).__name__}: {exc}"
+            if _warn_once(f"skill count {key!r}", detail):
+                log.error(
+                    "skill count skipped for view %r: %s: %s; "
+                    "the instructions get no count",
+                    key,
+                    type(exc).__name__,
+                    exc,
+                )
+            return None
+
+    async def skill_count(self) -> SkillCount | None:
+        """How many skills ``skills/list`` holds and how many the cap cuts, for the
+        request's handshake, or None when it cannot be told (DLV-17). It reads the
+        cached build and the request's manifests, and runs no listing. Under ``local``
+        it counts no plugin skill, so it pins no build."""
+        own = await skills._own_count(self._server, self._skills)
+        resolved = _resolved()
+        if self._skills is None:
+            return _count(own, 0, resolved.max, resolved.via) if own else None
+        if resolved.via == "local":
+            return _count(own, 0, resolved.max, resolved.via)
+        pin = await self._quiet_pin()
+        if pin is None:
+            return None
+        return _count(own, len(pin.build.entries), resolved.max, resolved.via)
 
     async def _build_for(
         self, memo: _Memo, state: _State, view: View, key: _Key

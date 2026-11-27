@@ -73,6 +73,7 @@ async def test_the_echo(mode):  # DLV-12, GW-9
             "listed": ["skills", "prompts", "agents"],
             "via": "mcp",
             "prefix": None,
+            "max": 100,
         }
 
 
@@ -84,6 +85,7 @@ async def test_the_echo_with_nothing_sent_is_the_built_ins(mode):
             "listed": ["skills"],
             "via": "mcp",
             "prefix": None,
+            "max": 100,
         }
 
 
