@@ -20,6 +20,7 @@ import yaml
 from fastmcp import Client, FastMCP
 from fastmcp.skills import SkillsClientExtension
 from fastmcp.skills.provider import SkillManifestProvider
+from gateway_server import over_http
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
 from skill_server import (
     BOTH,
@@ -594,3 +595,16 @@ async def test_a_plain_fastmcp_server_lists_its_skills_both_ways(mode):  # Revie
         rows = [str(r.uri) for r in await client.list_resources()]
     assert entries == [ENTRY_URI]
     assert ENTRY_URI in rows
+
+
+@pytest.mark.parametrize("mode", ["legacy", "auto"])
+@pytest.mark.parametrize("via", ["mcp", "extension"])
+async def test_a_mounted_plain_server_follows_the_quickmcps_mode(via, mode):
+    child = FastMCP("child")
+    serve(child, [load_skill(DEMO)])
+    parent = QuickMCP("t")
+    parent.server.mount(child)
+    async with over_http(parent, mode=mode, headers={"X-MCP-Via": via}) as client:
+        entries = [e["uri"] for e in (await request(client, "skills/list"))["skills"]]
+        rows = [str(r.uri) for r in await client.list_resources()]
+    assert (ENTRY_URI in rows, ENTRY_URI in entries) == (via == "mcp", via == "extension")

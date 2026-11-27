@@ -207,6 +207,21 @@ async def test_a_wrongly_typed_default_value_falls_through_named(caplog):
     assert messages[1].startswith("delivery_default resources 'True' is ignored")
 
 
+@pytest.mark.parametrize("attr", ["via", "listed", "resources"])
+async def test_a_huge_default_integer_falls_through_named(attr, caplog):
+    mcp = server()
+    mcp.delivery_default(lambda info: SimpleNamespace(**{attr: 10**5000}))
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        async with over_http(mcp) as client:
+            await seen(client)
+    (record,) = warnings(caplog)
+    rule = delivery._ATTRS[attr].rule
+    assert record.getMessage() == (
+        f"delivery_default {attr} 'a number of more than 10 digits' is ignored, "
+        f"and the next source answers: {rule}"
+    )
+
+
 async def test_a_raising_delivery_default_gives_nothing(caplog):
     mcp = server()
 

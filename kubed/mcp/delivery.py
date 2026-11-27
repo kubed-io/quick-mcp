@@ -171,6 +171,7 @@ def _take_listed(raw: str) -> frozenset[str]:
 
 
 _TOO_LONG = "a number of more than 10 digits"
+_BOUND = 10**10  # a whole number this large or larger is _TOO_LONG, never str()-ed
 
 
 def _take_max(raw: str) -> int | None:
@@ -342,6 +343,14 @@ def _query(entry: _Input) -> Level:
     return level
 
 
+def _shown(value: object) -> str:
+    """``value`` as shown in a warning: a whole number of more than 10 digits is
+    ``_TOO_LONG``, not ``str()``-ed, which Python refuses past 4300 digits."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) >= _BOUND:
+        return _TOO_LONG
+    return str(value)[:64]
+
+
 def _raw(entry: _Input, value: object) -> str | None:
     """``value`` as a raw value of ``entry``: a string, or for ``Listed`` a collection
     joined with ``,``, for ``Max`` a whole number. None when it is none of these.
@@ -351,7 +360,7 @@ def _raw(entry: _Input, value: object) -> str | None:
     if isinstance(value, str):
         return value
     if entry.name == "Max" and isinstance(value, int) and not isinstance(value, bool):
-        return str(value) if abs(value) < 10**10 else _TOO_LONG
+        return _shown(value)
     if entry.name == "Listed" and isinstance(value, Collection):
         return ",".join(str(kind) for kind in value)
     return None
@@ -597,7 +606,7 @@ class _Resolver:
             value = given[attr]
             raws[attr] = raw = None if value is None else _raw(entry, value)
             if value is not None and raw is None:
-                source, shown = f"delivery_default {attr}", str(value)[:64]
+                source, shown = f"delivery_default {attr}", _shown(value)
                 if warn and _warn_once(source, shown):
                     _warning(source, shown, entry)
         return _Partial(**raws)
@@ -692,8 +701,10 @@ def _delivered() -> Resolved | None:
     None anywhere else.
 
     Only ``QuickMCP`` resolves delivery: it is the open resolution, or the one
-    ``_resolved`` makes when the context's server is a ``QuickMCP``'s. A server it does
-    not wrap, or no context at all, gets None, and lists as FastMCP does (DLV-10).
+    ``_resolved`` makes when the context's server is a ``QuickMCP``'s. A server mounted
+    on a ``QuickMCP`` is answered within the ``QuickMCP``'s request and follows its
+    resolution. A server no ``QuickMCP`` serves the request for, or no context at all,
+    gets None, and lists as FastMCP does (DLV-10).
     """
     current = _RESOLVED.get()
     if current is not None:

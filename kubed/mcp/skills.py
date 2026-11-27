@@ -619,9 +619,19 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
         return await super()._list_skill_entries(context)
 
     async def _skill_uris(self, uri: str | None = None) -> Sequence[str]:
-        # skills/list also asks every source for its URIs, to drop the ones two
-        # share: a catalogue it lists none of has none to share, and loads nothing
-        # for it. skills/get names its URI, and is always answered.
+        """The catalogue's URIs, or none when ``skills/list`` asks for its duplicate
+        check and lists none of them.
+
+        FastMCP's ``skills/list`` handler (``SkillsExtension._list_entries``, through
+        ``_identities()``) asks every source for ``_skill_uris(None)`` to drop the
+        URIs two sources share. For a catalogue the listing shows none of, that would
+        load it (build it, for the plugins) for nothing, so it answers none.
+        ``skills/get`` passes its URI and is unchanged.
+
+        Written against fastmcp 4.2.6; ``_skill_uris`` is a private method.
+        ``test_skills_list_reaches_the_uri_override`` fails if an upgrade renames it or
+        stops calling it.
+        """
         if uri is None and not self._lists_entries():
             return []
         return await super()._skill_uris(uri)

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 
 import pytest
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.skills import SkillsClientExtension
 from gateway_server import over_http
 from plugin_server import ENTRY, copy
@@ -154,6 +154,18 @@ async def test_a_prefixed_extension_lists_one_way(tmp_path, mode):  # Review Foc
 
 def test_delivered_is_none_off_quickmcp():  # Review Focus 2
     assert delivery._delivered() is None
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_delivered_is_none_in_a_plain_servers_request(mode):
+    plain = FastMCP("plain")
+
+    @plain.tool
+    def none() -> bool:
+        return delivery._delivered() is None
+
+    async with Client(plain, mode=mode) as client:
+        assert (await client.call_tool("none", {})).data is True
 
 
 async def gets(client: Client) -> dict:

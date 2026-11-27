@@ -31,7 +31,7 @@ from skill_server import request
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from kubed.mcp import QuickMCP
+from kubed.mcp import QuickMCP, skills
 from kubed.mcp.plugins import _PINS, View, _PinScope, _Slot
 from kubed.mcp.protocol import MCPError
 from kubed.mcp.request import request_values
@@ -427,6 +427,27 @@ async def test_a_skills_list_that_lists_no_plugin_skill_pins_nothing(
     mcp = failing(monkeypatch, failure, via=via)
     async with Client(mcp.server, mode=mode) as client:
         assert (await request(client, "skills/list"))["skills"] == []
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_skills_list_reaches_the_uri_override(monkeypatch, mode):
+    # skills.EntryOnlySkillProvider._skill_uris overrides a private FastMCP method,
+    # written against fastmcp 4.2.6. Through the real skills/list handler, a failing
+    # view under mcp still lists nothing, and the handler's duplicate check still
+    # asks the override: an upgrade that renames the method fails the first, one that
+    # stops calling it the second.
+    asked: list[str | None] = []
+    real = skills.EntryOnlySkillProvider._skill_uris
+
+    async def spy(self, uri=None):
+        asked.append(uri)
+        return await real(self, uri)
+
+    monkeypatch.setattr(skills.EntryOnlySkillProvider, "_skill_uris", spy)
+    mcp = failing(monkeypatch, "make", via="mcp")
+    async with Client(mcp.server, mode=mode) as client:
+        assert (await request(client, "skills/list"))["skills"] == []
+    assert None in asked
 
 
 @pytest.mark.parametrize("mode", MODES)
