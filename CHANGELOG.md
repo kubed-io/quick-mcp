@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Garbage-collection counts and pause times, per generation, are in the metrics.
+
 ### Changed
 
 - **BREAKING:** on a `QuickMCP`, `skills/list` lists skills only under `X-MCP-Via: extension`; the default `mcp` lists them as resources alone, and `local` lists only the server's own.
@@ -32,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A session's first request no longer stalls ~2 s while FastMCP's state store loads.
 - A delivery value thousands of digits long is ignored with a warning instead of failing the request.
 
 ## [0.6.0] - 2026-11-27
