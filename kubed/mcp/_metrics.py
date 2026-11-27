@@ -8,10 +8,16 @@ the prefix sees the plain URI, under the request's pinned build. So ``_ReadObser
 sits there and writes the label into a holder the metrics leave in ``_MATCHED``, and the
 metrics' histogram reads it back as the read's point is recorded.
 
-The label is the template the URI matches, else the URI. The lookup asks for templates
-only: a successful read that matches none has found a static resource, so a static
-lookup would decide nothing, and for a skill's file it re-reads the file. A static
-resource whose URI also matches a template is labelled by that template.
+The plugin layer is asked first, from the pinned build's maps: a file it serves is
+labelled by a bounded pattern, with the library and plugin that serve it
+(``kubed.plugin.library``, ``kubed.plugin.name``). A skill's files are static resources
+that would otherwise each be a series. The exact URI stays on the span.
+
+Only a read that isn't the layer's is labelled by the template the URI matches, else the
+URI. The lookup asks for templates only: a successful read that matches none has found
+a static resource, so a static lookup would decide nothing, and for a skill's file it
+re-reads the file. A static resource whose URI also matches a template is labelled by
+that template.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ import logging
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import extract_version_spec
@@ -31,9 +37,14 @@ from fastmcp.utilities.versions import VersionSpec
 
 from .gateway import _TakeThePrefix
 
+if TYPE_CHECKING:
+    from .plugins import Plugins, _ReadLabels
+
 log = logging.getLogger(__name__)
 
 _TEMPLATE = "mcp.resource.template"
+_LIBRARY = "kubed.plugin.library"
+_PLUGIN = "kubed.plugin.name"
 
 
 @dataclass
@@ -41,6 +52,8 @@ class _Matched:
     """One read's label: the observer writes it, the read's point reads it."""
 
     label: str | None = None
+    library: str | None = None
+    plugin: str | None = None
 
 
 _MATCHED: ContextVar[_Matched | None] = ContextVar("_MATCHED", default=None)
@@ -64,6 +77,10 @@ class _Labelled:
             matched = _MATCHED.get()
             if matched is not None and matched.label is not None:
                 attributes[_TEMPLATE] = matched.label
+                if matched.library is not None:
+                    attributes[_LIBRARY] = matched.library
+                if matched.plugin is not None:
+                    attributes[_PLUGIN] = matched.plugin
             else:
                 del attributes[_TEMPLATE]
         self._histogram.record(amount, attributes, *args, **kwargs)
@@ -127,7 +144,7 @@ class _CallMetrics(UsageMiddleware):
         finally:
             _MATCHED.reset(token)
 
-    def observe(self, server: FastMCP) -> None:
+    def observe(self, server: FastMCP, plugins: Plugins) -> None:
         """Put the read observer right after the prefix, or last without one.
 
         Never raises (TEL-6).
@@ -144,7 +161,7 @@ class _CallMetrics(UsageMiddleware):
                 ),
                 len(middleware),
             )
-            middleware.insert(after, _ReadObserver(server))
+            middleware.insert(after, _ReadObserver(server, plugins))
         except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
             log.error(
                 "Resource reads are not labelled in the call metrics: %s",
@@ -155,13 +172,15 @@ class _CallMetrics(UsageMiddleware):
 class _ReadObserver(Middleware):
     """Labels a read the call metrics are recording, from the plain URI under the pin.
 
-    The label is the ``uri_template`` of the template the URI matches. A read that
-    succeeds without one is labelled by its URI, and one that fails without one is not
-    labelled. A cancellation goes through unlabelled.
+    A file the plugin layer serves is labelled by its pattern, library and plugin, read
+    or failed. Otherwise the label is the ``uri_template`` of the template the URI
+    matches; a read that succeeds without one is labelled by its URI, and one that fails
+    without one is not labelled. A cancellation goes through unlabelled.
     """
 
-    def __init__(self, server: FastMCP) -> None:
+    def __init__(self, server: FastMCP, plugins: Plugins) -> None:
         self._server = server
+        self._plugins = plugins
 
     async def on_read_resource(self, context: Any, call_next: Any) -> Any:
         matched = _MATCHED.get()
@@ -171,10 +190,27 @@ class _ReadObserver(Middleware):
         try:
             result = await call_next(context)
         except Exception:
-            matched.label = await self._template(context, uri)
+            await self._label(matched, context, uri, failed=True)
             raise
-        matched.label = await self._template(context, uri) or uri
+        await self._label(matched, context, uri, failed=False)
         return result
+
+    async def _label(
+        self, matched: _Matched, context: Any, uri: str, failed: bool
+    ) -> None:
+        if (layer := await self._layer(uri)) is not None:
+            matched.label = layer.pattern
+            matched.library = layer.library
+            matched.plugin = layer.plugin
+            return
+        matched.label = await self._template(context, uri) or (None if failed else uri)
+
+    async def _layer(self, uri: str) -> _ReadLabels | None:
+        """The plugin layer's labels for ``uri``, None when it is not the layer's."""
+        try:
+            return await self._plugins._read_labels(uri)
+        except Exception:  # noqa: BLE001  # TEL-6: a lookup that fails is not the layer's
+            return None
 
     async def _template(self, context: Any, uri: str) -> str | None:
         """The ``uri_template`` of the template ``uri`` matches, at its version."""

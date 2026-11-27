@@ -2089,6 +2089,22 @@ def reads(points: list) -> list[tuple[str | None, int]]:
     ]
 
 
+def labelled(points: list) -> list:
+    """Each ``resources/read`` point's (template, library, plugin), with its count."""
+    return [
+        (
+            (
+                p.attributes.get("mcp.resource.template"),
+                p.attributes.get("kubed.plugin.library"),
+                p.attributes.get("kubed.plugin.name"),
+            ),
+            p.count,
+        )
+        for p in points
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+
+
 def resourced(name: str) -> QuickMCP:
     mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)})
 
@@ -2208,9 +2224,10 @@ async def test_a_plugin_skill_read_under_a_prefix_is_labelled_without_it(
     mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
     async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
         await client.read_resource("kb+skill://lib/guide/references/a.md")
-        await client.read_resource("kb+skill://lib/guide/references/a.md")
-    assert reads(duration_points(metered, "kit-reads")) == [
-        ("skill://lib/guide/references/a.md", 2)
+        await client.read_resource("kb+skill://lib/guide/SKILL.md")
+    assert sorted(labelled(duration_points(metered, "kit-reads"))) == [
+        (("skill://{library}/{path}", "lib", "kit"), 1),
+        (("skill://{library}/{path}/SKILL.md", "lib", "kit"), 1),
     ]
 
 
@@ -2225,7 +2242,10 @@ async def test_a_plugin_file_read_under_a_prefix_is_labelled_without_it(
     mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
     async with over_http(mcp, headers={"Kb-Resource-Prefix": "kb+"}) as client:
         await client.read_resource(f"kb+{uri}")
-    assert reads(duration_points(metered, name)) == [(uri, 1)]
+    scheme = uri.partition(":")[0]
+    assert labelled(duration_points(metered, name)) == [
+        ((f"{scheme}://{{library}}/{{path}}", "lib", "kit"), 1)
+    ]
 
 
 async def test_a_read_through_the_tool_is_a_call_and_a_read(metered, tmp_path) -> None:
@@ -2247,12 +2267,20 @@ async def test_a_read_through_the_tool_is_a_call_and_a_read(metered, tmp_path) -
     async with Client(mcp.server) as client:
         assert "read_resource" in {tool.name for tool in await client.list_tools()}
         await client.call_tool("read_resource", {"uri": "data://items/1"})
+        await client.call_tool("read_resource", {"uri": "skill://lib/guide/SKILL.md"})
     points = duration_points(metered, "tool-reads")
     assert sorted(
         (p.attributes["mcp.method.name"], p.attributes.get("gen_ai.tool.name"))
         for p in points
-    ) == [("resources/read", None), ("tools/call", "read_resource")]
-    assert reads(points) == [("data://items/{id}", 1)]
+    ) == [
+        ("resources/read", None),
+        ("resources/read", None),
+        ("tools/call", "read_resource"),
+    ]
+    assert sorted(labelled(points), key=str) == [
+        (("data://items/{id}", None, None), 1),
+        (("skill://{library}/{path}/SKILL.md", "lib", "kit"), 1),
+    ]
 
 
 async def test_overlapping_reads_keep_their_own_templates(metered) -> None:
@@ -2289,6 +2317,216 @@ async def test_tools_and_prompts_are_recorded_as_before(metered) -> None:
     assert "mcp.resource.template" not in tool.attributes
 
 
+def kit_reads(name: str, tmp_path: Path) -> QuickMCP:
+    mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)})
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    return mcp
+
+
+async def test_many_files_of_one_skill_are_one_series(metered, tmp_path) -> None:
+    tree = {**KIT_TREE, "skills/guide/references/b.md": "# B\n"}
+    mcp = QuickMCP("series", config={"telemetry": TelemetrySettings(otel=True)})
+    mcp.add_plugin(write(tmp_path / "kit", tree), namespace="lib")
+    async with Client(mcp.server) as client:
+        for name in ("a", "b", "a"):
+            await client.read_resource(f"skill://lib/guide/references/{name}.md")
+    assert labelled(duration_points(metered, "series")) == [
+        (("skill://{library}/{path}", "lib", "kit"), 3)
+    ]
+
+
+READS = [
+    "skill://lib/guide/_index.md",
+    "skill://lib/guide/_manifest",
+    "prompts://lib/_index.md",
+]
+
+
+async def test_an_index_and_a_manifest_read_are_labelled_by_the_layer(
+    metered, tmp_path
+) -> None:
+    async with Client(kit_reads("indexes", tmp_path).server) as client:
+        for uri in READS:
+            await client.read_resource(uri)
+    assert sorted(labelled(duration_points(metered, "indexes"))) == [
+        (("prompts://{library}/{path}/_index.md", "lib", "kit"), 1),
+        (("skill://{library}/{path}/_index.md", "lib", "kit"), 1),
+        (("skill://{library}/{path}/_manifest", "lib", "kit"), 1),
+    ]
+
+
+async def test_no_point_carries_a_served_uri(metered, tmp_path) -> None:
+    async with Client(kit_reads("no-uri", tmp_path).server) as client:
+        for uri in [
+            *READS,
+            "skill://lib/guide/references/a.md",
+            "agents://lib/scout.md",
+        ]:
+            await client.read_resource(uri)
+    points = [
+        p
+        for p in duration_points(metered, "no-uri")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert len(points) == 5
+    for point in points:
+        for value in point.attributes.values():
+            assert not str(value).startswith(
+                ("skill://lib/", "prompts://lib/", "agents://lib/")
+            )
+
+
+async def test_the_span_keeps_the_exact_uri(metered, spans, tmp_path) -> None:
+    async with Client(kit_reads("span-uri", tmp_path).server) as client:
+        await client.read_resource("skill://lib/guide/references/a.md")
+    from opentelemetry.trace import SpanKind
+
+    (span,) = [
+        s
+        for s in spans.get_finished_spans()
+        if s.kind == SpanKind.SERVER
+        and s.attributes.get("mcp.method.name") == "resources/read"
+    ]
+    assert span.attributes["mcp.resource.uri"] == "skill://lib/guide/references/a.md"
+
+
+async def test_a_failed_read_of_a_missing_skill_file(metered, tmp_path) -> None:
+    from fastmcp.exceptions import MCPError
+
+    async with Client(kit_reads("missing-file", tmp_path).server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("skill://lib/guide/references/missing.md")
+    (point,) = [
+        p
+        for p in duration_points(metered, "missing-file")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    # A missing file is resource-not-found, a routing error: UsageMiddleware takes the
+    # name attribute off the point, so none of the three labels reach it.
+    for key in ("mcp.resource.template", "kubed.plugin.library", "kubed.plugin.name"):
+        assert key not in point.attributes
+    assert point.attributes["rpc.status_code"] == "-32602"
+    assert "skill://lib/guide/references/missing.md" not in point.attributes.values()
+
+
+async def test_a_template_read_beside_plugins_is_unchanged(metered, tmp_path) -> None:
+    mcp = resourced("beside")
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with Client(mcp.server) as client:
+        await client.read_resource("data://items/1")
+    assert labelled(duration_points(metered, "beside")) == [
+        (("data://items/{id}", None, None), 1)
+    ]
+
+
+async def test_a_server_without_plugins_never_pins_for_a_label(
+    metered, monkeypatch
+) -> None:
+    from kubed.mcp.plugins import Plugins
+
+    calls: list[None] = []
+
+    async def pinned(self):
+        calls.append(None)
+        raise AssertionError("pinned")
+
+    monkeypatch.setattr(Plugins, "pinned", pinned)
+    async with Client(resourced("unpinned").server) as client:
+        await client.read_resource("data://about")
+        await client.read_resource("data://items/1")
+    assert calls == []
+    assert sorted(labelled(duration_points(metered, "unpinned"))) == [
+        (("data://about", None, None), 1),
+        (("data://items/{id}", None, None), 1),
+    ]
+
+
+async def test_a_read_whose_pin_fails_carries_no_label_and_no_error_of_its_own(
+    metered, tmp_path
+) -> None:
+    from fastmcp.exceptions import MCPError
+
+    mcp = kit_reads("pin-fails", tmp_path)
+
+    def view():
+        raise RuntimeError("view")
+
+    mcp.plugin_view(view)
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("skill://lib/guide/SKILL.md")
+    (point,) = [
+        p
+        for p in duration_points(metered, "pin-fails")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    for key in ("mcp.resource.template", "kubed.plugin.library", "kubed.plugin.name"):
+        assert key not in point.attributes
+
+
+async def test_a_lookup_that_raises_falls_back_to_the_template(
+    metered, caplog
+) -> None:
+    from kubed.mcp._metrics import _ReadObserver
+
+    class Broken:
+        async def _read_labels(self, uri: str):
+            raise RuntimeError("lookup")
+
+    mcp = resourced("lookup-raises")
+    (observer,) = [m for m in mcp.server.middleware if isinstance(m, _ReadObserver)]
+    observer._plugins = Broken()
+    with caplog.at_level(logging.WARNING):
+        async with Client(mcp.server) as client:
+            await client.read_resource("data://items/1")
+    assert labelled(duration_points(metered, "lookup-raises")) == [
+        (("data://items/{id}", None, None), 1)
+    ]
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_the_layer_is_asked_before_a_template(metered, tmp_path) -> None:
+    mcp = kit_reads("layer-first", tmp_path)
+
+    @mcp.server.resource("prompts://lib/extra/{id}")
+    def extra(id: str) -> str:
+        return id
+
+    async with Client(mcp.server) as client:
+        (content,) = await client.read_resource("prompts://lib/extra/1")
+    assert content.text == "1"
+    assert labelled(duration_points(metered, "layer-first")) == [
+        (("prompts://{library}/{path}", "lib", "kit"), 1)
+    ]
+
+
+async def test_a_failed_template_read_below_the_layer_is_labelled_by_it(
+    metered, tmp_path
+) -> None:
+    from fastmcp.exceptions import MCPError, ResourceError
+
+    mcp = kit_reads("layer-first-fails", tmp_path)
+
+    @mcp.server.resource("prompts://lib/extra/{id}")
+    def extra(id: str) -> str:
+        raise ResourceError("no")
+
+    async with Client(mcp.server) as client:
+        with pytest.raises(MCPError):
+            await client.read_resource("prompts://lib/extra/1")
+    (point,) = [
+        p
+        for p in duration_points(metered, "layer-first-fails")
+        if p.attributes["mcp.method.name"] == "resources/read"
+    ]
+    assert (
+        point.attributes.get("mcp.resource.template"),
+        point.attributes.get("kubed.plugin.library"),
+        point.attributes.get("kubed.plugin.name"),
+    ) == ("prompts://{library}/{path}", "lib", "kit")
+    assert point.attributes["error.type"] == "-32603"
+
+
 def test_usage_middleware_still_has_what_the_reads_use() -> None:
     from fastmcp.server.middleware.usage import UsageMiddleware
 
@@ -2318,7 +2556,9 @@ def test_the_call_metrics_copy_and_still_label() -> None:
     from opentelemetry.metrics import NoOpMeterProvider
 
     from kubed.mcp._metrics import (
+        _LIBRARY,
         _MATCHED,
+        _PLUGIN,
         _TEMPLATE,
         _CallMetrics,
         _Labelled,
@@ -2338,6 +2578,18 @@ def test_the_call_metrics_copy_and_still_label() -> None:
         finally:
             _MATCHED.reset(token)
         assert twin._histogram.points[-1] == {_TEMPLATE: "data://items/{id}"}
+        token = _MATCHED.set(_Matched("skill://{library}/{path}", "lib", "kit"))
+        try:
+            twin.record(1.0, {_TEMPLATE: ""})
+            twin.record(1.0, {"other": "x"})
+        finally:
+            _MATCHED.reset(token)
+        assert twin._histogram.points[-2] == {
+            _TEMPLATE: "skill://{library}/{path}",
+            _LIBRARY: "lib",
+            _PLUGIN: "kit",
+        }
+        assert twin._histogram.points[-1] == {"other": "x"}
 
 
 def _without_record(monkeypatch) -> None:

@@ -143,7 +143,7 @@ class _TelemetryComponent(Component):
         if metrics is not None:
             mcp.server.middleware.insert(0, metrics)
             # Inside the pin and the prefix, the one place a read's plain URI is seen.
-            metrics.observe(mcp.server)
+            metrics.observe(mcp.server, mcp._plugins)
 
     async def start(self, section: BaseModel | None) -> None:
         # Never raises (TEL-6). None when another start owns the process's signals.
