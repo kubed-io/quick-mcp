@@ -1002,7 +1002,8 @@ class _Build:
     ``files`` is each prompt and agent file served, by its address, and ``folders``
     each of their folders' children (PLUG-66, PLUG-68), rewritten or not. ``entries`` is
     each skill's ``SKILL.md`` row, as ``resources/list`` shows it (SKL-8), made with the
-    build.
+    build. ``owners`` is the plugin that serves each skill's root and each prompt or
+    agent folder, by URI, made with the build: what a read's labels are looked up in.
     """
 
     admitted: tuple[Plugin, ...]
@@ -1017,6 +1018,68 @@ class _Build:
         default_factory=lambda: MappingProxyType({})
     )
     entries: tuple[skills.SkillFileResource, ...] = ()
+    owners: Mapping[str, Plugin] = field(default_factory=lambda: MappingProxyType({}))
+
+
+@dataclass(frozen=True)
+class _ReadLabels:
+    """What telemetry labels a read of a file the layer serves with: its ``pattern``,
+    and the ``library`` and ``plugin`` that serve it."""
+
+    pattern: str
+    library: str
+    plugin: str
+
+
+def _owners(
+    admitted: Iterable[_Served],
+    catalogue: Mapping[str, skills.Skill],
+    materials: Iterable[_Material],
+) -> Mapping[str, Plugin]:
+    """The plugin that owns each skill's root, of the skills ``catalogue`` holds, and
+    each prompt or agent folder of ``materials``: the first plugin with a file in it."""
+    owners: dict[str, Plugin] = {}
+    for served in admitted:
+        for key in served.catalogue:
+            if key in catalogue:
+                owners[skills._root(key)] = served.plugin
+    for material in materials:
+        for uri, _ in _folders_in(material)[2]:
+            owners.setdefault(uri, material.served.plugin)
+    return MappingProxyType(owners)
+
+
+_INDEXES = (skills.INDEX_MD, skills.INDEX_JSON)
+
+
+def _pattern(scheme: str, rel: Sequence[str]) -> str:
+    """The pattern a read ``rel`` below an owner has, ``rel`` its segments."""
+    if rel and rel[-1] in _INDEXES:
+        return f"{scheme}://{{library}}/{{path}}/{rel[-1]}"
+    if scheme == "skill" and list(rel) in ([skills.ENTRY], [skills.MANIFEST]):
+        return f"skill://{{library}}/{{path}}/{rel[0]}"
+    return f"{scheme}://{{library}}/{{path}}"
+
+
+def _labels(build: _Build, uri: str) -> _ReadLabels | None:
+    """The labels of a read of ``uri``, or None when it is not the build's: a served
+    prompt or agent file, or anything strictly below a skill's root or a served folder.
+    It reads ``build.files`` and ``build.owners`` only."""
+    scheme, sep, rest = uri.partition("://")
+    if not sep:
+        return None
+    if (material := build.files.get(uri)) is not None:
+        return _read_labels(_pattern(scheme, ()), material.served.plugin)
+    parts = rest.split("/")
+    for depth in range(len(parts) - 1, 0, -1):
+        owner = build.owners.get(f"{scheme}://{'/'.join(parts[:depth])}")
+        if owner is not None:
+            return _read_labels(_pattern(scheme, parts[depth:]), owner)
+    return None
+
+
+def _read_labels(pattern: str, plugin: Plugin) -> _ReadLabels:
+    return _ReadLabels(pattern, plugin.namespace.partition("/")[0], plugin.name)
 
 
 @dataclass(frozen=True)
@@ -1832,6 +1895,13 @@ class Plugins:
             raise slot.error
         return slot.pin
 
+    async def _read_labels(self, uri: str) -> _ReadLabels | None:
+        """The labels of a read of ``uri`` (None when it is not the layer's, or when no
+        plugin is served, which pins nothing). It raises what ``pinned`` raises."""
+        if not self.current:
+            return None
+        return _labels((await self.pinned()).build, uri)
+
     async def _pin(self) -> _Pin:
         """One pin, made fresh. The view runs first, so a set it serves (PLUG-51) is
         what the request reads. The memo and the state are taken after it and before
@@ -1912,6 +1982,7 @@ class Plugins:
                 files=MappingProxyType({m.file.uri: m for m in read}),
                 folders=MappingProxyType(_folder_rows(read)),
                 entries=self._rows(plain),
+                owners=_owners(admitted, plain, read),
             )
         rewrite = _Rewrite(chain, view.key, plugins)
         catalogue: dict[str, skills.Skill] = {}
@@ -1969,6 +2040,7 @@ class Plugins:
             files=MappingProxyType(files),
             folders=MappingProxyType(folders),
             entries=self._rows(catalogue),
+            owners=_owners(admitted, catalogue, materials),
         )
 
     def _rows(
