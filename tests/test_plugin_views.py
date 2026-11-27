@@ -419,6 +419,17 @@ def failing(monkeypatch, failure, via: str = "mcp") -> QuickMCP:
 
 
 @pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("via", ["mcp", "local"])
+@pytest.mark.parametrize("failure", FAILURES)
+async def test_a_skills_list_that_lists_no_plugin_skill_pins_nothing(
+    monkeypatch, failure, via, mode
+):  # Review Focus 4
+    mcp = failing(monkeypatch, failure, via=via)
+    async with Client(mcp.server, mode=mode) as client:
+        assert (await request(client, "skills/list"))["skills"] == []
+
+
+@pytest.mark.parametrize("mode", MODES)
 async def test_extension_prompts_list_pins(monkeypatch, mode):  # Review Focus 4
     mcp = failing(monkeypatch, "make", via="extension")
     async with Client(mcp.server, mode=mode) as client:

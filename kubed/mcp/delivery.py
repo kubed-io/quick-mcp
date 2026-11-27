@@ -685,3 +685,21 @@ def _resolved() -> Resolved:
             if served is not None:
                 resolver = _RESOLVERS.get(served, _BARE)
     return resolver.resolve(request_values(), _client_info(None), _extensions(None))
+
+
+def _delivered() -> Resolved | None:
+    """The current request's resolution where a ``QuickMCP`` resolves delivery, and
+    None anywhere else.
+
+    Only ``QuickMCP`` resolves delivery: it is the open resolution, or the one
+    ``_resolved`` makes when the context's server is a ``QuickMCP``'s. A server it does
+    not wrap, or no context at all, gets None, and lists as FastMCP does (DLV-10).
+    """
+    current = _RESOLVED.get()
+    if current is not None:
+        return current[1]
+    try:
+        server = get_context().fastmcp
+    except RuntimeError:  # no context: no server
+        return None
+    return _resolved() if server in _RESOLVERS else None

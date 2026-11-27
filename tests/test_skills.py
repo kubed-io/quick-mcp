@@ -17,7 +17,7 @@ import sys
 import fastmcp.skills.skill as fastmcp_skill
 import pytest
 import yaml
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.skills import SkillsClientExtension
 from fastmcp.skills.provider import SkillManifestProvider
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
@@ -575,8 +575,6 @@ async def test_serving_twice_adds_a_provider_and_one_extension(mode):
 
 async def test_a_mounted_server_keeps_the_extension_it_brings():
     """The parent registers its own copy, still this extension: clone() keeps the class."""
-    from fastmcp import FastMCP
-
     parent = FastMCP("parent")
     parent.mount(demo().server)
     async with Client(parent) as client:
@@ -585,3 +583,14 @@ async def test_a_mounted_server_keeps_the_extension_it_brings():
     assert extensions[EXTENSION_ID] == {"directoryRead": True}
     assert [e["uri"] for e in entries] == [ENTRY_URI]
     assert type(SkillsExtension().clone()) is SkillsExtension
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_a_plain_fastmcp_server_lists_its_skills_both_ways(mode):  # Review Focus 2
+    server = FastMCP("plain")
+    serve(server, [load_skill(DEMO)])
+    async with Client(server, mode=mode) as client:
+        entries = [e["uri"] for e in (await request(client, "skills/list"))["skills"]]
+        rows = [str(r.uri) for r in await client.list_resources()]
+    assert entries == [ENTRY_URI]
+    assert ENTRY_URI in rows

@@ -395,12 +395,14 @@ async def test_the_servers_own_skills_are_never_cut(tmp_path, mine, kept_theirs)
         assert await listing(client) == uris("a", range(kept_theirs)) + own(range(mine))
 
 
-@pytest.mark.parametrize("via", ["mcp", "extension"])
-async def test_extension_mode_is_cut_alike(tmp_path, via):
+@pytest.mark.parametrize(
+    ("via", "listed"), [("mcp", []), ("extension", uris("a", range(100)))]
+)
+async def test_extension_mode_is_cut_alike(tmp_path, via, listed):
     async with over_http(
         capped(tmp_path, ("a", 101)), headers={"X-MCP-Via": via}
     ) as client:
-        assert await listing(client) == uris("a", range(100))
+        assert await listing(client) == listed
 
 
 async def test_the_cut_adds_no_visibility_check(tmp_path, monkeypatch):  # #86
@@ -424,6 +426,30 @@ async def test_a_cut_skill_is_still_served(tmp_path):  # DLV-10
         for tail in ("SKILL.md", "_manifest", "_index.md", "_index.json"):
             assert await client.read_resource(f"{root}/{tail}")
         assert (await read_directory(client, uri=root))["resources"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_mcp_lists_skills_as_rows_alone(tmp_path, mode):
+    async with Client(capped(tmp_path, ("a", 101), own=3).server, mode=mode) as client:
+        assert await listing(client) == []
+        assert sorted(await rows(client)) == uris("a", range(97)) + own(range(3))
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_explicit_listed_doubles_skills_capped_alike(tmp_path, mode):  # DLV-17
+    mcp = capped(tmp_path, ("a", 101), own=3, config=BOTH)
+    async with Client(mcp.server, mode=mode) as client:
+        listed = await listing(client)
+        shown_ = await rows(client)
+    assert listed == uris("a", range(97)) + own(range(3))
+    assert sorted(shown_) == listed
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_empty_skills_list_is_one_page(tmp_path, mode):  # Review Focus 3
+    mcp = capped(tmp_path, ("a", 20), list_page_size=7)
+    async with Client(mcp.server, mode=mode) as client:
+        assert await page_sizes(client, "skills/list", "skills") == [0]
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -482,13 +508,15 @@ async def test_list_resources_is_cut(tmp_path):  # DLV-6
 
 async def test_local_listing_skills_keeps_the_same_room(tmp_path):
     headers = {"X-MCP-Via": "local", "X-MCP-Listed": "skills"}
-    async with over_http(
-        capped(tmp_path, ("a", 101), own=3), headers=headers
-    ) as client:
+    mcp = capped(tmp_path, ("a", 101), own=3)
+    got = seen_by(mcp)
+    async with over_http(mcp, headers=headers) as client:
         assert await listing(client) == own(range(3))
         assert sorted(await rows(client)) == sorted(
             uris("a", range(97)) + own(range(3))
         )
+    # The count is local's listing, skills/list: the own skills alone (DLV-11).
+    assert got[0].skills == SkillCount(3, 0)
 
 
 async def test_no_cap_lists_every_row(tmp_path):
@@ -509,18 +537,25 @@ async def test_resources_list_runs_no_listing_pass(
 
 
 @pytest.mark.parametrize(
-    ("own_", "plugin_", "cap_", "via", "count"),
+    ("own_", "plugin_", "cap_", "via", "listed", "count"),
     [
-        (0, 101, 100, "mcp", (100, 1)),
-        (3, 101, 100, "mcp", (100, 4)),
-        (5, 101, 3, "extension", (5, 101)),
-        (0, 101, None, "mcp", (101, 0)),
-        (3, 101, 100, "local", (3, 0)),
-        (2, 0, 100, "mcp", (2, 0)),
+        (0, 101, 100, "mcp", {"skills"}, (100, 1)),
+        (3, 101, 100, "mcp", {"skills"}, (100, 4)),
+        (3, 101, 100, "mcp", set(), (0, 0)),
+        (5, 101, 3, "extension", set(), (5, 101)),
+        (0, 101, None, "extension", set(), (101, 0)),
+        (3, 101, 100, "local", set(), (3, 0)),
+        (3, 101, 100, "local", {"skills"}, (3, 0)),
+        (2, 0, 100, "mcp", {"skills"}, (2, 0)),
     ],
 )
-def test_count(own_, plugin_, cap_, via, count):
-    assert plugins._count(own_, plugin_, cap_, via) == SkillCount(*count)
+def test_count(own_, plugin_, cap_, via, listed, count):
+    assert plugins._count(own_, plugin_, cap_, via, frozenset(listed)) == SkillCount(*count)
+
+
+async def shown(client, via: str) -> list[str]:
+    """The listing ``via`` shows skills in (DLV-11)."""
+    return await (rows(client) if via == "mcp" else listing(client))
 
 
 def seen_by(mcp: QuickMCP) -> list[Resolved]:
@@ -533,23 +568,31 @@ def seen_by(mcp: QuickMCP) -> list[Resolved]:
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
-    ("mine", "headers", "max_", "count"),
+    ("mine", "headers", "max_", "via", "count"),
     [
-        (0, {}, 100, (100, 1)),
-        (3, {}, 100, (100, 4)),
-        (0, {"X-MCP-Max": "all"}, None, (101, 0)),
-        (3, {"X-MCP-Via": "local"}, 100, (3, 0)),
-        (5, {"X-MCP-Max": "3"}, 3, (5, 101)),
+        (0, {}, 100, "mcp", (100, 1)),
+        (3, {}, 100, "mcp", (100, 4)),
+        (0, {"X-MCP-Max": "all"}, None, "mcp", (101, 0)),
+        (3, {"X-MCP-Via": "local"}, 100, "local", (3, 0)),
+        (5, {"X-MCP-Max": "3"}, 3, "mcp", (5, 101)),
+        (0, {"X-MCP-Via": "extension"}, 100, "extension", (100, 1)),
+        (
+            5,
+            {"X-MCP-Via": "extension", "X-MCP-Max": "3"},
+            3,
+            "extension",
+            (5, 101),
+        ),
     ],
 )
 async def test_instructions_see_the_cap_and_the_count(
-    tmp_path, mode, mine, headers, max_, count
+    tmp_path, mode, mine, headers, max_, via, count
 ):
     mcp = capped(tmp_path, ("a", 101), own=mine)
     got = seen_by(mcp)
     async with over_http(mcp, mode=mode, headers=headers) as client:
         text = result(client).instructions
-        listed = await listing(client)
+        listed = await shown(client, via)
     (delivery,) = got
     assert delivery.max == max_
     assert delivery.skills == SkillCount(*count)
@@ -558,20 +601,30 @@ async def test_instructions_see_the_cap_and_the_count(
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_the_count_follows_skills_list_not_resources_list(tmp_path, mode):
+@pytest.mark.parametrize(
+    ("headers", "rows_len", "listing_len", "count"),
+    [
+        ({"X-MCP-Listed": "none"}, 0, 0, (0, 0)),
+        ({"X-MCP-Via": "extension"}, 0, 100, (100, 1)),
+        ({}, 100, 0, (100, 1)),
+    ],
+)
+async def test_the_count_follows_the_modes_listing(
+    tmp_path, mode, headers, rows_len, listing_len, count
+):
     mcp = capped(tmp_path, ("a", 101))
     got = seen_by(mcp)
-    async with over_http(mcp, mode=mode, headers={"X-MCP-Listed": "none"}) as client:
-        assert await rows(client) == []
-        assert len(await listing(client)) == 100
-    assert got[0].skills == SkillCount(100, 1)
+    async with over_http(mcp, mode=mode, headers=headers) as client:
+        assert len(await rows(client)) == rows_len
+        assert len(await listing(client)) == listing_len
+    assert got[0].skills == SkillCount(*count)
 
 
 @pytest.mark.parametrize("mode", MODES)
 async def test_the_count_reuses_the_cached_build(
     tmp_path, monkeypatch, mode
 ):  # #86
-    mcp = capped(tmp_path, ("a", 101))
+    mcp = capped(tmp_path, ("a", 101), config=EXTENSION)
     seen_by(mcp)
     made = []
     plain = Plugins._make
@@ -722,14 +775,21 @@ async def test_a_failing_pin_leaves_the_count_out(
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_local_counts_without_the_view(tmp_path, caplog, mode):
+@pytest.mark.parametrize(
+    ("headers", "count"),
+    [
+        ({"X-MCP-Via": "local"}, SkillCount(2, 0)),
+        ({"X-MCP-Listed": "none"}, SkillCount(0, 0)),
+    ],
+)
+async def test_local_counts_without_the_view(tmp_path, caplog, mode, headers, count):
     mcp = capped(tmp_path, ("a", 3), own=2)
     mcp.plugin_view(_view_raises)
     got = seen_by(mcp)
     with caplog.at_level(logging.ERROR, logger="kubed.mcp"):
-        async with over_http(mcp, mode=mode, headers={"X-MCP-Via": "local"}):
+        async with over_http(mcp, mode=mode, headers=headers):
             pass
-    assert got[0].skills == SkillCount(2, 0)
+    assert got[0].skills == count
     assert not [r for r in caplog.records if "skill count" in r.getMessage()]
 
 

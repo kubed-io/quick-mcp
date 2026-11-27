@@ -7,14 +7,18 @@ import logging
 
 import pytest
 from fastmcp import Client
+from fastmcp.skills import SkillsClientExtension
 from gateway_server import over_http
 from plugin_server import ENTRY, copy
-from skill_server import load_skill, make_skill, request
+from skill_server import load_skill, make_skill, read_directory, request
 from test_delivery_inputs import config, seen, server, warnings
 
-from kubed.mcp import QuickMCP, skills
+from kubed.mcp import QuickMCP, delivery, skills
+from kubed.mcp.skills import SkillsExtension
 
 pytestmark = pytest.mark.unit
+
+MODES = ["legacy", "auto"]
 
 OWN_PROMPT = "own_prompt"
 OWN_STATE = "state://own"
@@ -24,7 +28,6 @@ PLUGIN_SKILLS = [ENTRY]
 PLUGIN_AGENTS = ["helper"]
 PROMPT_FILE = "prompts://t/greet.md"
 AGENT_FILE = "agents://t/helper.md"
-PLUGIN_SCHEMES = ("skill://t/", "prompts://", "agents://")
 
 
 def make(tmp_path, delivery=None, header_prefix=None) -> QuickMCP:
@@ -62,68 +65,95 @@ async def lists(client: Client) -> dict[str, list[str]]:
     }
 
 
-async def own_skill(mcp: QuickMCP) -> str:
-    """The SKILL.md URI of the server's own catalogue, as skills/list gives it."""
-    async with Client(mcp.server) as client:
-        got = (await lists(client))["skills"]
-    (own,) = [u for u in got if u not in PLUGIN_SKILLS]
-    return own
-
-
-def local_shape(own: str) -> dict[str, list[str]]:
-    return {
-        "prompts": [OWN_PROMPT],
-        "skills": [own],
-        "agents": [],
-        "resources": sorted([own, OWN_STATE]),
-    }
-
-
-@pytest.mark.parametrize("by", ["header", "query", "kb-header"])
-async def test_local_lists_none_of_the_plugins(tmp_path, by):
-    mcp = make(tmp_path, header_prefix="Kb" if by == "kb-header" else None)
-    own = await own_skill(mcp)
-    where = {
-        "header": {"headers": {"X-MCP-Via": "local"}},
-        "query": {"params": {"via": "local"}},
-        "kb-header": {"headers": {"Kb-Via": "local"}},
-    }[by]
-    async with over_http(mcp, **where) as client:
-        got = await lists(client)
-    assert got["prompts"] == [OWN_PROMPT]
-    assert got["skills"] == [own]
-    assert got["agents"] == []
-    assert got["resources"] == sorted([own, OWN_STATE])
-
-
-async def test_extension_lists_the_plugins_prompts(tmp_path):
-    mcp = make(tmp_path)
-    own = await own_skill(mcp)
-    async with over_http(mcp, headers={"X-MCP-Via": "extension"}) as client:
-        got = await lists(client)
-    assert got["prompts"] == sorted([*PLUGIN_PROMPTS, OWN_PROMPT])
-    assert got["skills"] == sorted([*PLUGIN_SKILLS, own])
-    assert got["agents"] == PLUGIN_AGENTS
-    assert not any(u.startswith(PLUGIN_SCHEMES) for u in got["resources"])
-    assert OWN_STATE in got["resources"]
-
-
-async def test_mcp_is_today(tmp_path):
-    mcp = make(tmp_path)
-    own = await own_skill(mcp)
-    async with over_http(mcp) as client:
-        plain = await lists(client)
-    async with over_http(mcp, headers={"X-MCP-Via": "mcp"}) as client:
-        header = await lists(client)
-    async with over_http(mcp, params={"via": "mcp"}) as client:
-        query = await lists(client)
-    assert plain == header == query
-    assert plain == {
+OWN_SKILL = "skill://tmp-skill/SKILL.md"
+SHAPES = {  # DLV-9: each kind one way per mode
+    "mcp": {
         "prompts": sorted([*PLUGIN_PROMPTS, OWN_PROMPT]),
-        "skills": sorted([*PLUGIN_SKILLS, own]),
+        "skills": [],
         "agents": PLUGIN_AGENTS,
-        "resources": sorted([*PLUGIN_SKILLS, own, OWN_STATE]),
-    }
+        "resources": sorted([*PLUGIN_SKILLS, OWN_SKILL, OWN_STATE]),
+    },
+    "extension": {
+        "prompts": sorted([*PLUGIN_PROMPTS, OWN_PROMPT]),
+        "skills": sorted([*PLUGIN_SKILLS, OWN_SKILL]),
+        "agents": PLUGIN_AGENTS,
+        "resources": [OWN_STATE],
+    },
+    "local": {
+        "prompts": [OWN_PROMPT],
+        "skills": [OWN_SKILL],
+        "agents": [],
+        "resources": [OWN_STATE],
+    },
+}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("via", list(SHAPES))
+@pytest.mark.parametrize("by", ["header", "query", "kb-header", "config"])
+async def test_each_mode_lists_each_kind_one_way(tmp_path, mode, via, by):
+    sent = {
+        "header": {"headers": {"X-MCP-Via": via}},
+        "query": {"params": {"via": via}},
+        "kb-header": {"headers": {"Kb-Via": via}},
+        "config": {},
+    }[by]
+    mcp = make(
+        tmp_path,
+        config(via=via) if by == "config" else None,
+        header_prefix="Kb" if by == "kb-header" else None,
+    )
+    async with over_http(mcp, mode=mode, **sent) as client:
+        assert await lists(client) == SHAPES[via]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_no_via_is_mcp_even_when_skills_list_declares_skills(tmp_path, mode):
+    async with over_http(
+        make(tmp_path), mode=mode, extensions=[SkillsClientExtension()]
+    ) as client:
+        assert await lists(client) == SHAPES["mcp"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("via", list(SHAPES))
+async def test_the_skills_extension_is_declared_in_every_mode(tmp_path, mode, via):
+    async with over_http(make(tmp_path), mode=mode, headers={"X-MCP-Via": via}) as client:
+        declared = client.session.server_capabilities.extensions or {}
+    assert declared[SkillsExtension.identifier] == {"directoryRead": True}
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_mcp_listing_none_lists_skills_nowhere(tmp_path, mode):  # DLV-9 edge
+    async with over_http(make(tmp_path), mode=mode, headers={"X-MCP-Listed": "none"}) as client:
+        got = await lists(client)
+        for uri in (*PLUGIN_SKILLS, OWN_SKILL):
+            assert await client.read_resource(uri)
+            assert (await request(client, "skills/get", uri=uri))["skill"]["uri"] == uri
+    assert (got["skills"], got["resources"]) == ([], [OWN_STATE])
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_explicit_listed_prompts_under_mcp_lists_them_twice(tmp_path, mode):
+    async with over_http(
+        make(tmp_path), mode=mode, headers={"X-MCP-Listed": "skills,prompts"}
+    ) as client:
+        got = await lists(client)
+    assert PROMPT_FILE in got["resources"] and "greet" in got["prompts"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_prefixed_extension_lists_one_way(tmp_path, mode):  # Review Focus 1
+    async with over_http(
+        make(tmp_path), header="kb+", mode=mode, headers={"X-MCP-Via": "extension"}
+    ) as client:
+        got = await lists(client)
+    assert got["skills"] == sorted([*PLUGIN_SKILLS, OWN_SKILL])
+    assert not [u for u in got["resources"] if "skill://" in u]
+
+
+def test_delivered_is_none_off_quickmcp():  # Review Focus 2
+    assert delivery._delivered() is None
 
 
 async def gets(client: Client) -> dict:
@@ -133,19 +163,30 @@ async def gets(client: Client) -> dict:
         for name in PLUGIN_PROMPTS
     }
     got_skills = {
-        uri: await request(client, "skills/get", uri=uri) for uri in PLUGIN_SKILLS
+        uri: await request(client, "skills/get", uri=uri)
+        for uri in (*PLUGIN_SKILLS, OWN_SKILL)
     }
     agents = {
         name: await request(client, "agents/get", name=name) for name in PLUGIN_AGENTS
     }
     reads = {
         uri: [c.model_dump(mode="json") for c in await client.read_resource(uri)]
-        for uri in (*PLUGIN_SKILLS, PROMPT_FILE, AGENT_FILE)
+        for uri in (*PLUGIN_SKILLS, OWN_SKILL, PROMPT_FILE, AGENT_FILE)
     }
-    return {"prompts": prompts, "skills": got_skills, "agents": agents, "reads": reads}
+    folders = {
+        uri: await read_directory(client, uri=uri)
+        for uri in ("skill://tmp-skill", "skill://t/demo-guide")
+    }
+    return {
+        "prompts": prompts,
+        "skills": got_skills,
+        "agents": agents,
+        "reads": reads,
+        "folders": folders,
+    }
 
 
-@pytest.mark.parametrize("via", ["extension", "local"])
+@pytest.mark.parametrize("via", list(SHAPES))
 async def test_every_get_answers_in_every_mode(tmp_path, via):
     mcp = make(tmp_path)
     async with over_http(mcp) as client:
@@ -184,6 +225,7 @@ async def test_an_explicit_listed_beats_the_preset(tmp_path, via):
     async with over_http(mcp, headers=headers) as client:
         got = await lists(client)
     assert set(PLUGIN_SKILLS) <= set(got["resources"])
+    assert OWN_SKILL in got["resources"]
     assert AGENT_FILE in got["resources"]
     assert PROMPT_FILE not in got["resources"]
     assert got["prompts"] == (
@@ -196,6 +238,7 @@ async def test_a_client_via_beats_a_config_listed(tmp_path):
     async with over_http(mcp, headers={"X-MCP-Via": "local"}) as client:
         got = await lists(client)
     assert not any(u.startswith("skill://t/") for u in got["resources"])
+    assert OWN_SKILL not in got["resources"]
     mcp = make(tmp_path / "same", config(listed="skills", via="local"))
     async with over_http(mcp) as client:
         got = await lists(client)
@@ -217,15 +260,10 @@ async def test_a_kb_via_beats_a_shared_listed(tmp_path):
 
 async def test_a_config_sets_via(tmp_path):
     mcp = make(tmp_path, config(via="local"))
-    own = await own_skill(mcp)
     async with over_http(mcp) as client:
-        assert await lists(client) == local_shape(own)
+        assert await lists(client) == SHAPES["local"]
     async with over_http(mcp, headers={"X-MCP-Via": "mcp"}) as client:
-        got = await lists(client)
-    assert got["prompts"] == sorted([*PLUGIN_PROMPTS, OWN_PROMPT])
-    assert got["skills"] == sorted([*PLUGIN_SKILLS, own])
-    assert got["agents"] == PLUGIN_AGENTS
-    assert set(PLUGIN_SKILLS) <= set(got["resources"])
+        assert await lists(client) == SHAPES["mcp"]
 
 
 @pytest.mark.parametrize(
