@@ -4,6 +4,7 @@ per key (PLUG-53 to PLUG-55)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import anyio
 import pytest
 from fastmcp import Client, Context
 from fastmcp.utilities.tests import asgi_server
+from gateway_server import over_http as serve_over_http
 from mcp_types import INTERNAL_ERROR
 from plugin_server import (
     DEMO,
@@ -26,7 +28,7 @@ from plugin_server import (
 from skill_server import request
 
 from kubed.mcp import QuickMCP
-from kubed.mcp.plugins import _PINS, View, _Slot
+from kubed.mcp.plugins import _PINS, View, _PinScope, _Slot
 from kubed.mcp.protocol import MCPError
 from kubed.mcp.request import request_values
 
@@ -381,25 +383,127 @@ READS = [
 ]
 
 
-@pytest.mark.parametrize("failure", [*FAILING_VIEWS, "make"])
-@pytest.mark.parametrize(("method", "params"), READS)
-async def test_a_failure_to_pin_fails_the_request(
-    monkeypatch, failure, method, params
-):  # Review Focus 5
+MODES = ["auto", "legacy"]  # the protocol eras, as tests/test_sep_2640.py
+FAILURES = [*FAILING_VIEWS, "make"]
+
+
+def failing(monkeypatch, failure) -> QuickMCP:
     mcp = served((DEMO, None))
     if failure == "make":
         monkeypatch.setattr(type(mcp._plugins), "_make", broken_make)
     else:
         mcp.plugin_view(FAILING_VIEWS[failure])
-    async with Client(mcp.server) as client:
+    return mcp
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("failure", FAILURES)
+@pytest.mark.parametrize(("method", "params"), READS)
+async def test_a_failure_to_pin_fails_the_request(
+    monkeypatch, failure, method, params, mode
+):  # Review Focus 5
+    mcp = failing(monkeypatch, failure)
+    async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
             await request(client, method, **params)
-    # The pin's own error, never what its absence would read as, an unknown skill.
+    # The pin's failure, never what its absence would read as, an unknown skill, and
+    # the same on every protocol era.
     assert caught.value.error.code == INTERNAL_ERROR
+    assert caught.value.error.message == "Internal server error"
     with pytest.raises(
         (ZeroDivisionError, TypeError, RuntimeError)
-    ):  # off a request it just raises
+    ):  # off a request it just raises the original
         await mcp._plugins.pinned()
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("failure", FAILURES)
+async def test_a_failure_to_pin_fails_the_request_over_http(
+    monkeypatch, failure, mode
+):  # Review Focus 5
+    mcp = failing(monkeypatch, failure)
+    async with serve_over_http(mcp, mode=mode) as client:
+        with pytest.raises(MCPError) as caught:
+            await request(client, "skills/list")
+    assert caught.value.error.code == INTERNAL_ERROR
+    assert caught.value.error.message == "Internal server error"
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(("method", "params"), READS)
+async def test_a_view_that_raises_an_mcp_error_sends_it_whole(
+    method, params, mode
+):  # PLUG-53
+    def refuses() -> View:
+        raise MCPError(code=-32001, message="not for you")
+
+    mcp = served((DEMO, None))
+    mcp.plugin_view(refuses)
+    async with Client(mcp.server, mode=mode) as client:
+        with pytest.raises(MCPError) as caught:
+            await request(client, method, **params)
+    assert caught.value.error.code == -32001
+    assert caught.value.error.message == "not for you"
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("failure", FAILURES)
+async def test_the_original_error_is_logged_once_with_its_traceback(
+    monkeypatch, caplog, failure, mode
+):  # PLUG-53
+    mcp = failing(monkeypatch, failure)
+    with caplog.at_level(logging.ERROR):
+        async with Client(mcp.server, mode=mode) as client:
+            with pytest.raises(MCPError):
+                await request(client, "skills/list")
+    logged = [
+        r
+        for r in caplog.records
+        if r.exc_info
+        and isinstance(r.exc_info[1], (ZeroDivisionError, TypeError, RuntimeError))
+    ]
+    assert len(logged) == 1
+    assert logged[0].levelno == logging.ERROR
+    assert logged[0].name == "kubed.mcp.plugins"
+    assert logged[0].exc_info[2] is not None  # its traceback is attached
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_failed_pin_in_a_nested_request_is_logged_once(caplog, mode):  # PLUG-53
+    mcp = served((DEMO, None))
+    mcp.plugin_view(lambda: 1 / 0)
+
+    @mcp.tool
+    async def nested(ctx: Context) -> str:
+        try:
+            await ctx.read_resource(ENTRY)
+        except Exception as exc:  # noqa: BLE001 - the tool carries on
+            return type(exc).__name__
+        return "read"
+
+    with caplog.at_level(logging.ERROR):
+        async with Client(mcp.server, mode=mode) as client:
+            with pytest.raises(MCPError) as caught:
+                await client.call_tool("nested", {})
+    assert caught.value.error.code == INTERNAL_ERROR
+    ours = [r for r in caplog.records if r.name == "kubed.mcp.plugins"]
+    assert len(ours) == 1
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_build_that_raises_an_mcp_error_sends_it_whole(
+    monkeypatch, mode
+):  # PLUG-53
+    async def refuses(self, state, view, key):
+        raise MCPError(code=-32001, message="not for you")
+
+    mcp = served((DEMO, None))
+    monkeypatch.setattr(type(mcp._plugins), "_make", refuses)
+    async with Client(mcp.server, mode=mode) as client:
+        with pytest.raises(MCPError) as caught:
+            await request(client, "skills/list")
+    assert caught.value.error.code == -32001
+    assert caught.value.error.message == "not for you"
 
 
 async def test_the_build_key_is_one_extendable_value(monkeypatch):  # #28's seam (GW-6)
@@ -427,3 +531,18 @@ async def test_the_build_key_is_one_extendable_value(monkeypatch):  # #28's seam
         "k",
         None,
     )
+
+
+async def test_a_pins_mcp_error_carries_nothing_of_the_requests_own_miss():  # PLUG-53
+    mcp = served((DEMO, None))
+    scope = next(m for m in mcp.server.middleware if isinstance(m, _PinScope))
+    sent = MCPError(code=-32001, message="not for you")
+
+    async def misses(context):
+        (_PINS.get() or {})[mcp._plugins].error = sent
+        raise KeyError("Unknown resource")  # what the request made of the absence
+
+    with pytest.raises(MCPError) as caught:
+        await scope.on_request(None, misses)
+    assert caught.value is sent
+    assert caught.value.__context__ is None

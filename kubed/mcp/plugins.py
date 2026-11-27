@@ -40,7 +40,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NoReturn, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlparse
 
 import anyio
@@ -53,7 +53,9 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool
 from fastmcp.utilities.versions import VersionSpec, version_sort_key
-from mcp_types import TextContent
+from mcp_types import INTERNAL_ERROR, TextContent
+
+from mcp.shared.exceptions import MCPError
 
 from . import gateway, skills
 from ._media import text_of
@@ -1148,6 +1150,11 @@ class _PinScope(Middleware):
     open and shares it. FastMCP logs and swallows what a provider raises, so an error
     stored in the slot is raised again here, after the request is handled, in place of
     whatever the request made of its absence (an unknown skill, say).
+
+    It is raised as an ``MCPError``, so both protocol eras answer alike (the legacy
+    one would send code 0 and the error's text for anything else): an ``MCPError`` the
+    pin raised goes through whole, and any other failure is ``-32603`` "Internal
+    server error", the original logged once, at error, with its traceback.
     """
 
     def __init__(self, plugins: Plugins) -> None:
@@ -1165,13 +1172,27 @@ class _PinScope(Middleware):
         except Exception:
             if slot.error is None:
                 raise
-            raise slot.error from None
+            result = None  # the pin's failure is what the request fails with
         finally:
             if token is not None:
                 _PINS.reset(token)
         if slot.error is not None:
-            raise slot.error
+            self._fail(slot.error, token is not None)
         return result
+
+    @staticmethod
+    def _fail(error: Exception, owner: bool) -> NoReturn:
+        """Fail the request for its pin's ``error``: raised as it is if an ``MCPError``,
+        else as an internal error, the original logged here and nowhere else (the SDK
+        logs only what it is not handed an ``MCPError`` for). Only the scope that opened
+        the slot logs: one nested in it shares the slot and just raises."""
+        if isinstance(error, MCPError):
+            raise error
+        if owner:
+            log.error(
+                "plugin pin failed: %s: %s", type(error).__name__, error, exc_info=error
+            )
+        raise MCPError(code=INTERNAL_ERROR, message="Internal server error") from error
 
 
 @dataclass
