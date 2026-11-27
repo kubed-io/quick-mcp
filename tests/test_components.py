@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import inspect
 import logging
+import signal
 import sys
 import types
 import typing
@@ -14,6 +16,7 @@ from typing import Literal
 
 import fastmcp.server.server
 import pytest
+import uvicorn
 from fastmcp import Client, FastMCP
 from pydantic import model_validator
 from starlette.testclient import TestClient
@@ -74,6 +77,7 @@ def test_every_server_has_the_three_built_ins_with_their_defaults() -> None:
         ("serving.host", "HOST", "--host"),
         ("serving.port", "PORT", "--port"),
         ("serving.log_level", "LOG_LEVEL", "--log-level"),
+        ("serving.graceful_timeout", "GRACEFUL_TIMEOUT", "--graceful-timeout"),
         ("telemetry.profiles", "TELEMETRY_PROFILES", "--telemetry-profiles"),
         ("telemetry.profile_cpu", "TELEMETRY_PROFILE_CPU", "--telemetry-profile-cpu"),
         (
@@ -280,6 +284,8 @@ def test_run_reads_host_and_port_from_environ(ran) -> None:
     QuickMCP("t", environ={"TRANSPORT": "http", "HOST": "0.0.0.0", "PORT": "9001"}).run(
         path="/mcp"
     )
+    [middleware] = ran[0].pop("middleware")
+    assert middleware.cls.__module__ == "kubed.mcp._shutdown"
     assert ran == [
         {
             "transport": "http",
@@ -287,8 +293,105 @@ def test_run_reads_host_and_port_from_environ(ran) -> None:
             "port": 9001,
             "show_banner": False,
             "path": "/mcp",
+            "uvicorn_config": {"timeout_graceful_shutdown": 15},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "environ, argv, timeout",
+    [
+        ({}, None, 15),
+        ({"GRACEFUL_TIMEOUT": "2.5"}, None, 2.5),
+        ({}, ["--graceful-timeout", "3"], 3),
+    ],
+    ids=["default", "env", "flag"],
+)
+def test_run_gives_uvicorn_the_graceful_timeout(ran, environ, argv, timeout) -> None:
+    QuickMCP("t", environ={"TRANSPORT": "http", **environ}, argv=argv).run()
+    assert ran[0]["uvicorn_config"] == {"timeout_graceful_shutdown": timeout}
+
+
+def test_the_graceful_timeout_is_never_negative() -> None:
+    with pytest.raises(ValueError, match=r"serving\.graceful_timeout"):
+        QuickMCP("t", environ={"GRACEFUL_TIMEOUT": "-1"})
+
+
+def test_run_keeps_the_callers_other_uvicorn_config(ran) -> None:
+    given = {"log_config": None, "ws": "none"}
+    QuickMCP("t", environ={"TRANSPORT": "http"}).run(uvicorn_config=given)
+    assert ran[0]["uvicorn_config"] == {
+        "log_config": None,
+        "ws": "none",
+        "timeout_graceful_shutdown": 15,
+    }
+    assert given == {"log_config": None, "ws": "none"}
+
+
+def test_the_listen_ender_comes_ahead_of_the_callers_middleware(ran) -> None:
+    from starlette.middleware import Middleware
+
+    class Own:
+        def __init__(self, app) -> None:
+            self.app = app
+
+    own = Middleware(Own)
+    QuickMCP("t", environ={"TRANSPORT": "http"}).run(middleware=[own])
+    first, *rest = ran[0]["middleware"]
+    assert first.cls.__module__ == "kubed.mcp._shutdown"
+    assert rest == [own]
+
+
+def test_run_hooks_uvicorns_stop_only_while_it_serves(
+    monkeypatch, root_logging
+) -> None:
+    original = uvicorn.Server.handle_exit
+    during: list[object] = []
+
+    def serve(self, **kwargs) -> None:
+        during.append(uvicorn.Server.handle_exit)
+
+    monkeypatch.setattr("fastmcp.FastMCP.run", serve)
+    QuickMCP("t", environ={"TRANSPORT": "http"}).run()
+    assert during[0] is not original and during[0].__wrapped__ is original
+    assert uvicorn.Server.handle_exit is original
+
+    def fail(self, **kwargs) -> None:
+        during.append(uvicorn.Server.handle_exit)
+        raise OSError("address in use")
+
+    monkeypatch.setattr("fastmcp.FastMCP.run", fail)
+    with pytest.raises(OSError, match="address in use"):
+        QuickMCP("t", environ={"TRANSPORT": "http"}).run()
+    assert during[1] is not original and during[1].__wrapped__ is original
+    assert uvicorn.Server.handle_exit is original
+
+
+def test_run_hooks_nothing_on_stdio(monkeypatch, root_logging) -> None:
+    original = uvicorn.Server.handle_exit
+    during: list[object] = []
+    monkeypatch.setattr(
+        "fastmcp.FastMCP.run",
+        lambda self, **kwargs: during.append(uvicorn.Server.handle_exit),
+    )
+    QuickMCP("t", environ={}).run()
+    assert during == [original]
+
+
+def test_uvicorns_stop_is_the_method_the_hook_wraps() -> None:
+    """The stop hook replaces ``uvicorn.Server.handle_exit``, which uvicorn's signal
+    handlers call as ``(self, sig, frame)``. sse-starlette replaces it on import with a
+    function of ``*args, **kwargs`` that calls uvicorn's, so whichever is there must
+    take those three."""
+    handle_exit = inspect.getattr_static(uvicorn.Server, "handle_exit")
+    assert inspect.isfunction(handle_exit)
+    inspect.signature(handle_exit).bind(object(), signal.SIGTERM, None)
+    own = getattr(sys.modules.get("sse_starlette.sse"), "AppStatus", None)
+    uvicorns = getattr(own, "original_handler", None) or handle_exit
+    assert list(inspect.signature(uvicorns).parameters) == ["self", "sig", "frame"]
+    assert "signal.signal(sig, self.handle_exit)" in inspect.getsource(
+        uvicorn.Server.capture_signals
+    )
 
 
 def test_run_on_stdio_passes_nothing_else(ran) -> None:
@@ -325,6 +428,23 @@ def test_run_refuses_a_serving_setting_before_it_does_anything(
     with pytest.raises(TypeError) as caught:
         mcp.run(path="/mcp", **{key: "x"})
     assert str(caught.value).startswith(f"run() takes no {key!r}: {hint}")
+    assert ran == [] and root_logging.level == level
+    mcp.auth = Refuse()  # serving has not started
+
+
+@pytest.mark.parametrize("environ", [{}, {"TRANSPORT": "http"}], ids=["stdio", "http"])
+def test_run_refuses_uvicorns_graceful_timeout_before_it_does_anything(
+    ran, root_logging, environ
+) -> None:
+    mcp = QuickMCP("t", environ={**environ, "LOG_LEVEL": "DEBUG"})
+    level = root_logging.level
+    with pytest.raises(TypeError) as caught:
+        mcp.run(uvicorn_config={"log_config": None, "timeout_graceful_shutdown": 1})
+    assert str(caught.value) == (
+        "run() takes no uvicorn_config['timeout_graceful_shutdown']: set "
+        "serving.graceful_timeout in the config (GRACEFUL_TIMEOUT, --graceful-timeout, "
+        "a serving: file key) or through hooks={'serving': ...}"
+    )
     assert ran == [] and root_logging.level == level
     mcp.auth = Refuse()  # serving has not started
 
