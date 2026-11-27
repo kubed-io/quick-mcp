@@ -90,6 +90,7 @@ def test_every_server_has_the_three_built_ins_with_their_defaults() -> None:
         ("delivery.resources", "DELIVERY_RESOURCES", "--delivery-resources"),
         ("delivery.listed", "DELIVERY_LISTED", "--delivery-listed"),
         ("delivery.via", "DELIVERY_VIA", "--delivery-via"),
+        ("delivery.max", "DELIVERY_MAX", "--delivery-max"),
     ],
 )
 def test_each_built_in_item_has_its_names(path, env, arg) -> None:
