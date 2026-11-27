@@ -15,9 +15,12 @@ from gateway_server import over_http
 from plugin_server import agent_md, command_md, skill, write
 from skill_server import read_directory, request
 from test_delivery_inputs import warnings
+from test_handshake import errors
 
-from kubed.mcp import DeliverySettings, QuickMCP
-from kubed.mcp.delivery import _Partial, _resolved
+from kubed.mcp import DeliverySettings, QuickMCP, plugins
+from kubed.mcp.delivery import Resolved, SkillCount, _Partial, _resolved
+from kubed.mcp.plugins import Plugins, View
+from kubed.mcp.protocol import MCPError
 from kubed.mcp.skills import Skill, serve
 
 pytestmark = pytest.mark.unit
@@ -422,3 +425,189 @@ async def test_resources_list_runs_no_listing_pass(
     async with Client(capped(tmp_path, ("a", 101), own=3).server, mode=mode) as client:
         assert len(await rows(client)) == 100
     assert checked == []
+
+
+@pytest.mark.parametrize(
+    ("own_", "plugin_", "cap_", "via", "count"),
+    [
+        (0, 101, 100, "mcp", (100, 1)),
+        (3, 101, 100, "mcp", (100, 4)),
+        (5, 101, 3, "extension", (5, 101)),
+        (0, 101, None, "mcp", (101, 0)),
+        (3, 101, 100, "local", (3, 0)),
+        (2, 0, 100, "mcp", (2, 0)),
+    ],
+)
+def test_count(own_, plugin_, cap_, via, count):
+    assert plugins._count(own_, plugin_, cap_, via) == SkillCount(*count)
+
+
+def seen_by(mcp: QuickMCP) -> list[Resolved]:
+    got: list[Resolved] = []
+    mcp.instructions(
+        lambda d: got.append(d) or ("cut" if d.skills and d.skills.cut else "whole")
+    )
+    return got
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    ("mine", "headers", "max_", "count"),
+    [
+        (0, {}, 100, (100, 1)),
+        (3, {}, 100, (100, 4)),
+        (0, {"X-MCP-Max": "all"}, None, (101, 0)),
+        (3, {"X-MCP-Via": "local"}, 100, (3, 0)),
+        (5, {"X-MCP-Max": "3"}, 3, (5, 101)),
+    ],
+)
+async def test_instructions_see_the_cap_and_the_count(
+    tmp_path, mode, mine, headers, max_, count
+):
+    mcp = capped(tmp_path, ("a", 101), own=mine)
+    got = seen_by(mcp)
+    async with over_http(mcp, mode=mode, headers=headers) as client:
+        text = result(client).instructions
+        listed = await listing(client)
+    (delivery,) = got
+    assert delivery.max == max_
+    assert delivery.skills == SkillCount(*count)
+    assert delivery.skills.listed == len(listed)
+    assert text == ("cut" if count[1] else "whole")
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_the_count_follows_skills_list_not_resources_list(tmp_path, mode):
+    mcp = capped(tmp_path, ("a", 101))
+    got = seen_by(mcp)
+    async with over_http(mcp, mode=mode, headers={"X-MCP-Listed": "none"}) as client:
+        assert await rows(client) == []
+        assert len(await listing(client)) == 100
+    assert got[0].skills == SkillCount(100, 1)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_the_count_reuses_the_cached_build(
+    tmp_path, monkeypatch, mode
+):  # Review Focus 5, #86
+    mcp = capped(tmp_path, ("a", 101))
+    seen_by(mcp)
+    made = []
+    plain = Plugins._make
+    monkeypatch.setattr(
+        Plugins, "_make", lambda self, *a: made.append(1) or plain(self, *a)
+    )
+    checked = visibility_checks(monkeypatch)
+    async with over_http(mcp, mode=mode) as client:
+        assert checked == []  # the handshake ran no listing
+        await rows(client)
+        assert checked == []
+        await listing(client)
+    assert len(made) == 1
+
+
+async def test_skills_is_none_off_the_handshake(tmp_path):
+    mcp = capped(tmp_path, ("a", 101))
+    seen_by(mcp)
+
+    @mcp.tool
+    def count() -> dict:
+        return {"skills": _resolved().skills}
+
+    async with over_http(mcp) as client:
+        assert (await client.call_tool("count", {})).data == {"skills": None}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(("mine", "count"), [(0, None), (3, SkillCount(3, 0))])
+async def test_a_server_without_plugin_skills(mode, mine, count):
+    mcp = QuickMCP("t")
+    if mine:
+        serve(
+            mcp.server,
+            [Skill.from_files({"SKILL.md": skill(f"own-{i:03}")}) for i in range(mine)],
+        )
+    got = seen_by(mcp)
+    async with over_http(mcp, mode=mode):
+        pass
+    assert got[0].skills == count
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_the_count_is_not_echoed(tmp_path, mode):
+    mcp = capped(tmp_path, ("a", 101))
+    seen_by(mcp)
+    async with over_http(mcp, mode=mode) as client:
+        assert set(result(client).meta[META]) == {
+            "resources",
+            "listed",
+            "via",
+            "prefix",
+            "max",
+        }
+
+
+async def _never(self):
+    raise AssertionError("counted with no instructions fn")
+
+
+async def _boom(self):
+    raise RuntimeError("boom")
+
+
+async def test_no_instructions_fn_counts_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(Plugins, "skill_count", _never)
+    async with over_http(capped(tmp_path, ("a", 101))) as client:
+        assert result(client) is not None
+
+
+async def test_a_failing_count_leaves_skills_none(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(Plugins, "skill_count", _boom)
+    mcp = capped(tmp_path, ("a", 101))
+    got = seen_by(mcp)
+    with caplog.at_level(logging.ERROR, logger="kubed.mcp.delivery"):
+        async with over_http(mcp):
+            pass
+    assert got[0].skills is None
+    assert [r.getMessage() for r in errors(caplog)] == [
+        "skill count failed: the instructions get no count"
+    ]
+
+
+def _view_raises() -> View:
+    raise RuntimeError("view down")
+
+
+def _build_fails() -> View:
+    def admits(plugin):
+        raise RuntimeError("view down")
+
+    return View("broken", admits)
+
+
+@pytest.mark.parametrize(
+    ("view", "key"), [(_view_raises, None), (_build_fails, "broken")]
+)
+async def test_a_failing_pin_leaves_the_count_out(
+    tmp_path, caplog, view, key
+):  # Review Focus 4
+    mcp = capped(tmp_path, ("a", 3))
+    mcp.plugin_view(view)
+    got = seen_by(mcp)
+    with caplog.at_level(logging.ERROR, logger="kubed.mcp.plugins"):
+        for _ in range(2):
+            async with over_http(mcp, mode="legacy") as client:
+                assert result(client) is not None
+                with pytest.raises(MCPError) as caught:  # as today (PLUG-53)
+                    await request(client, "skills/list")
+                assert caught.value.error.message == "view down"
+    assert [d.skills for d in got] == [None, None]
+    skipped = [r for r in caplog.records if "skill count" in r.getMessage()]
+    assert [r.msg for r in skipped] == [
+        "skill count skipped for view %r: %s: %s; the instructions get no count"
+    ] * len(skipped)
+    logged = [r.getMessage() for r in skipped]
+    assert logged == [
+        f"skill count skipped for view {key!r}: RuntimeError: view down; "
+        "the instructions get no count"
+    ]
