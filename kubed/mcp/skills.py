@@ -52,6 +52,10 @@ from fastmcp.skills.provider import (
     # FastMCP 4.2's private row builder, imported so that a row is exactly FastMCP's.
     _file_resource,
 )
+
+# FastMCP 4.2's private limit check, run before any file is read, as
+# ``Skill.from_directory`` runs it: its numbers and its wording.
+from fastmcp.skills.skill import _validate_limits
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import INVALID_PARAMS, PaginatedRequestParams
 from pydantic import Field, ValidationError
@@ -100,8 +104,10 @@ def _reason(exc: Exception) -> str:
 def load_skill(path: str | os.PathLike[str]) -> Skill | None:
     """The skill in folder ``path``, without its reserved files, or None.
 
-    A folder with no ``SKILL.md`` is no skill: a warning, and None. A skill FastMCP's
-    ``Skill.from_directory`` refuses is not served: an error with the reason, and None.
+    A folder with no ``SKILL.md`` is no skill: a warning, and None. The skill is built
+    with ``Skill.from_files`` from the folder's files less its hidden paths, any path
+    with a segment starting with ``.``, with the checks ``Skill.from_directory`` makes.
+    A skill refused is not served: an error with the reason, and None.
     """
     skill = _load_skill(Path(path))
     return None if isinstance(skill, str) else skill
@@ -113,7 +119,7 @@ def _load_skill(path: Path) -> Skill | str:
         log.warning("no SKILL.md at %s", path)
         return f"no {ENTRY}"
     try:
-        skill = Skill.from_directory(path)
+        skill, hidden = _from_folder(path)
     except (OSError, ValueError) as exc:
         reason = _reason(exc)
         log.error(
@@ -122,7 +128,70 @@ def _load_skill(path: Path) -> Skill | str:
             reason,
         )
         return reason
+    if hidden:
+        log.debug(
+            "skill %s: hidden paths not served: %s", skill.name, ", ".join(hidden)
+        )
     return without_reserved(skill)
+
+
+def _is_hidden(path: str) -> bool:
+    """Whether any ``/``-segment of ``path`` starts with a dot."""
+    return any(part.startswith(".") for part in path.split("/"))
+
+
+def _scan(root: Path) -> tuple[list[Path], list[str]]:
+    """The regular files under ``root``, and the hidden entries left out.
+
+    FastMCP's ``scan_files`` with one difference: a hidden entry is left out unjudged,
+    and a hidden folder is not entered (SKL-24). Both lists are in walk order, each
+    folder's entries sorted, depth first; the hidden ones are root-relative POSIX paths.
+    A folder it cannot list is skipped, as ``rglob`` skips it.
+    """
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("skill root must be a directory, not a symlink")
+    files: list[Path] = []
+    hidden: list[str] = []
+
+    def walk(folder: Path) -> None:
+        try:
+            entries = sorted(folder.iterdir(), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                hidden.append(entry.relative_to(root).as_posix())
+            elif entry.is_symlink():
+                raise ValueError(f"skill contains a symlink: {entry.relative_to(root)}")
+            elif entry.is_file():
+                files.append(entry)
+            elif entry.is_dir():
+                walk(entry)
+            else:
+                raise ValueError(
+                    f"skill contains a non-regular file: {entry.relative_to(root)}"
+                )
+
+    walk(root)
+    return files, hidden
+
+
+def _from_folder(path: Path) -> tuple[Skill, list[str]]:
+    """``Skill.from_directory`` over the folder's files less its hidden paths.
+
+    Returns the skill, not yet trimmed of reserved files, and the hidden entries
+    left out.
+    """
+    root = path.absolute()
+    paths, hidden = _scan(root)
+    _validate_limits(len(paths), sum(file.stat().st_size for file in paths))
+    files = {file.relative_to(root).as_posix(): file.read_bytes() for file in paths}
+    skill = Skill.from_files(files)
+    if skill.name != root.name:
+        raise ValueError(
+            f"Skill folder {root.name!r} must match its SKILL.md name {skill.name!r}"
+        )
+    return skill, hidden
 
 
 def _is_index(path: str) -> bool:
@@ -131,8 +200,13 @@ def _is_index(path: str) -> bool:
 
 
 def _unserved(files: Iterable[str]) -> set[str]:
-    """The files whose URI the server answers otherwise: an index, the root manifest."""
-    return {path for path in files if _is_index(path) or path == MANIFEST}
+    """The files never served: a hidden path (SKL-24), and a file whose URI the server
+    answers otherwise: an index, the root manifest."""
+    return {
+        path
+        for path in files
+        if _is_hidden(path) or _is_index(path) or path == MANIFEST
+    }
 
 
 def _all_folders(paths: Iterable[str]) -> set[str]:
@@ -168,8 +242,12 @@ def without_reserved(skill: Skill) -> Skill:
     ``_manifest`` below the root is an ordinary file. A folder at such a URI is named
     too, though its files stay in the skill. The same skill comes back when nothing is
     reserved.
+
+    A hidden path is dropped too, without a warning: one debug line names the files.
     """
     for rel in sorted(_all_folders(skill.files)):
+        if _is_hidden(rel):
+            continue
         if _is_index(rel):
             log.warning(
                 "skill %s: folder %s is not served, "
@@ -185,7 +263,14 @@ def without_reserved(skill: Skill) -> Skill:
                 rel,
             )
     unserved = sorted(_unserved(skill.files))
+    hidden = [name for name in unserved if _is_hidden(name)]
+    if hidden:
+        log.debug(
+            "skill %s: hidden paths not served: %s", skill.name, ", ".join(hidden)
+        )
     for name in unserved:
+        if _is_hidden(name):
+            continue
         answers = "the skill's manifest" if name == MANIFEST else "its folder's index"
         log.warning(
             "skill %s: %s is not served, %s answers that URI", skill.name, name, answers
@@ -497,8 +582,9 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
 
     ``_get_resource`` still answers every file, the manifest and each folder's two index
     files by exact URI. A folder is every one a skill's files sit in. A file whose URI
-    the server answers otherwise is never served: a catalogue given here is trimmed with
-    ``without_reserved``, and one ``load_skills()`` returns is trimmed silently.
+    the server answers otherwise, or a hidden path, is never served: a catalogue given
+    here is trimmed with ``without_reserved``, and one ``load_skills()`` returns is
+    trimmed silently.
 
     The provider brings ``SkillsExtension``, which FastMCP registers once however many
     providers bring it.

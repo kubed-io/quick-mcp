@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A skill's hidden files and folders (names starting with `.`) are no longer served, and the rest of the skill is.
+
 ## [0.5.1] - 2026-11-26
 
 ### Fixed

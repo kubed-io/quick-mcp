@@ -10,7 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import pathlib
+import sys
 
+import fastmcp.skills.skill as fastmcp_skill
 import pytest
 import yaml
 from fastmcp import Client
@@ -109,6 +113,19 @@ def invalid_skill(tmp_path, case: str):
         (tmp_path / "outside.md").write_text("# Outside\n", encoding="utf-8")
         (folder / "linked.md").symlink_to(tmp_path / "outside.md")
         return folder
+    if case == "nested-symlink":
+        folder = make_skill(tmp_path, {"assets/a.txt": "a\n"})
+        (tmp_path / "outside.md").write_text("# Outside\n", encoding="utf-8")
+        (folder / "assets" / "link.md").symlink_to(tmp_path / "outside.md")
+        return folder
+    if case == "root-symlink":
+        (tmp_path / "real").mkdir()
+        real = make_skill(tmp_path / "real", {})
+        link = tmp_path / "tmp-skill"
+        link.symlink_to(real)
+        return link
+    if case == "too-many-files":
+        return make_skill(tmp_path, {f"refs/{i}.txt": "x" for i in range(512)})
     folder = tmp_path / "tmp-skill"  # not-utf8
     folder.mkdir()
     (folder / "SKILL.md").write_bytes(
@@ -119,7 +136,7 @@ def invalid_skill(tmp_path, case: str):
 
 INVALID = {
     "bad-name": "lowercase letters",
-    "folder-mismatch": "must match its SKILL.md name",
+    "folder-mismatch": "Skill folder 'tmp-skill' must match its SKILL.md name 'some-other-name'",
     "no-description": "description must contain",
     "empty-description": "description must contain",
     "long-description": "description must contain",
@@ -128,6 +145,9 @@ INVALID = {
     "nan": "finite JSON values",
     "int-key": "keys must be strings",
     "symlink": "symlink",
+    "nested-symlink": "skill contains a symlink: assets/link.md",
+    "root-symlink": "skill root must be a directory, not a symlink",
+    "too-many-files": "A skill may contain at most 512 files",
     "not-utf8": "utf-8",
 }
 
@@ -142,6 +162,109 @@ def test_an_invalid_skill_is_an_error_naming_why(tmp_path, caplog, case):
     assert len(errors) == 1
     assert str(folder) in errors[0]
     assert INVALID[case] in errors[0]
+
+
+fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+
+HIDDEN_FILES = {
+    ".gitignore": "*.log\n",
+    ".env": "SECRET=1\n",
+    ".git/config": "[core]\n",
+    "assets/.gitkeep": "",
+    "assets/a.txt": "a\n",
+    "references/R.md": "# R\n",
+}
+
+
+def test_load_skill_leaves_out_hidden_paths(tmp_path, caplog):
+    folder = make_skill(tmp_path, HIDDEN_FILES)
+    with caplog.at_level(logging.DEBUG, logger="kubed.mcp.skills"):
+        skill = load_skill(folder)
+    assert set(skill.files) == {"SKILL.md", "assets/a.txt", "references/R.md"}
+    ours = [r for r in caplog.records if r.name == "kubed.mcp.skills"]
+    assert [(r.levelno, r.getMessage()) for r in ours] == [
+        (
+            logging.DEBUG,
+            "skill tmp-skill: hidden paths not served: .env, .git, .gitignore, assets/.gitkeep",
+        )
+    ]
+
+
+def test_load_skill_is_from_directory_on_an_ordinary_folder():
+    ours, theirs = load_skill(DEMO), Skill.from_directory(DEMO)
+    assert dict(ours.files) == dict(theirs.files)
+    assert ours._manifest == theirs._manifest
+
+
+def test_a_symlink_in_a_hidden_folder_does_not_refuse_the_skill(tmp_path, caplog):
+    folder = make_skill(tmp_path, {"assets/a.txt": "a\n"}, folders=(".venv/bin",))
+    (folder / ".venv/bin/python").symlink_to(sys.executable)
+    with caplog.at_level(logging.INFO):
+        skill = load_skill(folder)
+    assert set(skill.files) == {"SKILL.md", "assets/a.txt"}
+    assert not caplog.records
+
+
+def test_a_hidden_symlink_is_left_out(tmp_path):
+    folder = make_skill(tmp_path, {})
+    (folder / ".envrc").symlink_to(tmp_path / "nowhere")
+    assert set(load_skill(folder).files) == {"SKILL.md"}
+
+
+@fifo
+def test_a_special_file_in_a_hidden_folder_does_not_refuse_the_skill(tmp_path):
+    folder = make_skill(tmp_path, {}, folders=(".git",))
+    os.mkfifo(folder / ".git" / "fsmonitor")
+    assert set(load_skill(folder).files) == {"SKILL.md"}
+
+
+@fifo
+def test_a_special_file_outside_a_hidden_folder_refuses_the_skill(tmp_path, caplog):
+    folder = make_skill(tmp_path, {})
+    os.mkfifo(folder / "pipe")
+    with caplog.at_level(logging.ERROR):
+        assert load_skill(folder) is None
+    assert "skill contains a non-regular file: pipe" in caplog.text
+
+
+def test_hidden_files_do_not_count_against_the_limits(tmp_path):
+    folder = make_skill(tmp_path, {f".git/objects/{i}": "x" for i in range(600)})
+    assert set(load_skill(folder).files) == {"SKILL.md"}
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs a user that permissions apply to",
+)
+def test_a_folder_that_cannot_be_listed_is_skipped_as_fastmcp_skips_it(tmp_path):
+    folder = make_skill(tmp_path, {"assets/a.txt": "a\n", "locked/b.txt": "b\n"})
+    (folder / "locked").chmod(0o000)
+    try:
+        assert (
+            set(load_skill(folder).files)
+            == set(Skill.from_directory(folder).files)
+            == {"SKILL.md", "assets/a.txt"}
+        )
+    finally:
+        (folder / "locked").chmod(0o755)
+
+
+@pytest.mark.parametrize("over", ["files", "bytes"])
+def test_the_limits_are_checked_before_any_file_is_read(tmp_path, monkeypatch, caplog, over):
+    if over == "files":
+        folder = make_skill(tmp_path, {f"refs/{i}.txt": "x" for i in range(512)})
+        reason = "A skill may contain at most 512 files"
+    else:
+        monkeypatch.setattr(fastmcp_skill, "MAX_SKILL_BYTES", 1000)
+        folder = make_skill(tmp_path, {"big.txt": "x" * 2000})
+        reason = "A skill may contain at most 1000 bytes"
+    read = []
+    plain = pathlib.Path.read_bytes
+    monkeypatch.setattr(pathlib.Path, "read_bytes", lambda p: read.append(p) or plain(p))
+    with caplog.at_level(logging.ERROR):
+        assert load_skill(folder) is None
+    assert read == []
+    assert reason in caplog.text
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
