@@ -7,7 +7,8 @@ something else configured first is kept, and only log records are given its trac
 provider something else set without a tracer provider is kept too: the stop shuts down
 only the providers ``initialize()`` set.
 With profiles on too, each root span tags the profile samples taken while it runs.
-Inside a span, a record's message ends with its trace and span ids.
+Inside a span, a record's message ends with its trace and span ids. Started inside the
+running loop, it also measures garbage collection (``_gc``).
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from opentelemetry.instrumentation.logging.handler import (
 )
 from opentelemetry.metrics._internal import _ProxyMeterProvider
 
+from ._gc import _GcMonitor
 from .telemetry import TelemetrySettings
 
 log = logging.getLogger(__name__)
@@ -297,6 +299,19 @@ def _trace_text() -> _TraceText | None:
         return None
 
 
+def _gc_monitor() -> _GcMonitor | None:
+    """Measure garbage collection on the global meter provider, whoever set it.
+
+    None with no running loop, or when it fails to start. Never raises.
+    """
+    try:
+        monitor = _GcMonitor(metrics.get_meter("kubed.mcp"))
+        return monitor if monitor.start() else None
+    except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+        log.error("GC metrics did not start: %s", type(error).__name__)
+        return None
+
+
 def _shutdown(kind: str, provider: object) -> None:
     """Shut ``provider`` down, waiting at most ``_SHUTDOWN_SECONDS`` for it."""
     if kind == "meter":
@@ -429,18 +444,27 @@ class _Otel:
         logging_instrumented: bool,
         link: _ProfileLink | None = None,
         text: _TraceText | None = None,
+        gc: _GcMonitor | None = None,
     ) -> None:
         self._owned = owned
         self._logging_instrumented = logging_instrumented
         self._link = link
         self._text = text
+        self._gc = gc
 
     def stop(self) -> None:
-        """Remove the ids, close the link, uninstrument logging, stop our providers.
+        """Stop measuring GC, remove the ids, close the link, uninstrument logging, and
+        stop our providers.
 
-        Never raises. The ids go first: see ``_TraceText``.
+        Never raises. GC goes first, so its last passes reach the meter before its
+        provider shuts down. The ids go next: see ``_TraceText``.
         """
         global _stopped
+        try:
+            if self._gc is not None:
+                self._gc.stop()
+        except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
+            log.error("OpenTelemetry did not stop cleanly: %s", type(error).__name__)
         try:
             if self._text is not None:
                 self._text.remove()
@@ -508,6 +532,7 @@ def start(
                 logging_instrumented=instrumented,
                 link=link,
                 text=_trace_text(),
+                gc=_gc_monitor(),
             )
         instrumentor = LoggingInstrumentor()
         before = instrumentor.is_instrumented_by_opentelemetry
@@ -538,6 +563,7 @@ def start(
             and not before,
             link=_link_profiles(trace.get_tracer_provider(), profiles),
             text=_trace_text(),
+            gc=_gc_monitor(),
         )
     except Exception as error:  # noqa: BLE001  # TEL-6: logged by type only, never its text
         log.error(

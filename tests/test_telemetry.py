@@ -3442,3 +3442,87 @@ def test_fail_recover_fail_warns_twice(stub, no_proxies, caplog) -> None:
         logging.INFO,
         logging.WARNING,
     ]
+
+
+# -- garbage collection (TEL-23) ----------------------------------------------
+
+
+def gc_monitors() -> list[object]:
+    """The GC monitors registered in ``gc.callbacks``."""
+    import gc
+
+    from kubed.mcp._gc import _GcMonitor
+
+    return [
+        callback
+        for callback in gc.callbacks
+        if isinstance(getattr(callback, "__self__", None), _GcMonitor)
+    ]
+
+
+async def test_gc_is_measured_while_serving_with_otel_on(traced, spans) -> None:
+    async with Client(served("gc", TelemetrySettings(otel=True)).server) as client:
+        assert len(gc_monitors()) == 1
+        assert (await client.call_tool("ping", {})).data == "pong"
+    assert gc_monitors() == []
+
+
+async def test_gc_is_not_measured_with_otel_off(traced) -> None:
+    async with Client(served("gc", TelemetrySettings()).server) as client:
+        assert gc_monitors() == []
+        assert (await client.call_tool("ping", {})).data == "pong"
+
+
+async def test_the_initialize_path_measures_gc_and_stops_it_first(monkeypatch) -> None:
+    import kubed.mcp._otel
+    from kubed.mcp._gc import _GcMonitor
+
+    monkeypatch.setattr(kubed.mcp._otel, "_sdk_configured", lambda: False)
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", lambda **kwargs: None)
+    order: list[str] = []
+    gc_stop, text_remove = _GcMonitor.stop, _TraceText.remove
+    monkeypatch.setattr(
+        _GcMonitor, "stop", lambda self: (order.append("gc"), gc_stop(self))[1]
+    )
+    monkeypatch.setattr(
+        _TraceText, "remove", lambda self: (order.append("text"), text_remove(self))[1]
+    )
+    otel = kubed.mcp._otel.start("gc", TelemetrySettings(otel=True), None)
+    assert otel is not None
+    try:
+        assert len(gc_monitors()) == 1
+    finally:
+        otel.stop()
+    assert gc_monitors() == []
+    assert order == ["gc", "text"]
+
+
+def test_with_no_running_loop_gc_is_not_measured(monkeypatch) -> None:
+    import kubed.mcp._otel
+
+    monkeypatch.setattr(kubed.mcp._otel, "_sdk_configured", lambda: False)
+    monkeypatch.setattr(kubed.mcp._otel, "initialize", lambda **kwargs: None)
+    otel = kubed.mcp._otel.start("gc", TelemetrySettings(otel=True), None)
+    assert otel is not None
+    assert gc_monitors() == []
+    otel.stop()
+
+
+async def test_a_gc_monitor_that_fails_to_start_leaves_otel_running(
+    traced, monkeypatch, caplog
+) -> None:
+    import kubed.mcp._otel
+
+    class Refuse:
+        def __init__(self, meter) -> None:
+            raise RuntimeError("s3cret")
+
+    monkeypatch.setattr(kubed.mcp._otel, "_GcMonitor", Refuse)
+    otel = kubed.mcp._otel.start("gc", TelemetrySettings(otel=True), None)
+    assert otel is not None
+    otel.stop()
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r.getMessage() for r in errors] == [
+        "GC metrics did not start: RuntimeError"
+    ]
+    assert_safe(caplog.records, "s3cret")

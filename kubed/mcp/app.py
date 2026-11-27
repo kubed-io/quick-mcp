@@ -113,6 +113,28 @@ _AUTH_FIXED = (
 )
 
 
+def _warm_state_store(server: FastMCP) -> None:
+    """Load FastMCP's session-state store now, so a session's first request doesn't.
+
+    FastMCP builds the store on its first use, and its first import of ``key_value.aio``
+    instruments that package with beartype: seconds of CPU on the event loop. The
+    store is FastMCP's private ``_state_store``, touched on purpose: FastMCP has no
+    public way to warm it. Never raises: a FastMCP without it, or a warm-up that
+    fails, is one warning naming only the error's type, and serving goes on.
+    """
+    # Looked up on the class: an AttributeError raised inside the property is a failed
+    # warm-up, not a missing store.
+    if inspect.getattr_static(type(server), "_state_store", None) is None:
+        _BOOT.warning("FastMCP has no session-state store to warm")
+        return
+    try:
+        server._state_store  # noqa: B018  # the property's first read is the warm-up
+    except Exception as error:  # noqa: BLE001  # never fails the boot; logged by type only, never its text
+        _BOOT.warning(
+            "FastMCP's session-state store did not warm: %s", type(error).__name__
+        )
+
+
 def _with_teardown(
     container: Container,
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[Any]] | None,
@@ -124,9 +146,10 @@ def _with_teardown(
     """The server's lifespan, with the components started before it and stopped after.
 
     On every entry: ``on_enter`` runs, the boot line is logged, each component starts
-    in order, the server's ``lifespan`` runs, the started components stop in reverse,
-    and the container is torn down last. A start that raises stops those already
-    started, tears the container down and fails the boot with its error.
+    in order, FastMCP's session-state store is warmed, the server's ``lifespan`` runs,
+    the started components stop in reverse, and the container is torn down last. A
+    start that raises stops those already started, tears the container down and fails
+    the boot with its error.
     """
 
     @asynccontextmanager
@@ -136,6 +159,7 @@ def _with_teardown(
             _BOOT.info("%s", boot_line)
             started = await _start_all(parts)
             try:
+                _warm_state_store(server)
                 if lifespan is None:
                     yield {}
                 else:
