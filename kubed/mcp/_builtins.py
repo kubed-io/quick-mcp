@@ -63,6 +63,16 @@ class ServingSettings(Config):
         env="LOG_LEVEL",
         arg="--log-level",
     )
+    graceful_timeout: float = Field(
+        15,
+        ge=0,
+        doc=(
+            "Seconds in-flight HTTP requests get to finish when the server stops; "
+            "stdio doesn't read it."
+        ),
+        env="GRACEFUL_TIMEOUT",
+        arg="--graceful-timeout",
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -143,7 +153,7 @@ class _TelemetryComponent(Component):
         if metrics is not None:
             mcp.server.middleware.insert(0, metrics)
             # Inside the pin and the prefix, the one place a read's plain URI is seen.
-            metrics.observe(mcp.server)
+            metrics.observe(mcp.server, mcp._plugins)
 
     async def start(self, section: BaseModel | None) -> None:
         # Never raises (TEL-6). None when another start owns the process's signals.
