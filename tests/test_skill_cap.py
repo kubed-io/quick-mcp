@@ -217,7 +217,7 @@ async def test_an_untaken_config_cap_warns_once_at_build(caplog):
     assert record.getMessage().startswith("config delivery.max '0' is ignored")
 
 
-async def test_a_bool_cap_falls_through(caplog):  # Review Focus 3
+async def test_a_bool_cap_falls_through(caplog):
     mcp = server()
     mcp.delivery_default(lambda client: SimpleNamespace(max=True))
     with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
@@ -227,7 +227,7 @@ async def test_a_bool_cap_falls_through(caplog):  # Review Focus 3
     assert record.getMessage().startswith("delivery_default max 'True' is ignored")
 
 
-async def test_the_config_cap_loads_from_yaml_and_env(tmp_path):  # Review Focus 3
+async def test_the_config_cap_loads_from_yaml_and_env(tmp_path):
     (tmp_path / "c.yaml").write_text("delivery:\n  max: 150\n")
     from_yaml = QuickMCP("t", environ={"CONFIG_FILE": str(tmp_path / "c.yaml")})
     from_env = QuickMCP("t", environ={"DELIVERY_MAX": "150"})
@@ -301,7 +301,7 @@ async def test_delivery_default_caps_the_listing(tmp_path):
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_the_order_holds_on_every_call_and_page(tmp_path, mode):  # Review Focus 1
+async def test_the_order_holds_on_every_call_and_page(tmp_path, mode):
     mcp = capped(tmp_path, ("a", 60), ("b", 60), list_page_size=7)
     async with Client(mcp.server, mode=mode) as client:
         seen = [await listing(client) for _ in range(3)]
@@ -353,7 +353,7 @@ async def test_a_cut_skill_is_still_served(tmp_path):  # DLV-10
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_resources_list_cuts_at_the_same_places(tmp_path, mode):  # Review Focus 1
+async def test_resources_list_cuts_at_the_same_places(tmp_path, mode):
     mcp = capped(tmp_path, ("a", 60), ("b", 60), own=3, list_page_size=7)
     async with Client(mcp.server, mode=mode) as client:
         listed = await listing(client)
@@ -364,7 +364,7 @@ async def test_resources_list_cuts_at_the_same_places(tmp_path, mode):  # Review
     assert pages == [7] * 14 + [2]
 
 
-async def test_a_prefixed_listing_is_cut_alike(tmp_path):  # Review Focus 2
+async def test_a_prefixed_listing_is_cut_alike(tmp_path):
     async with over_http(capped(tmp_path, ("a", 101)), header="kb+") as client:
         prefix = result(client).meta[META]["prefix"]
         listed = await listing(client)
@@ -425,7 +425,7 @@ async def test_no_cap_lists_every_row(tmp_path):
 @pytest.mark.parametrize("mode", MODES)
 async def test_resources_list_runs_no_listing_pass(
     tmp_path, monkeypatch, mode
-):  # Review Focus 5
+):
     checked = visibility_checks(monkeypatch)
     async with Client(capped(tmp_path, ("a", 101), own=3).server, mode=mode) as client:
         assert len(await rows(client)) == 100
@@ -494,7 +494,7 @@ async def test_the_count_follows_skills_list_not_resources_list(tmp_path, mode):
 @pytest.mark.parametrize("mode", MODES)
 async def test_the_count_reuses_the_cached_build(
     tmp_path, monkeypatch, mode
-):  # Review Focus 5, #86
+):  # #86
     mcp = capped(tmp_path, ("a", 101))
     seen_by(mcp)
     made = []
@@ -621,7 +621,7 @@ def _build_fails() -> View:
 )
 async def test_a_failing_pin_leaves_the_count_out(
     tmp_path, caplog, mode, view, key
-):  # Review Focus 4
+):
     mcp = capped(tmp_path, ("a", 3))
     mcp.plugin_view(view)
     got = seen_by(mcp)
@@ -658,7 +658,7 @@ async def test_local_counts_without_the_view(tmp_path, caplog, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_an_async_view_is_counted(tmp_path, mode):  # Review Focus 3
+async def test_an_async_view_is_counted(tmp_path, mode):
     mcp = capped(tmp_path, ("a", 101))
 
     async def every() -> View:

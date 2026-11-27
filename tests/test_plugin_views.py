@@ -177,7 +177,7 @@ async def test_the_view_runs_once_per_request(kind):
     assert len(calls) == 2
 
 
-async def test_a_tools_nested_reads_keep_its_calls_set():  # Review Focus 1
+async def test_a_tools_nested_reads_keep_its_calls_set():
     mcp = served((DEMO, None))
     calls = counting(mcp)
 
@@ -329,7 +329,7 @@ async def test_a_new_generation_never_reuses_a_build():
     assert len(built) == 2
 
 
-async def test_a_new_view_is_not_served_an_old_build():  # Review Focus 2
+async def test_a_new_view_is_not_served_an_old_build():
     mcp = served((DEMO, None))
     async with Client(mcp.server) as client:
         assert [p.name for p in await client.list_prompts()] == ["greet"]
@@ -422,7 +422,7 @@ def failing(monkeypatch, failure) -> QuickMCP:
 @pytest.mark.parametrize(("method", "params"), READS)
 async def test_a_failure_to_pin_fails_the_request(
     monkeypatch, failure, method, params, mode
-):  # Review Focus 5
+):
     mcp = failing(monkeypatch, failure)
     async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
@@ -441,7 +441,7 @@ async def test_a_failure_to_pin_fails_the_request(
 @pytest.mark.parametrize("failure", FAILURES)
 async def test_a_failure_to_pin_fails_the_request_over_http(
     monkeypatch, failure, mode
-):  # Review Focus 5
+):
     mcp = failing(monkeypatch, failure)
     async with serve_over_http(mcp, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
@@ -579,7 +579,6 @@ def marks() -> View:
 
 
 async def test_a_context_variable_the_view_sets_is_kept_as_a_sync_views_is():
-    # Review Focus 5
     seen = {}
     for kind, wrap in KINDS.items():
         SEEN.set(None)
@@ -599,7 +598,6 @@ async def test_a_context_variable_the_view_sets_is_kept_as_a_sync_views_is():
 
 
 async def test_a_view_set_while_an_async_view_awaits_answers_in_its_place():
-    # Review Focus 2
     mcp = served((DEMO, None))
     entered, release, pins = anyio.Event(), anyio.Event(), []
 
