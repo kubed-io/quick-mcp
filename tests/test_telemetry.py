@@ -33,6 +33,7 @@ from fastmcp import Client, FastMCP
 from gateway_server import KIT_TREE, over_http
 from plugin_server import write
 from pydantic import BaseModel, ValidationError
+from skill_server import request
 
 import kubed.mcp
 import kubed.mcp.telemetry
@@ -1794,12 +1795,21 @@ def duration_points(reader, server: str) -> list:
     ]
 
 
+def points_of(reader, server: str, method: str) -> list:
+    """The server's duration points for ``method`` alone: a client lists and discovers too."""
+    return [
+        point
+        for point in duration_points(reader, server)
+        if point.attributes["mcp.method.name"] == method
+    ]
+
+
 async def test_each_tool_call_is_counted_under_the_tools_name(metered) -> None:
     mcp = served("counted", TelemetrySettings(otel=True))
     async with Client(mcp.server) as client:
         await client.call_tool("ping", {})
         await client.call_tool("ping", {})
-    points = duration_points(metered, "counted")
+    points = points_of(metered, "counted", "tools/call")
     assert [(p.attributes["gen_ai.tool.name"], p.count) for p in points] == [
         ("ping", 2)
     ]
@@ -1820,7 +1830,7 @@ async def test_a_failed_tool_call_carries_error_type(metered) -> None:
 
     async with Client(mcp.server) as client:
         await client.call_tool("fail", {}, raise_on_error=False)
-    (point,) = duration_points(metered, "failing-calls")
+    (point,) = points_of(metered, "failing-calls", "tools/call")
     assert (point.attributes["gen_ai.tool.name"], point.attributes["error.type"]) == (
         "fail",
         "tool_error",
@@ -1831,7 +1841,7 @@ async def test_an_unknown_tool_is_counted_without_its_name(metered) -> None:
     mcp = served("unknown-calls", TelemetrySettings(otel=True))
     async with Client(mcp.server) as client:
         await client.call_tool("nope", {}, raise_on_error=False)
-    (point,) = duration_points(metered, "unknown-calls")
+    (point,) = points_of(metered, "unknown-calls", "tools/call")
     assert "gen_ai.tool.name" not in point.attributes
     assert point.attributes["error.type"] == "tool_error"
 
@@ -1845,7 +1855,7 @@ async def test_a_prompt_render_is_counted_under_the_prompts_name(metered) -> Non
 
     async with Client(mcp.server) as client:
         await client.get_prompt("greet")
-    (point,) = duration_points(metered, "prompted")
+    (point,) = points_of(metered, "prompted", "prompts/get")
     assert (
         point.attributes["mcp.method.name"],
         point.attributes["gen_ai.prompt.name"],
@@ -1866,7 +1876,7 @@ async def test_a_servers_own_counter_lands_beside_the_call_metrics(metered) -> N
         await client.call_tool("count", {})
     (own,) = _metric_points(metered, "tests.own.calls")
     assert own.value == 1
-    (point,) = duration_points(metered, "own-counter")
+    (point,) = points_of(metered, "own-counter", "tools/call")
     assert point.attributes["gen_ai.tool.name"] == "count"
 
 
@@ -1893,7 +1903,7 @@ async def test_a_teardown_error_is_recorded_on_the_call(metered) -> None:
         # The teardown fails outside the tool, so the client gets a protocol error.
         with pytest.raises(MCPError):
             await client.call_tool("leaks", {})
-    (point,) = duration_points(metered, "torn-down")
+    (point,) = points_of(metered, "torn-down", "tools/call")
     # UsageMiddleware names an error that isn't FastMCP's by its class
     assert (point.attributes["gen_ai.tool.name"], point.attributes["error.type"]) == (
         "leaks",
@@ -2275,7 +2285,9 @@ async def test_a_read_through_the_tool_is_a_call_and_a_read(metered, tmp_path) -
     ) == [
         ("resources/read", None),
         ("resources/read", None),
+        ("server/discover", None),
         ("tools/call", "read_resource"),
+        ("tools/list", None),
     ]
     assert sorted(labelled(points), key=str) == [
         (("data://items/{id}", None, None), 1),
@@ -2312,9 +2324,198 @@ async def test_tools_and_prompts_are_recorded_as_before(metered) -> None:
         await client.read_resource("data://about")
     points = duration_points(metered, "mixed")
     kinds = sorted(p.attributes["mcp.method.name"] for p in points)
-    assert kinds == ["prompts/get", "resources/read", "tools/call"]
+    # The client discovers on connect, and lists the tools before it calls one.
+    assert kinds == [
+        "prompts/get",
+        "resources/read",
+        "server/discover",
+        "tools/call",
+        "tools/list",
+    ]
     tool = next(p for p in points if p.attributes["mcp.method.name"] == "tools/call")
     assert "mcp.resource.template" not in tool.attributes
+
+
+# -- listings (TEL-16) --------------------------------------------------------
+
+MODES = ["auto", "legacy"]  # server/discover, initialize
+LISTINGS = [
+    "agents/list",
+    "prompts/list",
+    "resources/list",
+    "resources/templates/list",
+    "skills/list",
+    "tools/list",
+]
+# What a listing's point may carry: its method, and what UsageMiddleware adds to any point.
+LISTING_KEYS = {
+    "mcp.method.name",
+    "fastmcp.server.name",
+    "mcp.protocol.version",
+    "network.transport",
+    "network.protocol.name",
+    "network.protocol.version",
+}
+
+
+def listings_served(name: str, tmp_path: Path, **options) -> QuickMCP:
+    """A server with something behind each of the seven listings."""
+    mcp = QuickMCP(name, config={"telemetry": TelemetrySettings(otel=True)}, **options)
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    mcp.tool(lambda: "pong", name="ping")
+
+    @mcp.resource("data://items/{id}")
+    def item(id: str) -> str:
+        return id
+
+    return mcp
+
+
+async def list_everything(client: Client) -> None:
+    await client.list_tools()
+    await client.list_resources()
+    await client.list_resource_templates()
+    await client.list_prompts()
+    await request(client, "skills/list")
+    await request(client, "agents/list")
+
+
+def methods(points: list) -> list[tuple[str, int]]:
+    """Each point's method, with its count, sorted."""
+    return sorted((p.attributes["mcp.method.name"], p.count) for p in points)
+
+
+def assert_unnamed(points: list) -> None:
+    """No point names what it listed: no component, label, cursor or URI."""
+    for point in points:
+        assert set(point.attributes) <= LISTING_KEYS, point.attributes
+        assert not [v for v in point.attributes.values() if "://" in str(v)]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_each_listing_is_one_point_under_its_method(
+    metered, tmp_path, mode
+) -> None:
+    name = f"listings-{mode}"
+    async with Client(listings_served(name, tmp_path).server, mode=mode) as client:
+        await list_everything(client)
+    points = duration_points(metered, name)
+    discover = ["server/discover"] if mode == "auto" else []
+    assert methods(points) == sorted((m, 1) for m in [*LISTINGS, *discover])
+    assert_unnamed(points)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_second_listing_records_again_in_one_series(
+    metered, tmp_path, mode
+) -> None:
+    name = f"listed-twice-{mode}"
+    async with Client(listings_served(name, tmp_path).server, mode=mode) as client:
+        for _ in range(2):
+            await list_everything(client)
+    points = [
+        p
+        for p in duration_points(metered, name)
+        if p.attributes["mcp.method.name"] != "server/discover"
+    ]
+    assert methods(points) == [(m, 2) for m in LISTINGS]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_paged_listing_is_one_series(metered, mode) -> None:
+    from kubed.mcp.skills import Skill, serve
+
+    name = f"paged-{mode}"
+    mcp = QuickMCP(
+        name, list_page_size=1, config={"telemetry": TelemetrySettings(otel=True)}
+    )
+    serve(
+        mcp.server,
+        [
+            Skill.from_files(
+                {"SKILL.md": f"---\nname: {n}\ndescription: The {n} skill.\n---\n"}
+            )
+            for n in ("alpha", "beta", "gamma")
+        ],
+    )
+    pages, cursor = 0, None
+    async with Client(mcp.server, mode=mode) as client:
+        while True:
+            page = await request(
+                client, "skills/list", **({} if cursor is None else {"cursor": cursor})
+            )
+            pages += 1
+            if (cursor := page.get("nextCursor")) is None:
+                break
+    assert pages == 3
+    points = duration_points(metered, name)
+    assert [c for m, c in methods(points) if m == "skills/list"] == [3]
+    assert_unnamed(points)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_listing_behind_a_prefix_is_one_unnamed_series(
+    metered, tmp_path, mode
+) -> None:
+    name = f"prefixed-listings-{mode}"
+    mcp = listings_served(name, tmp_path)
+    async with over_http(mcp, header="kb+", mode=mode) as client:
+        (entry,) = (await request(client, "skills/list"))["skills"]
+        # The prefix is in force: the served text carries it.
+        assert "kb+skill://" in entry["frontmatter"]["description"]
+        await list_everything(client)
+    points = duration_points(metered, name)
+    listed = [(m, c) for m, c in methods(points) if m != "server/discover"]
+    # skills/list twice, the rest once, each a single series.
+    assert listed == [(m, 2 if m == "skills/list" else 1) for m in LISTINGS]
+    assert_unnamed(points)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_get_and_a_directory_read_record_nothing(
+    metered, tmp_path, mode
+) -> None:
+    name = f"gets-{mode}"
+    async with Client(listings_served(name, tmp_path).server, mode=mode) as client:
+        (agent,) = (await request(client, "agents/list"))["agents"]
+        (entry,) = (await request(client, "skills/list"))["skills"]
+        await request(client, "skills/get", uri=entry["uri"])
+        await request(client, "agents/get", name=agent["name"])
+        await request(client, "resources/directory/read", uri="skill://lib/guide")
+    discover = [("server/discover", 1)] if mode == "auto" else []
+    assert methods(duration_points(metered, name)) == sorted(
+        [("agents/list", 1), ("skills/list", 1), *discover]
+    )
+
+
+async def test_a_listing_through_the_tool_is_a_call_and_a_listing(
+    metered, tmp_path
+) -> None:
+    from kubed.mcp import DeliverySettings
+
+    mcp = QuickMCP(
+        "tool-lists",
+        config={
+            "telemetry": TelemetrySettings(otel=True),
+            "delivery": DeliverySettings(resources="off"),
+        },
+    )
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    async with Client(mcp.server, mode="legacy") as client:
+        await client.call_tool("list_resources", {})
+    points = duration_points(metered, "tool-lists")
+    # tools/list is the client's own, before the call; resources/list is the tool's.
+    assert sorted(
+        (p.attributes["mcp.method.name"], p.attributes.get("gen_ai.tool.name"), p.count)
+        for p in points
+    ) == [
+        ("resources/list", None, 1),
+        ("tools/call", "list_resources", 1),
+        ("tools/list", None, 1),
+    ]
+    assert_unnamed(
+        [p for p in points if p.attributes["mcp.method.name"] != "tools/call"]
+    )
 
 
 def kit_reads(name: str, tmp_path: Path) -> QuickMCP:
@@ -2623,6 +2824,44 @@ def test_the_call_metrics_copy_and_still_label() -> None:
         assert twin._histogram.points[-1] == {"other": "x"}
 
 
+async def test_a_listing_inside_a_read_takes_no_label_from_it() -> None:
+    from opentelemetry.metrics import NoOpMeterProvider
+
+    from kubed.mcp._metrics import (
+        _LIBRARY,
+        _MATCHED,
+        _PLUGIN,
+        _TEMPLATE,
+        _CallMetrics,
+        _Labelled,
+        _Matched,
+    )
+
+    metrics = _CallMetrics(user_id="omit", meter_provider=NoOpMeterProvider())
+    recorded = Recorded()
+    metrics._duration = _Labelled(recorded)
+
+    async def call_next(context: object) -> list:
+        return []
+
+    context = types.SimpleNamespace(method="skills/list", fastmcp_context=None)
+    # The holder an outer read leaves, already labelled.
+    outer = _Matched("data://items/{id}", "lib", "kit")
+    token = _MATCHED.set(outer)
+    try:
+        await metrics.on_list_tools(context, call_next)
+        await metrics.on_request(context, call_next)
+        assert _MATCHED.get() is outer
+    finally:
+        _MATCHED.reset(token)
+    assert [p["mcp.method.name"] for p in recorded.points] == [
+        "tools/list",
+        "skills/list",
+    ]
+    for point in recorded.points:
+        assert not {_TEMPLATE, _LIBRARY, _PLUGIN} & set(point)
+
+
 def _without_record(monkeypatch) -> None:
     from fastmcp.server.middleware.usage import UsageMiddleware
 
@@ -2663,16 +2902,39 @@ async def test_a_changed_usage_middleware_is_one_warning_and_reads_pass_through(
     assert not isinstance(getattr(metrics, "_duration", None), _Labelled)
 
     async def call_next(context: object) -> str:
-        return "read"
+        return "passed"
 
-    assert await metrics.on_read_resource(object(), call_next) == "read"
+    # Nothing here could be recorded: a context with no server, and no histogram.
+    context = types.SimpleNamespace(method="skills/list")
+    for hook in (
+        metrics.on_read_resource,
+        metrics.on_list_tools,
+        metrics.on_list_resources,
+        metrics.on_list_resource_templates,
+        metrics.on_list_prompts,
+        metrics.on_discover,
+        metrics.on_request,
+    ):
+        assert await hook(context, call_next) == "passed"
     records = [r for r in caplog.records if r.name == "kubed.mcp._metrics"]
     assert [(r.levelno, r.getMessage()) for r in records] == [
         (
             logging.WARNING,
-            "Resource reads are not in the call metrics: FastMCP's UsageMiddleware has changed",
+            "Resource reads and listings are not in the call metrics: "
+            "FastMCP's UsageMiddleware has changed",
         )
     ]
+
+
+async def test_a_changed_usage_middleware_records_no_listing(
+    metered, tmp_path, monkeypatch
+) -> None:
+    _with_another_record(monkeypatch)
+    name = "listings-unrecorded"
+    # Every listing is still answered: none calls the _record it can't call.
+    async with Client(listings_served(name, tmp_path).server) as client:
+        await list_everything(client)
+    assert duration_points(metered, name) == []
 
 
 # -- the start line -----------------------------------------------------------
