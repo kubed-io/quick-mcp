@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -27,6 +28,8 @@ from plugin_server import (
     write,
 )
 from skill_server import request
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from kubed.mcp import QuickMCP
 from kubed.mcp.plugins import _PINS, View, _PinScope, _Slot
@@ -617,3 +620,48 @@ async def test_a_view_set_while_an_async_view_awaits_answers_in_its_place():
     assert pins[0].view.key == "new"
     assert pins[0].build.admitted == ()
     assert [key[1] for key in mcp._plugins._memo.builds] == ["new"]
+
+
+async def test_a_slow_async_view_stalls_no_other_request():  # #86
+    mcp = served((DEMO, None))
+    armed, waiting, took = [False], anyio.Event(), {}
+
+    async def revalidates() -> View:
+        found = request_values()
+        slow = found and (found[1].get("x-slow") or [None])[0]
+        if armed[0] and slow:
+            waiting.set()
+            await anyio.to_thread.run_sync(time.sleep, 1)  # a PROPFIND's wait
+        return View(None, lambda plugin: True)
+
+    mcp.plugin_view(revalidates)
+
+    @mcp.custom_route("/health", methods=["GET"], name="health")
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    async def timed(name, call) -> None:
+        # From the slow request's start: a stall that blocks the loop also keeps this
+        # task from starting its call, so a call's own duration would not show it.
+        took[name] = (await call(), time.monotonic() - began)
+
+    async with asgi_server(mcp.server) as running, running.http_client() as http:
+        path = str(running.app.url_path_for("health"))
+        async with (
+            Client(running.transport(headers={"x-slow": "1"})) as slow,
+            Client(running.transport()) as fast,
+        ):
+            armed[0] = True  # after both handshakes, so neither waits
+            began = time.monotonic()
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(timed, "slow", lambda: request(slow, "skills/list"))
+                with anyio.fail_after(5):
+                    await waiting.wait()  # the slow view is waiting now
+                tg.start_soon(timed, "health", lambda: http.get(path))
+                tg.start_soon(timed, "tools", fast.list_tools)
+                tg.start_soon(timed, "skills", lambda: request(fast, "skills/list"))
+    assert took["health"][0].status_code == 200
+    assert took["health"][1] < 0.6  # a plain ASGI route, as a probe
+    assert took["tools"][1] < 0.6  # a concurrent tools/list
+    assert took["skills"][1] < 0.6  # and a request that pins a view of its own
+    assert took["slow"][1] >= 1  # the slow view was awaited, not skipped
