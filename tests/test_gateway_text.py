@@ -11,7 +11,7 @@ import pytest
 from fastmcp import Client, Context
 from fastmcp.utilities.tests import asgi_server
 from gateway_server import kit, over_http
-from skill_server import request
+from skill_server import BOTH, request
 
 from kubed.mcp.protocol import MCPError
 
@@ -26,7 +26,7 @@ async def text_of(client, uri: str) -> str:
 
 
 async def test_a_prefixed_request_reads_prefixed_text(tmp_path):
-    async with over_http(kit(tmp_path), header="kb+") as client:
+    async with over_http(kit(tmp_path, config=BOTH), header="kb+") as client:
         skill = await text_of(client, GUIDE)
         assert "kb+skill://lib/guide/references/a.md" in skill
         assert "kb+skill://lib/guide/references/../SKILL.md" in skill
@@ -60,7 +60,7 @@ async def test_a_prefixed_request_reads_prefixed_text(tmp_path):
 
 
 async def test_structured_fields_stay_plain(tmp_path):  # GW-8
-    async with over_http(kit(tmp_path), header="kb+") as client:
+    async with over_http(kit(tmp_path, config=BOTH), header="kb+") as client:
         resources = await client.list_resources()
         assert resources
         for resource in resources:
@@ -82,7 +82,7 @@ async def test_structured_fields_stay_plain(tmp_path):  # GW-8
 
 
 async def test_digests_agree_under_a_prefix(tmp_path):
-    async with over_http(kit(tmp_path), header="kb+") as client:
+    async with over_http(kit(tmp_path, config=BOTH), header="kb+") as client:
         entry = (await request(client, "skills/list"))["skills"][0]
         manifest = json.loads(await text_of(client, "skill://lib/guide/_manifest"))
         by_path = {f["path"]: f for f in manifest["files"]}

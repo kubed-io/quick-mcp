@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 from plugin_server import DEMO, ENTRY, GUIDE, copy, listed, served, skill, write
-from skill_server import read_bytes, request
+from skill_server import BOTH, read_bytes, request
 
 from kubed.mcp import skills
 from kubed.mcp.plugins import Components, Plugin, Site, View, to_mcp_form
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.unit
 
 
 async def test_a_rewritten_skill_agrees_on_digest_and_size(tmp_path):
-    mcp = served((DEMO, None))
+    mcp = served((DEMO, None), config=BOTH)
     mcp.add_rewriter(lambda site, text: text.replace("Everything", "All"))  # GUIDE.md
     async with Client(mcp.server) as client:
         entry = (await request(client, "skills/list"))["skills"][0]

@@ -32,9 +32,11 @@ KIT_TREE = {
 }
 
 
-def kit(tmp_path: Path, header_prefix: str | None = None) -> QuickMCP:
+def kit(
+    tmp_path: Path, header_prefix: str | None = None, config: dict | None = None
+) -> QuickMCP:
     """A server ``t`` serving the plugin ``kit`` under the namespace ``lib``."""
-    mcp = QuickMCP("t", header_prefix=header_prefix)
+    mcp = QuickMCP("t", config=config or {}, header_prefix=header_prefix)
     mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
     return mcp
 

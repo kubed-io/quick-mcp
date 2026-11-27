@@ -7,7 +7,7 @@ import logging
 import pytest
 from fastmcp import Client
 from plugin_server import served, skill, write
-from skill_server import read_json, request
+from skill_server import BOTH, read_json, request
 
 from kubed.mcp import QuickMCP
 
@@ -65,7 +65,7 @@ EVERY = sorted(uri for uris in SERVED.values() for uri in uris)
 def grafana(tmp_path) -> QuickMCP:
     """A server with grafana/skills' one root added once per entry."""
     root = write(tmp_path / "grafana-skills", GRAFANA)
-    mcp = QuickMCP("kb")
+    mcp = QuickMCP("kb", config=BOTH)
     for ns, entry in ENTRIES.items():
         mcp.add_plugin(root, namespace=ns, manifest=entry)
     return mcp
@@ -100,7 +100,7 @@ async def test_resources_list_is_one_skill_md_row_per_skill(tmp_path):
 
 
 async def test_a_skill_md_inside_a_skill_is_one_of_its_files(tmp_path):
-    mcp = served((write(tmp_path / "probe", PROBE), None))
+    mcp = served((write(tmp_path / "probe", PROBE), None), config=BOTH)
     base = "skill://t/toplevel"
     async with Client(mcp.server) as client:
         rows = [str(r.uri) for r in await client.list_resources()]

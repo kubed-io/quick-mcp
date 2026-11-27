@@ -25,7 +25,7 @@ from plugin_server import (
     skill,
     write,
 )
-from skill_server import request
+from skill_server import BOTH, request
 
 from kubed.mcp import QuickMCP
 from kubed.mcp.agents import EXTENSION_ID, META_KEY
@@ -382,7 +382,7 @@ async def test_two_plugins_merge_under_one_namespace(tmp_path):
             "commands/wave.md": "---\ndescription: Wave.\n---\nWave.\n",
         },
     )
-    mcp = served((DEMO, "kit"), (other, "kit"))
+    mcp = served((DEMO, "kit"), (other, "kit"), config=BOTH)
     assert [p.name for p in mcp.plugins] == ["demo", "other"]
     assert await skill_uris(mcp) == [
         "skill://kit/demo-guide/SKILL.md",

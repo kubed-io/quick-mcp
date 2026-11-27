@@ -14,6 +14,7 @@ import pytest
 from fastmcp import Client
 from mcp_types import INVALID_PARAMS
 from skill_server import (
+    BOTH,
     DEMO,
     DIRECTORY,
     ENTRY_URI,
@@ -172,7 +173,7 @@ async def test_a_provider_built_from_a_skill_leaves_out_index_named_files(caplog
             "references/_index.md": "a file",
         }
     )
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     with caplog.at_level(logging.WARNING):
         serve(mcp.server, [skill])
     assert "references/_index.md" in caplog.text
@@ -618,7 +619,7 @@ async def test_folders_and_indexes_follow_a_catalogue_loaded_per_request(caplog)
     """``load_skills()`` overridden: nothing the provider knows was fixed when it was built."""
     current = {"lib/tmp-skill": skill({"a/x.md": "# Ex\n"})}
     provider = Switching(current)
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     serve(mcp.server, provider)
     base = "skill://lib/tmp-skill"
     async with Client(mcp.server) as client:
@@ -660,7 +661,7 @@ async def test_a_catalogue_is_loaded_once_per_request(call):
     provider = Switching(
         {"tmp-skill": skill({"a/x.md": "# Ex\n", "a/y.md": "# Why\n"})}
     )
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     serve(mcp.server, provider)
     async with Client(mcp.server) as client:
         provider.loads = 0

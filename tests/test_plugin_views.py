@@ -395,12 +395,13 @@ FAILING_VIEWS = {
     "unhashable": lambda: View([], lambda plugin: True),
 }
 FAILING_VIEWS |= {f"{name}, async": awaited(fn) for name, fn in FAILING_VIEWS.items()}
+# Each read, and the mode it pins under: skills/list pins only under extension.
 READS = [
-    ("skills/list", {}),
-    ("skills/get", {"uri": ENTRY}),
-    ("prompts/list", {}),
-    ("agents/list", {}),
-    ("resources/read", {"uri": ENTRY}),
+    ("skills/list", {}, "extension"),
+    ("skills/get", {"uri": ENTRY}, "mcp"),
+    ("prompts/list", {}, "mcp"),
+    ("agents/list", {}, "mcp"),
+    ("resources/read", {"uri": ENTRY}, "mcp"),
 ]
 
 
@@ -428,11 +429,11 @@ async def test_extension_prompts_list_pins(monkeypatch, mode):  # Review Focus 4
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("failure", FAILURES)
-@pytest.mark.parametrize(("method", "params"), READS)
+@pytest.mark.parametrize(("method", "params", "via"), READS)
 async def test_a_failure_to_pin_fails_the_request(
-    monkeypatch, failure, method, params, mode
+    monkeypatch, failure, method, params, via, mode
 ):
-    mcp = failing(monkeypatch, failure)
+    mcp = failing(monkeypatch, failure, via=via)
     async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
             await request(client, method, **params)
@@ -451,7 +452,7 @@ async def test_a_failure_to_pin_fails_the_request(
 async def test_a_failure_to_pin_fails_the_request_over_http(
     monkeypatch, failure, mode
 ):
-    mcp = failing(monkeypatch, failure)
+    mcp = failing(monkeypatch, failure, via="extension")
     async with serve_over_http(mcp, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
             await request(client, "skills/list")
@@ -461,14 +462,14 @@ async def test_a_failure_to_pin_fails_the_request_over_http(
 
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize(("method", "params"), READS)
+@pytest.mark.parametrize(("method", "params", "via"), READS)
 async def test_a_view_that_raises_an_mcp_error_sends_it_whole(
-    method, params, mode, kind
+    method, params, via, mode, kind
 ):  # PLUG-53
     def refuses() -> View:
         raise MCPError(code=-32001, message="not for you")
 
-    mcp = served((DEMO, None))
+    mcp = served((DEMO, None), config={"delivery": {"via": via}})
     mcp.plugin_view(KINDS[kind](refuses))
     async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
@@ -482,7 +483,7 @@ async def test_a_view_that_raises_an_mcp_error_sends_it_whole(
 async def test_the_original_error_is_logged_once_with_its_traceback(
     monkeypatch, caplog, failure, mode
 ):  # PLUG-53
-    mcp = failing(monkeypatch, failure)
+    mcp = failing(monkeypatch, failure, via="extension")
     with caplog.at_level(logging.ERROR):
         async with Client(mcp.server, mode=mode) as client:
             with pytest.raises(MCPError):
@@ -528,7 +529,7 @@ async def test_a_build_that_raises_an_mcp_error_sends_it_whole(
     async def refuses(self, state, view, key):
         raise MCPError(code=-32001, message="not for you")
 
-    mcp = served((DEMO, None))
+    mcp = served((DEMO, None), config={"delivery": {"via": "extension"}})
     monkeypatch.setattr(type(mcp._plugins), "_make", refuses)
     async with Client(mcp.server, mode=mode) as client:
         with pytest.raises(MCPError) as caught:
@@ -630,7 +631,7 @@ async def test_a_view_set_while_an_async_view_awaits_answers_in_its_place():
 
 
 async def test_a_slow_async_view_stalls_no_other_request():  # #86
-    mcp = served((DEMO, None))
+    mcp = served((DEMO, None), config={"delivery": {"via": "extension"}})
     armed, waiting, took = [False], anyio.Event(), {}
 
     async def revalidates() -> View:

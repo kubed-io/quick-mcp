@@ -22,6 +22,7 @@ from fastmcp.skills import SkillsClientExtension
 from fastmcp.skills.provider import SkillManifestProvider
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
 from skill_server import (
+    BOTH,
     DEMO,
     ENTRY_URI,
     GOOD,
@@ -515,7 +516,7 @@ NESTED_ROOT = f"skill://{NESTED}"
 
 
 def nested() -> QuickMCP:
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     serve(mcp.server, {NESTED: load_skill(DEMO)})
     return mcp
 
@@ -545,7 +546,7 @@ async def test_a_catalogue_of_two_skills_lists_each_entry(tmp_path):
             "a.md": "# A\n",
         }
     )
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     serve(mcp.server, {"demo-skill": load_skill(DEMO), "more/other": other})
     async with Client(mcp.server) as client:
         uris = sorted(str(r.uri) for r in await client.list_resources())
@@ -560,7 +561,7 @@ async def test_serving_twice_adds_a_provider_and_one_extension(mode):
     other = Skill.from_files(
         {"SKILL.md": "---\nname: other\ndescription: Another skill.\n---\n"}
     )
-    mcp = QuickMCP("t")
+    mcp = QuickMCP("t", config=BOTH)
     first = serve(mcp.server, [load_skill(DEMO)])
     second = serve(mcp.server, EntryOnlySkillProvider([other]))
     async with Client(mcp.server, mode=mode) as client:
