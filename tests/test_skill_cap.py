@@ -21,7 +21,7 @@ from kubed.mcp import DeliverySettings, QuickMCP, plugins
 from kubed.mcp.delivery import Resolved, SkillCount, _Partial, _resolved
 from kubed.mcp.plugins import Plugins, View
 from kubed.mcp.protocol import MCPError
-from kubed.mcp.skills import Skill, serve
+from kubed.mcp.skills import EntryOnlySkillProvider, Skill, serve
 
 pytestmark = pytest.mark.unit
 
@@ -364,10 +364,13 @@ async def test_resources_list_cuts_at_the_same_places(tmp_path, mode):  # Review
 
 async def test_a_prefixed_listing_is_cut_alike(tmp_path):  # Review Focus 2
     async with over_http(capped(tmp_path, ("a", 101)), header="kb+") as client:
+        prefix = result(client).meta[META]["prefix"]
         listed = await listing(client)
         shown = await rows(client)
+    assert prefix == "kb+"  # the cut ran on the prefixed build (GW-6)
     assert listed == uris("a", range(100))
-    assert sorted(u.removeprefix("kb+") for u in shown) == listed
+    assert all(u.startswith("skill://") for u in shown)  # a row's uri never is (GW-8)
+    assert sorted(shown) == listed
 
 
 async def test_prompt_and_agent_rows_are_never_cut(tmp_path):
@@ -533,6 +536,26 @@ async def test_a_server_without_plugin_skills(mode, mine, count):
     assert got[0].skills == count
 
 
+class _Broken(EntryOnlySkillProvider):
+    """An own catalogue whose load fails: FastMCP lists none of its skills."""
+
+    async def load_skills(self) -> dict[str, Skill]:
+        raise RuntimeError("catalogue down")
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_broken_own_catalogue_hides_no_plugin_skill(tmp_path, mode, caplog):
+    mcp = capped(tmp_path, ("a", 5))
+    serve(mcp.server, _Broken())
+    got = seen_by(mcp)
+    with caplog.at_level(logging.ERROR, logger="kubed.mcp"):
+        async with over_http(mcp, mode=mode) as client:
+            assert await listing(client) == uris("a", range(5))
+            assert sorted(await rows(client)) == uris("a", range(5))
+    assert got[0].skills == SkillCount(5, 0)
+    assert not [r for r in caplog.records if "skill count" in r.getMessage()]
+
+
 @pytest.mark.parametrize("mode", MODES)
 async def test_the_count_is_not_echoed(tmp_path, mode):
     mcp = capped(tmp_path, ("a", 101))
@@ -585,22 +608,24 @@ def _build_fails() -> View:
     return View("broken", admits)
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
     ("view", "key"), [(_view_raises, None), (_build_fails, "broken")]
 )
 async def test_a_failing_pin_leaves_the_count_out(
-    tmp_path, caplog, view, key
+    tmp_path, caplog, mode, view, key
 ):  # Review Focus 4
     mcp = capped(tmp_path, ("a", 3))
     mcp.plugin_view(view)
     got = seen_by(mcp)
     with caplog.at_level(logging.ERROR, logger="kubed.mcp.plugins"):
         for _ in range(2):
-            async with over_http(mcp, mode="legacy") as client:
+            async with over_http(mcp, mode=mode) as client:
                 assert result(client) is not None
                 with pytest.raises(MCPError) as caught:  # as today (PLUG-53)
                     await request(client, "skills/list")
-                assert caught.value.error.message == "view down"
+                if mode == "legacy":  # auto answers "Internal server error"
+                    assert caught.value.error.message == "view down"
     assert [d.skills for d in got] == [None, None]
     skipped = [r for r in caplog.records if "skill count" in r.getMessage()]
     assert [r.msg for r in skipped] == [
@@ -611,3 +636,15 @@ async def test_a_failing_pin_leaves_the_count_out(
         f"skill count skipped for view {key!r}: RuntimeError: view down; "
         "the instructions get no count"
     ]
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_local_counts_without_the_view(tmp_path, caplog, mode):
+    mcp = capped(tmp_path, ("a", 3), own=2)
+    mcp.plugin_view(_view_raises)
+    got = seen_by(mcp)
+    with caplog.at_level(logging.ERROR, logger="kubed.mcp"):
+        async with over_http(mcp, mode=mode, headers={"X-MCP-Via": "local"}):
+            pass
+    assert got[0].skills == SkillCount(2, 0)
+    assert not [r for r in caplog.records if "skill count" in r.getMessage()]

@@ -1989,11 +1989,14 @@ class Plugins:
     async def skill_count(self) -> SkillCount | None:
         """How many skills ``skills/list`` holds and how many the cap cuts, for the
         request's handshake, or None when it cannot be told (DLV-17). It reads the
-        cached build and the request's manifests, and runs no listing."""
+        cached build and the request's manifests, and runs no listing. Under ``local``
+        it counts no plugin skill, so it pins no build."""
         own = await skills._own_count(self._server, self._skills)
         resolved = _resolved()
         if self._skills is None:
             return _count(own, 0, resolved.max, resolved.via) if own else None
+        if resolved.via == "local":
+            return _count(own, 0, resolved.max, resolved.via)
         pin = await self._quiet_pin()
         if pin is None:
             return None

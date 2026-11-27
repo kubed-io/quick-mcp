@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Listings show at most 100 skills by default, set with `X-MCP-Max`, `?max=` or `delivery.max` (`all` for no cap); `Delivery` gains `max`, and `Resolved.skills` says how many were listed and cut.
+
 ### Changed
 
 - Skill, prompt and agent file reads are charted by pattern, library and plugin, not one series per file.
