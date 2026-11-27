@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-27
+
 ### Changed
 
 - **BREAKING:** on a `QuickMCP`, `skills/list` lists skills only under `X-MCP-Via: extension`; the default `mcp` lists them as resources alone, and `local` lists only the server's own.
