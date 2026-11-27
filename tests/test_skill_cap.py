@@ -12,6 +12,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.skills.provider import SkillManifestProvider
 from gateway_server import over_http
+from mcp_types import INTERNAL_ERROR
 from plugin_server import agent_md, command_md, skill, write
 from skill_server import read_directory, request
 from test_delivery_inputs import warnings
@@ -622,8 +623,9 @@ async def test_a_failing_pin_leaves_the_count_out(
         for _ in range(2):
             async with over_http(mcp, mode=mode) as client:
                 assert result(client) is not None
-                with pytest.raises(MCPError) as caught:  # as today (PLUG-53)
+                with pytest.raises(MCPError) as caught:  # every era (PLUG-53)
                     await request(client, "skills/list")
+                assert caught.value.error.code == INTERNAL_ERROR
                 assert caught.value.error.message == "Internal server error"
     assert [d.skills for d in got] == [None, None]
     skipped = [r for r in caplog.records if "skill count" in r.getMessage()]
