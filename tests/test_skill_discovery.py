@@ -129,3 +129,64 @@ def test_a_symlinked_or_dot_folder_is_not_searched(tmp_path, caplog):
         mcp = served((root, None))
     assert mcp.plugins[0].skills == ("skill://t/top/SKILL.md",)
     assert not caplog.records
+
+
+CLAUDE_CODE = [
+    (None, (TOPLEVEL,)),
+    (["./skills/category"], (TOPLEVEL, DEEP)),
+    (["./skills/category/deep"], (TOPLEVEL, DEEP)),
+]
+
+
+@pytest.mark.parametrize(("declared", "found"), CLAUDE_CODE)
+def test_skills_are_found_as_claude_code_finds_them(tmp_path, caplog, declared, found):
+    root = write(tmp_path / "probe", PROBE)
+    entry = (
+        {"name": "probe"} if declared is None else {"name": "probe", "skills": declared}
+    )
+    with caplog.at_level(logging.DEBUG):
+        plugin = QuickMCP("t").add_plugin(root, manifest=entry)
+    assert plugin.skills == found
+    assert plugin.components.notes == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    if declared is None:
+        assert "category" not in caplog.text
+
+
+def test_a_shared_skills_folder_is_passed_over_silently(tmp_path, caplog):
+    with caplog.at_level(logging.DEBUG):
+        mcp = grafana(tmp_path)
+    assert [p.components.notes for p in mcp.plugins] == [(), ()]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "k6-unlisted" not in caplog.text
+
+
+def test_a_declared_root_is_searched_one_level(tmp_path, caplog):
+    root = write(
+        tmp_path / "p",
+        {
+            "skills/x/SKILL.md": skill("x"),
+            "z/SKILL.md": skill("z"),
+            "tools/y/SKILL.md": skill("y"),
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        plugin = QuickMCP("t").add_plugin(root, manifest={"name": "p", "skills": "./"})
+    assert plugin.skills == ("skill://t/x/SKILL.md", "skill://t/z/SKILL.md")
+    assert plugin.components.notes == ()
+    assert not caplog.records
+
+
+def test_a_declared_skills_path_that_is_no_folder_is_still_noted(tmp_path, caplog):
+    root = write(tmp_path / "p", {"skills/top/SKILL.md": skill("top")})
+    entry = {"name": "p", "skills": ["./missing", "./skills/top/SKILL.md"]}
+    with caplog.at_level(logging.WARNING):
+        plugin = QuickMCP("t").add_plugin(root, manifest=entry)
+    notes = (
+        "skills entry 'missing' is not a folder in the plugin",
+        "skills entry 'skills/top/SKILL.md' is not a folder in the plugin",
+    )
+    assert plugin.components.notes == notes
+    assert plugin.skills == ("skill://t/top/SKILL.md",)
+    for note in notes:
+        assert f"plugin p: {note}" in caplog.text
