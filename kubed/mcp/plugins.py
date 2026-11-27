@@ -1069,16 +1069,16 @@ def _labels(build: _Build, uri: str) -> _ReadLabels | None:
     if not sep:
         return None
     if (material := build.files.get(uri)) is not None:
-        return _read_labels(_pattern(scheme, ()), material.served.plugin)
+        return _labelled(_pattern(scheme, ()), material.served.plugin)
     parts = rest.split("/")
     for depth in range(len(parts) - 1, 0, -1):
         owner = build.owners.get(f"{scheme}://{'/'.join(parts[:depth])}")
         if owner is not None:
-            return _read_labels(_pattern(scheme, parts[depth:]), owner)
+            return _labelled(_pattern(scheme, parts[depth:]), owner)
     return None
 
 
-def _read_labels(pattern: str, plugin: Plugin) -> _ReadLabels:
+def _labelled(pattern: str, plugin: Plugin) -> _ReadLabels:
     return _ReadLabels(pattern, plugin.namespace.partition("/")[0], plugin.name)
 
 
@@ -1895,12 +1895,15 @@ class Plugins:
             raise slot.error
         return slot.pin
 
-    async def _read_labels(self, uri: str) -> _ReadLabels | None:
-        """The labels of a read of ``uri`` (None when it is not the layer's, or when no
-        plugin is served, which pins nothing). It raises what ``pinned`` raises."""
-        if not self.current:
-            return None
-        return _labels((await self.pinned()).build, uri)
+    def _read_labels(self, uri: str) -> _ReadLabels | None:
+        """The labels of a read of ``uri``, from the build the request already pinned.
+
+        It never pins: a read that pinned no build (none served, one answered without a
+        provider, one that failed to pin) is not the layer's, and gives None.
+        """
+        slot = (_PINS.get() or {}).get(self)
+        pin = None if slot is None else slot.pin
+        return None if pin is None or not self.current else _labels(pin.build, uri)
 
     async def _pin(self) -> _Pin:
         """One pin, made fresh. The view runs first, so a set it serves (PLUG-51) is

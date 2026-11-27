@@ -2464,13 +2464,44 @@ async def test_a_read_whose_pin_fails_carries_no_label_and_no_error_of_its_own(
         assert key not in point.attributes
 
 
+async def test_a_read_answered_without_a_provider_never_pins_for_a_label(
+    metered, tmp_path
+) -> None:
+    from fastmcp.resources import ResourceResult
+    from fastmcp.server.middleware import Middleware
+
+    mcp = QuickMCP("answered", config={"telemetry": TelemetrySettings(otel=True)})
+    mcp.add_plugin(write(tmp_path / "kit", KIT_TREE), namespace="lib")
+    views: list[None] = []
+
+    def view():
+        views.append(None)
+        raise RuntimeError("view")
+
+    mcp.plugin_view(view)
+
+    class Answers(Middleware):
+        async def on_read_resource(self, context, call_next):
+            return ResourceResult("about")
+
+    # Added after the observer is placed, so it sits inside it.
+    mcp.server.add_middleware(Answers())
+    async with Client(mcp.server) as client:
+        (content,) = await client.read_resource("data://about")
+    assert content.text == "about"
+    assert views == []
+    assert labelled(duration_points(metered, "answered")) == [
+        (("data://about", None, None), 1)
+    ]
+
+
 async def test_a_lookup_that_raises_falls_back_to_the_template(
     metered, caplog
 ) -> None:
     from kubed.mcp._metrics import _ReadObserver
 
     class Broken:
-        async def _read_labels(self, uri: str):
+        def _read_labels(self, uri: str):
             raise RuntimeError("lookup")
 
     mcp = resourced("lookup-raises")

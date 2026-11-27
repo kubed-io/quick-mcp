@@ -198,17 +198,18 @@ class _ReadObserver(Middleware):
     async def _label(
         self, matched: _Matched, context: Any, uri: str, failed: bool
     ) -> None:
-        if (layer := await self._layer(uri)) is not None:
+        if (layer := self._layer(uri)) is not None:
             matched.label = layer.pattern
             matched.library = layer.library
             matched.plugin = layer.plugin
             return
         matched.label = await self._template(context, uri) or (None if failed else uri)
 
-    async def _layer(self, uri: str) -> _ReadLabels | None:
-        """The plugin layer's labels for ``uri``, None when it is not the layer's."""
+    def _layer(self, uri: str) -> _ReadLabels | None:
+        """The plugin layer's labels for ``uri`` from the request's existing pin, None
+        when it is not the layer's. It never pins."""
         try:
-            return await self._plugins._read_labels(uri)
+            return self._plugins._read_labels(uri)
         except Exception:  # noqa: BLE001  # TEL-6: a lookup that fails is not the layer's
             return None
 

@@ -160,4 +160,23 @@ async def test_a_server_without_plugins_has_no_labels_and_never_pins(monkeypatch
         raise AssertionError("pinned")
 
     monkeypatch.setattr(Plugins, "pinned", boom)
-    assert await mcp._plugins._read_labels("skill://lib/guide/SKILL.md") is None
+    assert mcp._plugins._read_labels("skill://lib/guide/SKILL.md") is None
+
+
+async def test_a_read_inside_a_pin_is_labelled_from_it_and_outside_one_is_not(tmp_path):
+    from kubed.mcp.plugins import _PINS, _Slot
+
+    mcp = QuickMCP("labels", config={})
+    mcp.add_plugin(write(tmp_path / "kit", TREE), namespace="lib")
+    uri = "skill://lib/guide/SKILL.md"
+    assert mcp._plugins._read_labels(uri) is None
+    slot = _Slot()
+    token = _PINS.set({mcp._plugins: slot})
+    try:
+        assert mcp._plugins._read_labels(uri) is None
+        slot.pin = await mcp._plugins.pinned()
+        assert mcp._plugins._read_labels(uri) == _ReadLabels(
+            "skill://{library}/{path}/SKILL.md", "lib", "kit"
+        )
+    finally:
+        _PINS.reset(token)
