@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Skill, prompt and agent file reads are charted by pattern, library and plugin, not one series per file.
+
 ### Fixed
 
 - `resources/directory/read` results carry `resultType: "complete"`, as SEP-2640 has them.
