@@ -624,8 +624,7 @@ async def test_a_failing_pin_leaves_the_count_out(
                 assert result(client) is not None
                 with pytest.raises(MCPError) as caught:  # as today (PLUG-53)
                     await request(client, "skills/list")
-                if mode == "legacy":  # auto answers "Internal server error"
-                    assert caught.value.error.message == "view down"
+                assert caught.value.error.message == "Internal server error"
     assert [d.skills for d in got] == [None, None]
     skipped = [r for r in caplog.records if "skill count" in r.getMessage()]
     assert [r.msg for r in skipped] == [

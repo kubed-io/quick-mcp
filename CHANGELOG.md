@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resources/directory/read` results carry `resultType: "complete"`, as SEP-2640 has them.
 - A plugin no longer logs a warning for each `SKILL.md` that isn't one of its skills, such as a sibling plugin's in a shared `skills/` folder.
 - A server that stops with clients connected ends their listen streams cleanly and gives in-flight calls 15 s (`serving.graceful_timeout`).
+- A request whose plugin view or build fails answers `-32603` on every protocol; raise an `MCPError` to send your own.
 
 ## [0.5.2] - 2026-11-27
 
