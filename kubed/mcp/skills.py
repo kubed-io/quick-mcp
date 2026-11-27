@@ -146,6 +146,7 @@ def _scan(root: Path) -> tuple[list[Path], list[str]]:
     FastMCP's ``scan_files`` with one difference: a hidden entry is left out unjudged,
     and a hidden folder is not entered (SKL-24). Both lists are in walk order, each
     folder's entries sorted, depth first; the hidden ones are root-relative POSIX paths.
+    A folder it cannot list is skipped, as ``rglob`` skips it.
     """
     if root.is_symlink() or not root.is_dir():
         raise ValueError("skill root must be a directory, not a symlink")
@@ -153,7 +154,11 @@ def _scan(root: Path) -> tuple[list[Path], list[str]]:
     hidden: list[str] = []
 
     def walk(folder: Path) -> None:
-        for entry in sorted(folder.iterdir(), key=lambda e: e.name):
+        try:
+            entries = sorted(folder.iterdir(), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
             if entry.name.startswith("."):
                 hidden.append(entry.relative_to(root).as_posix())
             elif entry.is_symlink():
@@ -231,14 +236,14 @@ def _folders_of(paths: Iterable[str]) -> set[str]:
 def without_reserved(skill: Skill) -> Skill:
     """The skill minus any file whose URI the server answers otherwise, each named.
 
-    A hidden path is dropped too, without a warning: one debug line names the files.
-
     That is a file with an index's name, which reads as its folder's index, and a
     ``_manifest`` at the root, which reads as the manifest. FastMCP would find such a
     file unreadable as listed and drop the whole skill from ``skills/list``. A
     ``_manifest`` below the root is an ordinary file. A folder at such a URI is named
     too, though its files stay in the skill. The same skill comes back when nothing is
     reserved.
+
+    A hidden path is dropped too, without a warning: one debug line names the files.
     """
     for rel in sorted(_all_folders(skill.files)):
         if _is_hidden(rel):

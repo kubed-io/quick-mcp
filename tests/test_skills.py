@@ -232,6 +232,23 @@ def test_hidden_files_do_not_count_against_the_limits(tmp_path):
     assert set(load_skill(folder).files) == {"SKILL.md"}
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs a user that permissions apply to",
+)
+def test_a_folder_that_cannot_be_listed_is_skipped_as_fastmcp_skips_it(tmp_path):
+    folder = make_skill(tmp_path, {"assets/a.txt": "a\n", "locked/b.txt": "b\n"})
+    (folder / "locked").chmod(0o000)
+    try:
+        assert (
+            set(load_skill(folder).files)
+            == set(Skill.from_directory(folder).files)
+            == {"SKILL.md", "assets/a.txt"}
+        )
+    finally:
+        (folder / "locked").chmod(0o755)
+
+
 @pytest.mark.parametrize("over", ["files", "bytes"])
 def test_the_limits_are_checked_before_any_file_is_read(tmp_path, monkeypatch, caplog, over):
     if over == "files":
