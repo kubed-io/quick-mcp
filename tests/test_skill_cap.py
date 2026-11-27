@@ -29,6 +29,7 @@ pytestmark = pytest.mark.unit
 
 MODES = ["legacy", "auto"]
 META = "io.kubed/delivery"
+RULE = "it is a whole number of 1 or more, at most 10 digits, or all for no cap"
 
 
 def result(client):
@@ -183,7 +184,10 @@ async def test_delivery_default_sets_the_cap(answer):
         assert await cap(client) == 5
 
 
-@pytest.mark.parametrize("raw", ["0", "-1", "+5", "1.5", "ten", "all of them"])
+@pytest.mark.parametrize(
+    "raw",
+    ["0", "-1", "+5", "1.5", "ten", "all of them", "00000000007", "10000000000"],
+)
 async def test_an_untaken_cap_falls_through(raw, caplog):
     with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
         async with over_http(
@@ -192,9 +196,71 @@ async def test_an_untaken_cap_falls_through(raw, caplog):
             assert await cap(client) == 7
     (record,) = warnings(caplog)
     assert record.getMessage() == (
-        f"header X-MCP-Max {raw!r} is ignored, and the next source answers: "
-        "it is a whole number of 1 or more, or all for no cap"
+        f"header X-MCP-Max {raw!r} is ignored, and the next source answers: {RULE}"
     )
+
+
+TOO_LONG = "9" * 5000
+
+
+@pytest.mark.parametrize("raw", ["9999999999", " 0000000007 "])
+async def test_a_cap_of_ten_digits_is_taken(raw):
+    async with over_http(server(), headers={"X-MCP-Max": raw}) as client:
+        assert await cap(client) == int(raw)
+
+
+@pytest.mark.parametrize(
+    ("sent", "source"),
+    [
+        (
+            {"headers": {"X-MCP-Max": TOO_LONG}, "params": {"max": "7"}},
+            "header X-MCP-Max",
+        ),
+        ({"params": {"max": TOO_LONG}}, "query parameter max"),
+    ],
+)
+async def test_a_cap_too_long_to_parse_falls_through(sent, source, caplog):
+    mcp = server(DeliverySettings(max="7"))
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        async with over_http(mcp, **sent) as client:
+            assert await cap(client) == 7
+    (record,) = warnings(caplog)
+    assert record.getMessage() == (
+        f"{source} {TOO_LONG[:64]!r} is ignored, and the next source answers: {RULE}"
+    )
+
+
+async def test_a_huge_delivery_default_cap_falls_through(caplog):
+    mcp = server(DeliverySettings(max=7))
+    mcp.delivery_default(lambda client: SimpleNamespace(max=10**5000))
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        async with over_http(mcp) as client:
+            assert await cap(client) == 7
+    (record,) = warnings(caplog)
+    assert record.getMessage() == (
+        "delivery_default max 'a number of more than 10 digits' is ignored, "
+        f"and the next source answers: {RULE}"
+    )
+
+
+async def test_a_huge_config_cap_warns_once_at_build(caplog):
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        mcp = server(DeliverySettings(max=10**5000))
+        async with Client(mcp.server) as client:
+            assert await cap(client) == 100
+    (record,) = warnings(caplog)
+    assert record.getMessage().startswith(
+        "config delivery.max 'a number of more than 10 digits' is ignored"
+    )
+
+
+async def test_an_empty_cap_is_no_value(caplog):  # DLV-2
+    with caplog.at_level(logging.WARNING, logger="kubed.mcp.delivery"):
+        async with over_http(
+            server(), headers={"X-MCP-Max": ""}, params={"max": "7"}
+        ) as client:
+            assert await cap(client) == 7
+    assert not warnings(caplog)
 
 
 async def test_a_non_ascii_digit_cap_falls_through(caplog):
