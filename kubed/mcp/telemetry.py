@@ -171,9 +171,15 @@ def _service_name(name: str) -> str:
 
 
 def _profile_tags(tags: Mapping[str, str]) -> dict[str, str]:
-    """The pod's labels from POD_NAMESPACE and POD_NAME, then ``tags``, which win."""
+    """The pod's labels from POD_NAMESPACE and POD_NAME, then the build's from
+    SERVICE_REPOSITORY and SERVICE_GIT_REF, then ``tags``, which win."""
     labels: dict[str, str] = {}
-    for label, variable in (("namespace", "POD_NAMESPACE"), ("pod", "POD_NAME")):
+    for label, variable in (
+        ("namespace", "POD_NAMESPACE"),
+        ("pod", "POD_NAME"),
+        ("service_repository", "SERVICE_REPOSITORY"),
+        ("service_git_ref", "SERVICE_GIT_REF"),
+    ):
         if value := os.environ.get(variable):
             labels[label] = value
     labels.update(tags)

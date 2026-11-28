@@ -62,7 +62,7 @@ def _clean(monkeypatch) -> Iterator[None]:
     monkeypatch.setattr(kubed.mcp.telemetry, "_running", None)
     for name in [n for n in os.environ if n.startswith("OTEL_")]:
         monkeypatch.delenv(name)
-    for name in ("POD_NAMESPACE", "POD_NAME"):
+    for name in ("POD_NAMESPACE", "POD_NAME", "SERVICE_REPOSITORY", "SERVICE_GIT_REF"):
         monkeypatch.delenv(name, raising=False)
     # _set_defaults writes os.environ directly, so the whole of it is put back.
     environ = dict(os.environ)
@@ -170,7 +170,14 @@ def _child(mode: str, **env: str) -> subprocess.CompletedProcess[str]:
     clean = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("OTEL_") and k not in ("POD_NAMESPACE", "POD_NAME")
+        if not k.startswith("OTEL_")
+        and k
+        not in (
+            "POD_NAMESPACE",
+            "POD_NAME",
+            "SERVICE_REPOSITORY",
+            "SERVICE_GIT_REF",
+        )
     }
     clean |= {"OTEL_TRACES_EXPORTER": "console", "OTEL_METRICS_EXPORTER": "none"}
     return subprocess.run(
@@ -533,6 +540,55 @@ async def test_an_empty_pod_variable_adds_no_label(pyroscope, monkeypatch) -> No
     async with Client(served("blank", TelemetrySettings(profiles=ADDRESS)).server):
         pass
     assert pyroscope[0]["tags"] == {"pod": "sf-0"}
+
+
+REPOSITORY = "https://github.com/example/server"
+COMMIT = "311c15298c0c036bce9e99d306c166689c4525a9"
+
+
+async def test_profiles_carry_the_build(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("SERVICE_GIT_REF", COMMIT)
+    async with Client(served("built", TelemetrySettings(profiles=ADDRESS)).server):
+        pass
+    assert pyroscope[0]["tags"] == {
+        "service_repository": REPOSITORY,
+        "service_git_ref": COMMIT,
+    }
+
+
+async def test_an_empty_build_variable_adds_no_label(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_REPOSITORY", "")
+    monkeypatch.setenv("SERVICE_GIT_REF", COMMIT)
+    async with Client(served("half-built", TelemetrySettings(profiles=ADDRESS)).server):
+        pass
+    assert pyroscope[0]["tags"] == {"service_git_ref": COMMIT}
+
+
+async def test_tags_override_the_build(pyroscope, monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("SERVICE_GIT_REF", COMMIT)
+    settings = TelemetrySettings(profiles=ADDRESS, tags={"service_git_ref": "pinned"})
+    async with Client(served("overridden", settings).server):
+        pass
+    assert pyroscope[0]["tags"] == {
+        "service_repository": REPOSITORY,
+        "service_git_ref": "pinned",
+    }
+
+
+async def test_no_build_variables_add_no_labels(pyroscope) -> None:
+    async with Client(served("unbuilt", TelemetrySettings(profiles=ADDRESS)).server):
+        pass
+    assert pyroscope[0]["tags"] == {}
+
+
+def test_the_build_is_not_on_traces(monkeypatch) -> None:
+    from kubed.mcp._otel import _resource_attributes
+
+    monkeypatch.setenv("SERVICE_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("SERVICE_GIT_REF", COMMIT)
+    assert _resource_attributes("", {}) == ""
 
 
 @pytest.mark.parametrize(("cpu", "memory"), [(True, False), (False, True)])
