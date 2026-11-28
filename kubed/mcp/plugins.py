@@ -37,6 +37,7 @@ import os
 import re
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -45,16 +46,17 @@ from typing import Any, NoReturn, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlparse
 
 import anyio
+import anyio.lowlevel
 from fastmcp import FastMCP
 from fastmcp.prompts import Message, Prompt, PromptResult
 from fastmcp.resources import Resource, ResourceTemplate, TextResource
-from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool
 from fastmcp.utilities.versions import VersionSpec, version_sort_key
 from mcp_types import INTERNAL_ERROR, TextContent
+from opentelemetry import trace
 
 from mcp.shared.exceptions import MCPError
 
@@ -102,6 +104,8 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+# A proxy until a tracer provider is set: what a build's span is made with (TEL-24).
+_TRACER = trace.get_tracer("kubed.mcp")
 
 MANIFEST_FILES = (".claude-plugin/plugin.json", "plugin.json")
 KINDS = ("skills", "commands", "agents")
@@ -1060,7 +1064,6 @@ class _Build:
     agents: tuple[Agent, ...]
     rewritten: bool  # the rewriter chain was not empty
     indexes: Mapping[str, TextResource | None]
-    _renderers: tuple[object, ...] = ()  # kept alive with the build they rendered
     files: Mapping[str, _Material] = field(default_factory=lambda: MappingProxyType({}))
     folders: Mapping[str, tuple[dict, ...]] = field(
         default_factory=lambda: MappingProxyType({})
@@ -1408,23 +1411,6 @@ def _agent_meta(fn: AgentMeta, name: str, plugin: Plugin) -> Mapping[str, object
     return MappingProxyType(json.loads(json.dumps(keys, allow_nan=False)))
 
 
-class _Renderer(skills.EntryOnlySkillProvider):
-    """One skill of a rewritten build, alone: what its indexes are rendered from.
-
-    A folder's children are its own skill's alone, so a renderer per skill lists each
-    one in time to the skill's size rather than the build's. The skill was trimmed of
-    its reserved files when it was read, so it is not trimmed (or warned of) again.
-    """
-
-    def __init__(self, key: str, skill: skills.Skill) -> None:
-        super().__init__()
-        self.skill = skill
-        self._catalogue = {key: skill}
-
-    async def load_skills(self) -> dict[str, skills.Skill]:
-        return self._catalogue
-
-
 class _Prefixed(Prompt):
     """A command that writes the prefix into what it renders (GW-7): its text is
     rewritten with the build, but an argument is given at the request, so the
@@ -1627,21 +1613,24 @@ class _Rewrite:
         return found
 
     async def indexes(
-        self, served: _Served, key: str, renderer: _Renderer
+        self,
+        served: _Served,
+        key: str,
+        skill: skills.Skill,
+        provider: skills.SkillManifestProvider,
     ) -> dict[str, TextResource | None]:
-        """Each folder's ``_index.md`` and ``_index.json`` of the skill at ``key``,
-        both rendered from one listing of the folder by ``renderer`` and rewritten;
-        None for one that failed."""
+        """Each folder's ``_index.md`` and ``_index.json`` of ``skill``, at ``key``,
+        both rendered from its folders' children, listed in one pass with ``provider``,
+        and rewritten; None for one that failed. The skill was trimmed of its reserved
+        files when it was read, so it is not trimmed (or warned of) again."""
         found: dict[str, TextResource | None] = {}
-        for rel in sorted(skills._folders_of(renderer.skill.files)):
+        listed = await skills._skill_children(provider, key, skill)
+        for rel in sorted(listed):
             path = _joined(served.skill_dirs[key], rel)
             folder = skills._folder_uri(key, rel)
-            children = await renderer.children(folder)
-            if children is None:
-                continue
             for name in (skills.INDEX_MD, skills.INDEX_JSON):
                 uri = f"{folder}/{name}"
-                resource = skills._index_of(uri, children)
+                resource = skills._index_of(uri, listed[rel])
                 site = self._site(served, "index", path, uri)
                 new = self._run(served, site, resource.text, uri)
                 found[uri] = (
@@ -1787,6 +1776,8 @@ class Plugins:
         self._reader: CommandReader = read_command
         self._agent_meta: AgentMeta | None = None
         self._memo = _Memo(OrderedDict(), {})
+        # Builds are made one at a time, in the order asked for (PLUG-55, #99).
+        self._building = anyio.Lock()
         self.add_loader(LocalLoader())
         self._replaceable = {"file"}
 
@@ -2067,7 +2058,8 @@ class Plugins:
             return memo.builds[key]
         flight = memo.flights.get(key)
         if flight is not None:
-            await flight.done.wait()
+            with self._span(state, key, "waited"):
+                await flight.done.wait()
             if flight.error is not None:
                 raise flight.error
             if flight.build is None:  # its maker was cancelled: make it again
@@ -2075,7 +2067,27 @@ class Plugins:
             return flight.build
         flight = memo.flights[key] = _Flight(anyio.Event())
         try:
-            flight.build = await self._make(state, view, key)
+            # The span covers the wait for the lock: a trace shows each request's wait.
+            with self._span(state, key, "made") as span:
+                try:
+                    # Only a rewritten build yields, so only it takes the lock; one
+                    # that does not is never queued behind it. Taken once the flight
+                    # is registered, so a second reader of the key waits on the
+                    # flight, not here. The lock is not reentrant: _make never pins.
+                    async with self._building if self._chain(key) else nullcontext():
+                        build = flight.build = await self._make(state, view, key)
+                except Exception:
+                    raise
+                except BaseException:
+                    span.set_attribute("kubed.build.outcome", "cancelled")
+                    raise
+                span.set_attributes(
+                    {
+                        "kubed.build.skills": len(build.catalogue),
+                        "kubed.build.prompts": len(build.prompts),
+                        "kubed.build.agents": len(build.agents),
+                    }
+                )
         except Exception as exc:
             flight.error = exc  # every reader awaiting the flight raises it too
             raise
@@ -2095,6 +2107,20 @@ class Plugins:
                 else:
                     del memo.builds[drop]
         return flight.build
+
+    def _span(
+        self, state: _State, key: _Key, outcome: str
+    ) -> AbstractContextManager[trace.Span]:
+        """The span of a build made or waited on for ``key`` (TEL-24); a kept build has
+        none, as it is every request's."""
+        return _TRACER.start_as_current_span(
+            "kubed.mcp.build",
+            attributes={
+                "kubed.build.generation": state.generation,
+                "kubed.build.prefixed": self._prefix_of(key) is not None,
+                "kubed.build.outcome": outcome,
+            },
+        )
 
     async def _make(self, state: _State, view: View, key: _Key) -> _Build:
         """A build of what ``view`` admits of ``state``, from what was read: it never
@@ -2131,12 +2157,17 @@ class Plugins:
         prompts: list[Prompt] = []
         agents: list[Agent] = []
         materials: list[_Material] = []
+        # A rewritten build is the slow one (#99): it yields to the loop after each
+        # item, so other requests, health checks included, are answered meanwhile.
         for served in admitted:
             for k, skill in served.catalogue.items():
                 if (built := rewrite.skill(served, k, skill)) is not None:
                     catalogue[k] = built
+                await anyio.lowlevel.checkpoint()
             for file in served.prompts:
-                if (rewritten := rewrite.prompt(served, file)) is None:
+                rewritten = rewrite.prompt(served, file)
+                await anyio.lowlevel.checkpoint()
+                if rewritten is None:
                     continue
                 prompt, text = rewritten
                 prompts.append(
@@ -2152,24 +2183,25 @@ class Plugins:
                     _material(served, file, prompt, _as_served(file, text))
                 )
             for file in served.agents:
-                if (rewritten := rewrite.agent(served, file)) is None:
+                rewritten = rewrite.agent(served, file)
+                await anyio.lowlevel.checkpoint()
+                if rewritten is None:
                     continue
                 agent, text = rewritten
                 agents.append(agent)
                 materials.append(_material(served, file, agent, _as_served(file, text)))
         files = {m.file.uri: m for m in materials}
         folders = _folder_rows(materials)
-        # Throwaway renderers, one per skill: FastMCP keys what it loads per request
-        # by a provider's id, so the build keeps them alive while a request may still
-        # see them.
-        renderers: list[_Renderer] = []
         indexes: dict[str, TextResource | None] = {}
-        async with Context(fastmcp=self._server):
-            for served in admitted:
-                for k in served.catalogue:
-                    if k in catalogue:
-                        renderers.append(renderer := _Renderer(k, catalogue[k]))
-                        indexes |= await rewrite.indexes(served, k, renderer)
+        for served in admitted:
+            for k in served.catalogue:
+                if k in catalogue:
+                    # Set whenever a plugin serves a skill (_providers).
+                    assert self._skills is not None
+                    indexes |= await rewrite.indexes(
+                        served, k, catalogue[k], self._skills
+                    )
+                    await anyio.lowlevel.checkpoint()
         indexes |= rewrite.file_indexes(folders, files)
         return _Build(
             admitted=plugins,
@@ -2178,7 +2210,6 @@ class Plugins:
             agents=tuple(agents),
             rewritten=True,
             indexes=MappingProxyType(indexes),
-            _renderers=tuple(renderers),
             files=MappingProxyType(files),
             folders=MappingProxyType(folders),
             entries=self._rows(catalogue),
