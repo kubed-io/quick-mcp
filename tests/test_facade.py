@@ -257,6 +257,7 @@ def test_a_submodule_still_imports_from_the_package() -> None:
         ("kubed.mcp._config", {"yaml"}, {"components"}),
         ("kubed.mcp._builtins", set(), {"_config", "telemetry", "components"}),
         ("kubed.mcp.components", set(), set()),
+        ("kubed.mcp.pyroscope", {"yaml"}, set()),
     ],
 )
 def test_the_config_modules_import_only_pydantic_and_the_standard_library(
