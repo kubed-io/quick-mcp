@@ -44,7 +44,10 @@ async def test_listing_builds_no_row(monkeypatch, rewritten):
     for _ in range(3):
         assert (await listed(mcp))[2] == [ENTRY]
     assert (await build(mcp)).rewritten is rewritten
-    assert made == ["SKILL.md"]  # once, with the build, not once per listing
+    # Once, with the build, not once per listing. A rewritten build also makes each
+    # file's row once, with it, for the indexes it renders (PLUG-56).
+    indexed = ["SKILL.md", "references/GUIDE.md"] if rewritten else []
+    assert made == [*indexed, "SKILL.md"]
 
 
 @pytest.mark.parametrize("rewritten", [False, True])
