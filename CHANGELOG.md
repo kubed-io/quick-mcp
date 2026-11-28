@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-28
+
 ### Added
 
 - Profiles carry `service_repository` and `service_git_ref` from `SERVICE_REPOSITORY` and `SERVICE_GIT_REF`, so Pyroscope opens a frame's source at the image's commit.
