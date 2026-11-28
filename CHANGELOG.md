@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A newly started server keeps answering, health checks included, while it builds what its first clients are served.
+
 ## [0.7.0] - 2026-11-27
 
 ### Changed

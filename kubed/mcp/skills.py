@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import posixpath
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -666,13 +666,8 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
             return None
         path, manifest, rel = found
         folders = _folders_of(manifest.files)
-        name = manifest.frontmatter.name
         rows = [
-            _folder(
-                _folder_uri(path, sub),
-                f"{path}/{sub}",
-                f"A folder of the {name} skill",
-            )
+            _subfolder(path, manifest, sub)
             for sub in folders
             if sub and posixpath.dirname(sub) == rel
         ]
@@ -698,22 +693,73 @@ class EntryOnlySkillProvider(SkillCatalogProvider):
             if index is not None:
                 return index
         resource = await super()._get_resource(uri, version)
-        if isinstance(resource, SkillFileResource) and resource.file_path != ENTRY:
-            title = None
-            if resource.file_path.endswith(".md"):
-                title = _heading(await self.read_file(resource))
-            name = posixpath.basename(resource.skill_path)
-            # Still a SkillFileResource with every other field kept, `file` included:
-            # FastMCP offers a skill's entry only while every file resolves to the one
-            # its manifest lists.
-            fields = {
-                field: getattr(resource, field)
-                for field in SkillFileResource.model_fields
-            }
-            fields["description"] = title or f"File from {name} skill"
-            fields["mime_type"] = _media.media_type(resource.file_path)
-            resource = _SkillFile(**fields)
+        if isinstance(resource, SkillFileResource):
+            resource = await _served_file(resource, self.read_file)
         return resource
+
+
+def _subfolder(path: str, manifest: SkillManifest, sub: str) -> dict:
+    """The row of the folder at ``sub`` in the skill at ``path``."""
+    return _folder(
+        _folder_uri(path, sub),
+        f"{path}/{sub}",
+        f"A folder of the {manifest.frontmatter.name} skill",
+    )
+
+
+async def _served_file(
+    resource: SkillFileResource,
+    read: Callable[[SkillFileResource], Awaitable[bytes]],
+) -> SkillFileResource:
+    """A skill's file as it is served, from FastMCP's row for it: the row itself for
+    its ``SKILL.md``; any other file the same row as a ``_SkillFile``, described by its
+    first heading when it is Markdown (its bytes asked of ``read`` for that alone),
+    else as a file of its skill, and typed by its media type."""
+    if resource.file_path == ENTRY:
+        return resource
+    title = None
+    if resource.file_path.endswith(".md"):
+        title = _heading(await read(resource))
+    name = posixpath.basename(resource.skill_path)
+    # Still a SkillFileResource with every other field kept, `file` included: FastMCP
+    # offers a skill's entry only while every file resolves to the one its manifest
+    # lists.
+    fields = {
+        field: getattr(resource, field) for field in SkillFileResource.model_fields
+    }
+    fields["description"] = title or f"File from {name} skill"
+    fields["mime_type"] = _media.media_type(resource.file_path)
+    return _SkillFile(**fields)
+
+
+async def _skill_children(
+    provider: SkillManifestProvider, path: str, skill: Skill
+) -> dict[str, list[dict]]:
+    """Every folder's children of the skill at ``path``, by the folder's path in it,
+    in one pass: what ``EntryOnlySkillProvider.children`` lists for each, its files'
+    rows made with ``provider`` from the skill's own bytes, outside any request.
+
+    A file in a folder that is none, below a folder with an index's name say, is
+    listed nowhere.
+    """
+    manifest = _without_unserved(skill._manifest)
+    folders = _folders_of(manifest.files)
+    rows: dict[str, list[dict]] = {rel: [] for rel in folders}
+    for sub in folders:
+        if sub:
+            rows[posixpath.dirname(sub)].append(_subfolder(path, manifest, sub))
+
+    async def read(resource: SkillFileResource) -> bytes:
+        return skill.files[resource.file_path]
+
+    for file, entry in manifest.files.items():
+        found = rows.get(posixpath.dirname(file))
+        if found is not None:
+            row = _file_resource(provider, path, manifest, file, entry)
+            found.append(_wire(await _served_file(row, read)))
+    return {
+        rel: sorted(found, key=lambda row: row["uri"]) for rel, found in rows.items()
+    }
 
 
 # ---- the extension -----------------------------------------------------------------
