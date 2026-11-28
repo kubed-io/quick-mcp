@@ -7,15 +7,18 @@ and versions its frames come from, so the command runs there and maps what is in
 
 from __future__ import annotations
 
+import argparse
+import difflib
 import importlib.metadata
 import json
 import platform
 import re
+import sys
 import sysconfig
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib.metadata import Distribution, PackageNotFoundError
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -222,3 +225,106 @@ def _render(name: str, mappings: Sequence[_Mapping]) -> str:
         },
     }
     return header + yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+
+
+def _normalised(document: object) -> dict[str, object] | None:
+    """What a ``.pyroscope.yaml`` means, apart from its order, grouping and comments.
+
+    One entry per prefix, holding its language and its source as sorted JSON. A
+    document of any other shape is None.
+    """
+    if not isinstance(document, dict):
+        return None
+    code = document.get("source_code")
+    mappings = code.get("mappings") if isinstance(code, dict) else None
+    if not isinstance(mappings, list):
+        return None
+    prefixes: dict[str, tuple[str, str]] = {}
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            return None
+        paths = mapping.get("path")
+        language = mapping.get("language")
+        source = mapping.get("source")
+        if (
+            not isinstance(paths, list)
+            or not isinstance(language, str)
+            or not isinstance(source, dict)
+        ):
+            return None
+        for entry in paths:
+            if not isinstance(entry, dict) or not isinstance(entry.get("prefix"), str):
+                return None
+            prefixes[entry["prefix"]] = (language, json.dumps(source, sort_keys=True))
+    return {"version": document.get("version"), "mappings": prefixes}
+
+
+def _say(line: str) -> None:
+    sys.stderr.write(f"kubed.mcp.pyroscope: {line}\n")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Write the image's ``.pyroscope.yaml``, or check a committed copy of it."""
+    parser = argparse.ArgumentParser(
+        prog="python -m kubed.mcp.pyroscope",
+        description="Write or check the .pyroscope.yaml that this image implies.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true", help="print the file on stdout")
+    mode.add_argument(
+        "--check", action="store_true", help="compare a committed copy with the image"
+    )
+    parser.add_argument("distribution", help="the server's own distribution")
+    parser.add_argument(
+        "file", nargs="?", help="with --check: the committed file, or - for stdin"
+    )
+    args = parser.parse_args(argv)
+    if args.write and args.file is not None:
+        parser.error("--write takes no file")
+
+    try:
+        name, mappings = _mappings(args.distribution, _say)
+    except _Unmappable as error:
+        _say(str(error))
+        return 2
+    rendered = _render(name, mappings)
+    if args.write:
+        sys.stdout.write(rendered)
+        return 0
+
+    if args.file is None or args.file == "-":
+        committed = sys.stdin.read()
+    else:
+        try:
+            committed = Path(args.file).read_text(encoding="utf-8")
+        except (OSError, ValueError) as error:
+            _say(f"{args.file} can't be read: {type(error).__name__}")
+            return 2
+    if not committed.strip():
+        _say(
+            "read nothing: pass the file's path, or run docker with -i so stdin "
+            "reaches the command"
+        )
+        return 2
+
+    try:
+        document = yaml.safe_load(committed)
+    except yaml.YAMLError:
+        document = None
+    expected = _normalised(yaml.safe_load(rendered))
+    if expected is not None and _normalised(document) == expected:
+        return 0
+    diff = difflib.unified_diff(
+        committed.splitlines(keepends=True),
+        rendered.splitlines(keepends=True),
+        fromfile=".pyroscope.yaml (committed)",
+        tofile=".pyroscope.yaml (this image)",
+    )
+    for line in diff:
+        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+    _say(f".pyroscope.yaml is stale: regenerate it with --write {name} in this image")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

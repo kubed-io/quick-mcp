@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import importlib.metadata
+import io
 import json
+import platform
+import subprocess
+import sys
+import sysconfig
 from collections.abc import Iterable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -20,6 +25,7 @@ from kubed.mcp.pyroscope import (
     _ref,
     _render,
     _Unmappable,
+    main,
 )
 
 SITE = PurePosixPath("/opt/venv/lib/python3.14/site-packages")
@@ -331,3 +337,161 @@ def test_what_it_leaves_out(image) -> None:
         "kubed-mcp's files hold no package, as in an editable install: its frames stay unmapped",
         "fastmcp-slim is not installed: its frames stay unmapped",
     ]
+
+
+FIXTURE = Path(__file__).with_name("data") / "mcp-kb.pyroscope.yaml"
+PREFIX = "kubed.mcp.pyroscope: "
+
+
+def written(image, capsys, *fakes, **env) -> str:
+    image(*fakes, **env)
+    assert main(["--write", "kubed-mcp-kb"]) == 0
+    return capsys.readouterr().out
+
+
+def test_write_prints_the_file(image, capsys) -> None:
+    image(kb(), mcp(), slim())
+    assert main(["--write", "kubed-mcp-kb"]) == 0
+    out, err = capsys.readouterr()
+    assert out == _render(*_mappings("kubed-mcp-kb", print))
+    assert err == ""
+
+
+@pytest.mark.parametrize("spelling", ["kubed_mcp_kb", "Kubed-MCP-KB"])
+def test_the_name_is_read_as_pip_reads_it(image, capsys, spelling) -> None:
+    text = written(image, capsys, kb(), mcp(), slim())
+    assert main(["--write", spelling]) == 0
+    assert capsys.readouterr().out == text
+
+
+def test_it_reproduces_mcp_kbs_committed_file(image, capsys) -> None:
+    image(kb(), mcp("0.6.1"), slim())  # the versions mcp-kb's file names
+    assert main(["--check", "kubed-mcp-kb", str(FIXTURE)]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_check_ignores_order_grouping_and_comments(image, capsys, monkeypatch) -> None:
+    document = yaml.safe_load(written(image, capsys, kb(), mcp(), slim()))
+    split = [
+        dict(m, path=[p])
+        for m in reversed(document["source_code"]["mappings"])
+        for p in m["path"]
+    ]
+    document["source_code"]["mappings"] = split
+    text = "# by hand\n" + yaml.safe_dump(document)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+    assert main(["--check", "kubed-mcp-kb"]) == 0
+
+
+@pytest.mark.parametrize("given", [[], ["-"]])
+def test_check_reads_stdin(image, capsys, monkeypatch, given) -> None:
+    text = written(image, capsys, kb(), mcp(), slim())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+    assert main(["--check", "kubed-mcp-kb", *given]) == 0
+
+
+def test_a_moved_ref_is_stale(image, capsys, monkeypatch) -> None:
+    committed = written(image, capsys, kb(), mcp("0.6.1"), slim())
+    image(kb(), mcp("0.7.0"), slim())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(committed))
+    assert main(["--check", "kubed-mcp-kb"]) == 1
+    out, err = capsys.readouterr()
+    lines = out.splitlines()
+    assert lines[:2] == [
+        "--- .pyroscope.yaml (committed)",
+        "+++ .pyroscope.yaml (this image)",
+    ]
+    assert any(x.startswith("-") and "v0.6.1" in x for x in lines[2:])
+    assert any(x.startswith("+") and "v0.7.0" in x for x in lines[2:])
+    assert err == (
+        PREFIX + ".pyroscope.yaml is stale: regenerate it with "
+        "--write kubed-mcp-kb in this image\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "committed", ["version: v1\n", "not: [a, map\n", "- just\n- a list\n"]
+)
+def test_a_file_that_is_not_a_source_map_is_stale(
+    image, capsys, monkeypatch, committed
+) -> None:
+    image(kb(), mcp(), slim())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(committed))
+    assert main(["--check", "kubed-mcp-kb"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("--- .pyroscope.yaml (committed)\n")
+    assert out.endswith("\n")
+
+
+@pytest.mark.parametrize("empty", ["", "\n  \n"])
+def test_empty_input_says_how_to_pass_it(image, capsys, monkeypatch, empty) -> None:
+    image(kb(), mcp(), slim())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(empty))
+    assert main(["--check", "kubed-mcp-kb"]) == 2
+    assert capsys.readouterr() == (
+        "",
+        PREFIX + "read nothing: pass the file's path, "
+        "or run docker with -i so stdin reaches the command\n",
+    )
+
+
+def test_an_unreadable_file_exits_2(image, capsys, tmp_path) -> None:
+    image(kb(), mcp(), slim())
+    missing = str(tmp_path / "nope.yaml")
+    assert main(["--check", "kubed-mcp-kb", missing]) == 2
+    assert capsys.readouterr() == (
+        "",
+        f"{PREFIX}{missing} can't be read: FileNotFoundError\n",
+    )
+
+
+def test_what_it_cannot_map_exits_2_naming_it(image, capsys) -> None:
+    image(mcp(), slim())
+    assert main(["--write", "nope"]) == 2
+    assert capsys.readouterr() == ("", PREFIX + "nope is not installed\n")
+
+
+def test_what_it_leaves_out_is_said_on_stderr(image, capsys) -> None:
+    image(kb(), mcp())
+    assert main(["--write", "kubed-mcp-kb"]) == 0
+    assert capsys.readouterr().err == (
+        PREFIX + "fastmcp-slim is not installed: its frames stay unmapped\n"
+    )
+
+
+def test_write_takes_no_file(image) -> None:
+    image(kb(), mcp(), slim())
+    with pytest.raises(SystemExit) as raised:
+        main(["--write", "kubed-mcp-kb", ".pyroscope.yaml"])
+    assert raised.value.code == 2
+
+
+def test_the_real_entry_point_in_this_environment() -> None:
+    run = [sys.executable, "-m", "kubed.mcp.pyroscope"]
+    wrote = subprocess.run(
+        [*run, "--write", "fastmcp-slim"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+    mappings = yaml.safe_load(wrote.stdout)["source_code"]["mappings"]
+    assert mappings[0]["source"] == {"local": {"path": "fastmcp"}}
+    assert mappings[-1]["source"] == {
+        "github": {
+            "owner": "python",
+            "repo": "cpython",
+            "ref": f"v{platform.python_version()}",
+            "path": "Lib",
+        }
+    }
+    stdlib = sysconfig.get_paths()["stdlib"].rstrip("/") + "/"
+    assert mappings[-1]["path"][0]["prefix"] == stdlib
+    checked = subprocess.run(
+        [*run, "--check", "fastmcp-slim"],
+        input=wrote.stdout,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
