@@ -17,7 +17,7 @@ import sys
 import sysconfig
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from importlib.metadata import Distribution, PackageNotFoundError
+from importlib.metadata import Distribution
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -112,11 +112,15 @@ def _packages(dist: Distribution) -> list[tuple[str, str]]:
 
 
 def _distribution(name: str) -> Distribution | None:
-    """The installed distribution of that name, or None."""
-    try:
-        return importlib.metadata.distribution(name)
-    except PackageNotFoundError:
-        return None
+    """The installed distribution of that name, or None.
+
+    ``python -m`` puts the working directory on ``sys.path``, and a ``.dist-info`` or
+    ``.egg-info`` left there, as ``pip install .`` does, would stand in for the
+    installed distribution. So the search leaves out the working directory.
+    """
+    cwd = Path.cwd().resolve()
+    path = [p for p in sys.path if p and Path(p).resolve() != cwd]
+    return next(iter(importlib.metadata.distributions(name=name, path=path)), None)
 
 
 def _stdlib() -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import io
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -451,6 +452,30 @@ def test_what_it_cannot_map_exits_2_naming_it(image, capsys) -> None:
     assert capsys.readouterr() == ("", PREFIX + "nope is not installed\n")
 
 
+def test_kubed_mcp_not_installed_exits_2(image, capsys) -> None:
+    image(kb(), slim())
+    assert main(["--write", "kubed-mcp-kb"]) == 2
+    assert capsys.readouterr() == ("", PREFIX + "kubed-mcp is not installed\n")
+
+
+def test_kubed_mcp_without_a_github_repository_exits_2(image, capsys) -> None:
+    image(
+        kb(),
+        Fake(
+            "kubed-mcp",
+            "0.6.1",
+            ["kubed/mcp/__init__.py"],
+            ["Homepage, https://example.com"],
+        ),
+        slim(),
+    )
+    assert main(["--write", "kubed-mcp-kb"]) == 2
+    assert capsys.readouterr() == (
+        "",
+        PREFIX + "kubed-mcp's Project-URL names no GitHub repository\n",
+    )
+
+
 def test_what_it_leaves_out_is_said_on_stderr(image, capsys) -> None:
     image(kb(), mcp())
     assert main(["--write", "kubed-mcp-kb"]) == 0
@@ -466,7 +491,7 @@ def test_write_takes_no_file(image) -> None:
     assert raised.value.code == 2
 
 
-def test_the_real_entry_point_in_this_environment() -> None:
+def test_the_real_entry_point_in_this_environment(tmp_path: Path) -> None:
     run = [sys.executable, "-m", "kubed.mcp.pyroscope"]
     wrote = subprocess.run(
         [*run, "--write", "fastmcp-slim"],
@@ -495,3 +520,25 @@ def test_the_real_entry_point_in_this_environment() -> None:
         timeout=60,
     )
     assert checked.returncode == 0, checked.stdout + checked.stderr
+
+    # A source checkout in the working directory does not stand in for the installed one.
+    info = tmp_path / "fastmcp_slim-9.9.9.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: fastmcp-slim\nVersion: 9.9.9\n"
+        "Project-URL: Repository, https://github.com/PrefectHQ/fastmcp\n"
+    )
+    (info / "RECORD").write_text("fastmcp/__init__.py,,\n")
+    (tmp_path / "fastmcp").mkdir()
+    (tmp_path / "fastmcp" / "__init__.py").write_text("")
+    shadowed = subprocess.run(
+        [*run, "--write", "fastmcp-slim"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+    )
+    assert shadowed.returncode == 0, shadowed.stderr
+    assert shadowed.stdout == wrote.stdout
+    assert str(tmp_path) not in shadowed.stdout

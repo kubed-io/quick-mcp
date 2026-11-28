@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Profiles carry `service_repository` and `service_git_ref` from `SERVICE_REPOSITORY` and `SERVICE_GIT_REF`, so Pyroscope opens a frame's source at the image's commit.
+- **`python -m kubed.mcp.pyroscope`** writes a server's `.pyroscope.yaml` from inside its image, and `--check` fails CI when the committed one is stale.
+
 ## [0.7.1] - 2026-11-28
 
 ### Fixed
